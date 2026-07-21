@@ -7,7 +7,47 @@ and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Pre-1.0, breaking
 changes ride a minor bump.
 
-## [0.2.0] — Unreleased
+## [0.2.1] — Unreleased
+
+An adversarial re-review of 0.2.0 found a crash reachable from the typed API and
+several hazard notes that were wrong on the facts.
+
+### Fixed
+
+- `convert({ backing: "" })` emitted `-B ""`. Combined with a `backingFormat`,
+  that **segfaults** qemu-img 11.0.2 (SIGSEGV, reproduced 3/3) after writing a
+  partial destination; without one it errors out. The flag is now omitted for an
+  empty `backing`, which is what it meant anyway.
+- `check`'s note claimed a truncated copy with intact metadata passes clean. It
+  does not: qcow2 flags a copy short by a full cluster or more (exit `2`,
+  dangling L2 entries). The real blind spots — now documented — are an
+  incomplete-but-consistent image, a shortfall under one `cluster_size`, VDI
+  (misses truncation entirely), and raw (no check at all).
+- `convert`'s URL note blamed stalls, which actually fail loudly (exit `1`). The
+  silent exit-`0` truncation comes from a server under-reporting the object's
+  length.
+- `salvage`'s note claimed it matters for truncated sources. It does not — a
+  truncated source zero-fills past EOF with the flag off — so the note now
+  covers damaged reads only, and mentions that the per-region warnings go to
+  discarded stderr.
+- `shrink`'s note prescribed shrinking the guest filesystem first, which does
+  not save the backup GPT header; a post-shrink `sgdisk -e` is required.
+- The `rebase` guard's message pointed at safe mode and `convert()`, both of
+  which need a readable base — impossible in the case that most often reaches
+  the guard, a base that was moved or deleted.
+
+### Added
+
+- `RebaseOptions.acknowledgeDataLoss` — opts back in to the guarded pair. The
+  guard judges options alone and never opens the image, so it also refuses the
+  shapes where the pair is harmless (no backing file at all, a fully allocated
+  overlay) or is the only repair (a missing base). Keeping that inside the typed
+  API beats dropping to `raw()`.
+- README rows for two unguarded neighbors: unsafe rebase onto a _wrong but
+  openable_ backing (equally destructive, not shaped precisely enough to catch),
+  and `dd` overwriting an existing output.
+
+## [0.2.0] — 2026-07-21
 
 ### Added
 
@@ -24,11 +64,10 @@ changes ride a minor bump.
   them) accept the result happily. Flatten with `rebase(path, { backing: "" })`
   in safe mode, or with `convert()`.
 
-### Documented
-
-Hazards found by auditing what this package makes reachable. All are real
-`qemu-img` behaviors, verified against 11.0.2; each is legitimate for some
-caller, so the fix is documentation rather than refusal:
+Hazards found by auditing what this package makes reachable, documented rather
+than refused since each is legitimate for some caller. **Several of these notes
+turned out to be wrong on the facts — see 0.2.1**, which corrects the `check`,
+URL, `salvage` and `shrink` entries:
 
 - `ConvertOptions.options` — `{ compression_type: "zstd" }` is accepted by qemu
   but unreadable by pure-Go qcow2 readers (Lima's `go-qcow2reader` implements

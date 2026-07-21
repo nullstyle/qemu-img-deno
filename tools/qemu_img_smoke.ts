@@ -119,13 +119,13 @@ try {
   assert(chain[0].backingFormat === "qcow2", "chain[0] backing format");
   pass("infoChain parses");
 
-  step("rebase overlay onto '' in safe mode (flatten, data preserved)");
+  step("rebase overlay onto '' in safe mode");
   await qemu.rebase(overlay, { backing: "" });
   const rebased = await qemu.info(overlay);
   assert(rebased.backingFilename === undefined, "backing removed");
-  // Safe mode copies the base's clusters down, so contents still match.
-  const flattened = await qemu.compare(base, overlay);
-  assert(flattened.identical, "safe flatten preserves guest-visible data");
+  // No data assertion here on purpose: `base` is empty, so comparing it to
+  // the flattened overlay passes whether or not the flatten preserved
+  // anything. The data-bearing proof is the next section.
   pass("rebase (safe flatten)");
 
   step("the unsafe+empty-backing guard, and why it exists");
@@ -166,17 +166,27 @@ try {
   }
   assert(refused, "rebase refuses unsafe + empty backing");
 
-  // Prove the refusal is warranted: force it through raw() and the image
-  // reads back as zeros instead of the base's data — while `check` calls it
-  // clean, which is exactly why this fails silently in the wild.
-  await qemu.raw(["rebase", "-u", "-b", "", guarded]);
-  const forced = await qemu.check(guarded);
-  assert(forced.code === 0, "the gutted image still checks clean");
+  // Prove the refusal is warranted by opting back in: the image then reads
+  // as zeros instead of the base's data. raw() would do the same; the typed
+  // opt-in is what a caller with a dangling base actually reaches for.
+  await qemu.rebase(guarded, {
+    backing: "",
+    unsafe: true,
+    acknowledgeDataLoss: true,
+  });
   assert(
     !(await qemu.compare(dataBase, guarded)).identical,
     "unsafe flatten silently lost the base's data",
   );
-  pass("guard refuses; raw() reproduces the silent data loss it prevents");
+  // Not asserted: a stricter future qemu-img flagging this would be an
+  // upstream improvement, and should not fail our release gate.
+  const forced = await qemu.check(guarded);
+  console.log(
+    `  · qemu-img check on the gutted image: ${
+      forced.code === 0 ? "clean (silent loss)" : `code ${forced.code}`
+    }`,
+  );
+  pass("guard refuses; the opt-in reproduces the loss it prevents");
 
   step("re-point overlay at base, write nothing, commit");
   await qemu.rebase(overlay, {

@@ -1,9 +1,4 @@
-import {
-  assert,
-  assertEquals,
-  assertRejects,
-  assertStringIncludes,
-} from "@std/assert";
+import { assert, assertEquals, assertRejects } from "@std/assert";
 import { CommandError } from "../../src/runner.ts";
 import {
   QemuImgMissingError,
@@ -365,13 +360,42 @@ Deno.test("rebase refuses unsafe + empty backing (silent data loss)", async () =
     QemuImgUnsafeOperationError,
   );
   assertEquals(error.operation, "rebase");
-  assertStringIncludes(error.message, "reads back as zeros");
   // The guard fires before the seam: nothing ran, the image is untouched.
   assertEquals(fake.commandLines(), []);
   assertEquals(fake.images.get("/img.qcow2")?.backingFilename, "/old.qcow2");
-  // raw() remains the documented escape hatch for callers who mean it.
-  await qemu.raw(["rebase", "-u", "-b", "", "/img.qcow2"]);
+});
+
+Deno.test("acknowledgeDataLoss opts back in to the guarded rebase", async () => {
+  const { qemu, fake } = client();
+  fake.setImage("/img.qcow2", { backingFilename: "/gone.qcow2" });
+  // The canonical legitimate case: the base was deleted, so safe mode and
+  // convert() cannot run at all — this pair is the only repair.
+  await qemu.rebase("/img.qcow2", {
+    backing: "",
+    unsafe: true,
+    acknowledgeDataLoss: true,
+  });
+  assertEquals(fake.images.get("/img.qcow2")?.backingFilename, undefined);
+  // The opt-in changes nothing about the emitted argv.
   assertEquals(fake.commandLines(), ["qemu-img rebase -u -b  /img.qcow2"]);
+});
+
+Deno.test("convert omits -B for an empty backing (qemu-img segfaults on it)", async () => {
+  const { qemu, fake } = client();
+  fake.setImage("/src.qcow2", { virtualSizeBytes: 1024 });
+  await qemu.convert("/src.qcow2", "/out.qcow2", {
+    format: "qcow2",
+    backing: "",
+  });
+  await qemu.convert("/src.qcow2", "/backed.qcow2", {
+    format: "qcow2",
+    backing: "/base.qcow2",
+    backingFormat: "qcow2",
+  });
+  assertEquals(fake.commandLines(), [
+    "qemu-img convert -O qcow2 /src.qcow2 /out.qcow2",
+    "qemu-img convert -B /base.qcow2 -F qcow2 -O qcow2 /src.qcow2 /backed.qcow2",
+  ]);
 });
 
 Deno.test("resize pins argv, honors deltas, and guards shrinks", async () => {

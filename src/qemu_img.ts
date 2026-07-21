@@ -188,9 +188,10 @@ export interface ConvertOptions extends CallOptions {
    * Continue past source read errors (`--salvage`).
    *
    * Unreadable regions are written as zeros and the conversion still exits
-   * `0`, so a damaged or truncated source yields a silently wrong image
-   * rather than a failure. Use it only to rescue data from media you already
-   * know is failing, and never on a source read over the network.
+   * `0` — the per-region warnings go to stderr, which this method discards —
+   * so a damaged source yields a silently wrong image rather than a failure.
+   * Use it only to rescue data from media you already know is failing, and
+   * never on a source read over the network.
    */
   readonly salvage?: boolean;
   /** Assume a `noCreate` target already reads as zeros (`--target-is-zero`). */
@@ -270,12 +271,26 @@ export interface RebaseOptions extends CallOptions {
    * Unsafe mode (`-u`): only rewrite the reference, never read data.
    *
    * Correct when the backing file merely moved or was renamed. Combined with
-   * `backing: ""` it is data loss — the base's clusters are never copied
-   * down, so they read back as zeros — and this library throws
-   * {@linkcode import("./errors.ts").QemuImgUnsafeOperationError} rather than
-   * emit it. {@linkcode QemuImg.raw} bypasses the guard.
+   * `backing: ""` on an image that still depends on its base it is data loss
+   * — the base's clusters are never copied down, so they read back as zeros,
+   * and {@linkcode QemuImg.prototype.check} still passes. This library throws
+   * {@linkcode QemuImgUnsafeOperationError} on that pair from the options
+   * alone, without opening the image, so it also refuses the shapes where the
+   * pair is harmless or is the only repair: an image with no backing file (a
+   * byte-identical no-op), a fully allocated overlay, or a chain whose base
+   * is gone. Set {@linkcode RebaseOptions.acknowledgeDataLoss} for those.
    */
   readonly unsafe?: boolean;
+  /**
+   * Proceed with `unsafe` + `backing: ""` anyway.
+   *
+   * The escape hatch for the cases the shape-based guard cannot distinguish —
+   * most commonly clearing a dangling reference after the base was deleted,
+   * where safe mode and {@linkcode QemuImg.prototype.convert} both fail with
+   * `Could not open backing file`. Anything the overlay never wrote will read
+   * as zeros afterwards.
+   */
+  readonly acknowledgeDataLoss?: boolean;
   /** Image format (`-f`). */
   readonly format?: ImageFormat;
 }
@@ -288,9 +303,11 @@ export interface ResizeOptions extends CallOptions {
    * Allow shrinking (`--shrink`).
    *
    * Truncates the virtual size, discarding everything past the new end —
-   * including a GPT's backup header, which sits in the last sectors. Shrink
-   * only after the guest filesystem and partition table have been reduced
-   * from inside the guest.
+   * including a GPT's backup header, which lives in the last LBA. Shrink only
+   * after the guest filesystem and partition table have been reduced from
+   * inside the guest, then repair the GPT (`sgdisk -e`): the backup header is
+   * lost to the truncation either way, and the primary header's
+   * `AlternateLBA`/`LastUsableLBA` are left pointing past the new end.
    */
   readonly shrink?: boolean;
   /** Preallocation mode for grown space (`--preallocation`). */
@@ -445,9 +462,13 @@ export class QemuImg {
    * any other exit throws a `CommandError`.
    *
    * This validates the image's internal structure (refcounts, cluster
-   * references), not that it holds the data you expect. A truncated copy
-   * whose metadata happens to be intact checks clean. To verify content,
-   * compare against a known-good source with {@linkcode QemuImg.compare}.
+   * references), not that it holds the data you expect. qcow2 does flag a
+   * copy truncated by a full cluster or more — the L2 entries dangle past
+   * EOF — but an *incomplete* image passes clean: a half-written convert, or
+   * a copy short by less than `cluster_size` (up to 2 MiB with large
+   * clusters), reports zero corruptions. VDI misses truncation entirely and
+   * raw has no check at all. To verify content, compare against a known-good
+   * source with {@linkcode QemuImg.prototype.compare}.
    */
   async check(path: string, options: CheckOptions = {}): Promise<CheckResult> {
     const args = [
@@ -508,11 +529,13 @@ export class QemuImg {
    *
    * Sources are spliced into argv verbatim, so qemu's block drivers apply: a
    * `source` may be an `http(s)://`, `ssh://` or `nbd://` URL as well as a
-   * path. Converting bulk data straight from a URL is fragile — a stalled
-   * transfer can leave a truncated output that still exits `0`, and
-   * {@linkcode QemuImg.check} will call that output clean because it verifies
-   * structure, not completeness. Download first, or verify the result with
-   * {@linkcode QemuImg.compare} against a known-good copy.
+   * path. Converting bulk data straight from a URL is fragile — a stall or
+   * reset mid-transfer at least fails loudly (exit `1`, so this throws), but
+   * a server that under-reports the object's length leaves a truncated
+   * output and still exits `0`, and {@linkcode QemuImg.prototype.check} will
+   * call that output clean because it verifies structure, not completeness.
+   * Download first, or verify the result with
+   * {@linkcode QemuImg.prototype.compare} against a known-good copy.
    */
   async convert(
     source: string | readonly string[],
@@ -525,7 +548,11 @@ export class QemuImg {
       ...flag("-f", options.sourceFormat),
       ...(options.compress === true ? ["-c"] : []),
       ...(options.noCreate === true ? ["-n"] : []),
-      ...flag("-B", options.backing),
+      // `-B ""` alongside `-F` segfaults qemu-img 11.0.2 (SIGSEGV, 3/3) after
+      // writing a partial destination; without `-F` it errors out. An empty
+      // `backing` can only mean "no backing file", which is what omitting the
+      // flag already does.
+      ...(options.backing === "" ? [] : flag("-B", options.backing)),
       ...flag("-F", options.backingFormat),
       ...(options.options === undefined
         ? []
@@ -656,18 +683,23 @@ export class QemuImg {
    * Safe mode (the default) reads the old chain and writes the differences
    * down, so guest-visible content survives. {@linkcode RebaseOptions.unsafe}
    * skips that, and combining it with an empty `backing` throws
-   * {@linkcode QemuImgUnsafeOperationError} — see that option's docs.
+   * {@linkcode QemuImgUnsafeOperationError} unless
+   * {@linkcode RebaseOptions.acknowledgeDataLoss} is set — see those options.
    */
   async rebase(path: string, options: RebaseOptions): Promise<void> {
-    if (options.unsafe === true && options.backing === "") {
+    if (
+      options.unsafe === true && options.backing === "" &&
+      options.acknowledgeDataLoss !== true
+    ) {
       throw new QemuImgUnsafeOperationError(
         "rebase",
-        "`unsafe` with an empty `backing` drops the backing reference without " +
-          "copying the base's data down, so every cluster the overlay never " +
-          "wrote reads back as zeros. Flatten with rebase(path, { backing: " +
-          '"" }) (safe mode) or convert() instead. If the image really is ' +
-          'self-contained, bypass this guard with raw(["rebase", "-u", "-b", ' +
-          '"", path]).',
+        "`unsafe` with an empty `backing` drops the backing reference " +
+          "without copying the base's data down, so every cluster the " +
+          "overlay never wrote reads back as zeros — and check() still " +
+          'passes. Flatten with rebase(path, { backing: "" }) (safe mode) ' +
+          "or convert() instead; both need a readable base. When the base " +
+          "is gone, or the image is self-contained or has no backing file " +
+          "at all, this pair is the right call: pass acknowledgeDataLoss.",
       );
     }
     await this.#checkedVoid([

@@ -1,6 +1,6 @@
 # @nullstyle/qemu-img
 
-> **Status: 0.2.0.** Pre-1.0 — breaking changes ride a minor bump.
+> **Status: 0.2.1.** Pre-1.0 — breaking changes ride a minor bump.
 
 A typed Deno driver for QEMU's
 [`qemu-img`](https://www.qemu.org/docs/master/tools/qemu-img.html) disk-image
@@ -63,18 +63,23 @@ the other via structural typing.
 
 ## Sharp edges
 
-`qemu-img` has invocations that fail silently rather than loudly. This package
-refuses exactly one of them and documents the rest, because each is legitimate
-for some caller. All verified against qemu-img 11.0.2.
+`qemu-img` has invocations that fail silently rather than loudly. The rule here:
+**an operation that yields a valid image holding less data than the one you
+passed needs an explicit acknowledgement.** Only the empty-`backing` rebase is
+shaped precisely enough to enforce that way; the rest are legitimate for some
+caller and are documented instead. qemu-img behavior verified against 11.0.2;
+the `go-qcow2reader` note is about Lima's pure-Go reader.
 
-| Invocation                                           | What actually happens                                                                                                                                                                |
-| ---------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `rebase({ backing: "", unsafe: true })`              | **Refused** (`QemuImgUnsafeOperationError`). Drops the reference without copying the base down, so unwritten clusters read as zeros. Use safe mode or `convert()`; `raw()` bypasses. |
-| `convert({ options: { compression_type: "zstd" } })` | Valid qcow2, but pure-Go readers (Lima's `go-qcow2reader`) implement DEFLATE only. Use `compress: true`.                                                                             |
-| `convert({ salvage: true })`                         | Read errors become zero-filled regions; still exits `0`.                                                                                                                             |
-| `convert()` from an `http(s)://` source              | Works, but a stalled transfer can truncate the output and still exit `0`.                                                                                                            |
-| `check()`                                            | Validates structure, not completeness — a truncated copy with intact metadata passes. Verify content with `compare()`.                                                               |
-| `resize(…, { shrink: true })`                        | Discards everything past the new end, including a GPT's backup header.                                                                                                               |
+| Invocation                                            | What actually happens                                                                                                                                                                                                                                                                                             |
+| ----------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `rebase(…, { backing: "", unsafe: true })`            | **Refused** (`QemuImgUnsafeOperationError`). Drops the reference without copying the base down, so unwritten clusters read as zeros and `check()` still passes. Use safe mode or `convert()` — both need a readable base. When the base is gone (the usual reason to reach for this), pass `acknowledgeDataLoss`. |
+| `rebase(…, { backing: <other image>, unsafe: true })` | Equally unrecoverable, and **not** refused: the overlay is reinterpreted against a backing it was never built on. Only the empty spelling is shaped precisely enough to catch without opening the image.                                                                                                          |
+| `convert({ options: { compression_type: "zstd" } })`  | Valid qcow2, but pure-Go readers (Lima's `go-qcow2reader`) implement DEFLATE only. Use `compress: true`.                                                                                                                                                                                                          |
+| `convert({ salvage: true })`                          | Read errors become zero-filled regions; still exits `0`.                                                                                                                                                                                                                                                          |
+| `convert()` from an `http(s)://` source               | Works, but a server that under-reports the object length truncates the output and still exits `0` (a stall or reset does fail loudly).                                                                                                                                                                            |
+| `check()`                                             | Validates structure, not completeness — a half-written image, or a copy short by less than one cluster, passes clean (VDI misses truncation entirely; raw has no check at all). Verify content with `compare()`.                                                                                                  |
+| `resize(…, { shrink: true })`                         | Discards everything past the new end, including a GPT's backup header. Repair with `sgdisk -e` afterwards.                                                                                                                                                                                                        |
+| `dd({ input, output })`                               | Overwrites an existing `output` in place, exit `0`, no warning.                                                                                                                                                                                                                                                   |
 
 ## Compatibility
 
