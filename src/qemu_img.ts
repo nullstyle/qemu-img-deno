@@ -1,0 +1,706 @@
+/**
+ * The `qemu-img` client: every subcommand, driven through the runner seam.
+ *
+ * Argv shapes are fixed and test-pinned. Subcommands with a JSON output form
+ * (`info`, `check`, `map`, `measure`) always request `--output=json` and
+ * return typed results from `./results.ts`; their runs are uncapped so large
+ * parse-feeding output is never head-truncated.
+ *
+ * @module
+ */
+
+import {
+  CommandError,
+  type CommandResult,
+  runChecked,
+  type RunOptions,
+} from "./runner.ts";
+import {
+  buildRunOptions,
+  type CallOptions,
+  type QemuImgOptions,
+  type ResolvedOptions,
+  resolveOptions,
+} from "./options.ts";
+import { QemuImgMissingError } from "./errors.ts";
+import {
+  type CheckResult,
+  type CompareResult,
+  type MapExtent,
+  type MeasureResult,
+  parseCheckResult,
+  parseMapExtents,
+  parseMeasureResult,
+  parseQemuImgInfo,
+  parseQemuImgInfoChain,
+  type QemuImgInfo,
+  type SnapshotInfo,
+} from "./results.ts";
+import { parseQemuImgVersion, type QemuImgVersion } from "./version.ts";
+
+/**
+ * A disk image format name. An open union: the common formats are typed,
+ * every other format qemu-img knows (`vmdk`, `vdi`, `vhdx`, `qed`, `luks`, …)
+ * flows through as a plain string.
+ */
+export type ImageFormat =
+  | "qcow2"
+  | "raw"
+  // deno-lint-ignore ban-types
+  | (string & {});
+
+/**
+ * Format-specific creation/amend options, rendered to qemu-img's
+ * `-o key=value,key2=value2` form with keys sorted for deterministic argv.
+ * Booleans render as `on`/`off`.
+ */
+export type FormatOptions = Readonly<
+  Record<string, string | number | boolean>
+>;
+
+/**
+ * A size argument. Numbers are bytes; strings pass through qemu-img's size
+ * grammar (`"10G"`, and for {@linkcode QemuImg.resize} the relative
+ * `"+1G"`/`"-512M"` forms).
+ */
+export type SizeValue = number | string;
+
+/** Options for {@linkcode QemuImg.amend}. */
+export interface AmendOptions extends CallOptions {
+  /** Format-specific options to apply (`-o`). */
+  readonly options: FormatOptions;
+  /** Image format (`-f`, skips probing). */
+  readonly format?: ImageFormat;
+  /** Allow unsafe amendments (`--force`). */
+  readonly force?: boolean;
+}
+
+/** Options for {@linkcode QemuImg.bench}. */
+export interface BenchOptions extends CallOptions {
+  /** Number of I/O requests (`-c`). */
+  readonly count?: number;
+  /** Queue depth (`-d`). */
+  readonly depth?: number;
+  /** Image format (`-f`). */
+  readonly format?: ImageFormat;
+  /** Flush after every N requests (`--flush-interval`). */
+  readonly flushInterval?: number;
+  /** Starting offset (`-o`). */
+  readonly offset?: SizeValue;
+  /** Write pattern byte (`--pattern`). */
+  readonly pattern?: number;
+  /** Buffer size per request (`-s`). */
+  readonly bufferSize?: SizeValue;
+  /** Step between requests (`-S`). */
+  readonly stepSize?: SizeValue;
+  /** Run a write benchmark instead of reads (`-w`). */
+  readonly write?: boolean;
+  /** Skip the drain between requests (`--no-drain`). */
+  readonly noDrain?: boolean;
+}
+
+/** One bitmap action for {@linkcode QemuImg.bitmap}. */
+export type BitmapAction =
+  | {
+    /** Create the bitmap (`--add`). */
+    readonly op: "add";
+    /** Dirty granularity in bytes (`-g`). */
+    readonly granularity?: number;
+  }
+  | {
+    /** Delete, clear, enable, or disable the bitmap. */
+    readonly op: "remove" | "clear" | "enable" | "disable";
+  }
+  | {
+    /** Merge another bitmap into this one (`--merge`). */
+    readonly op: "merge";
+    /** The source bitmap name. */
+    readonly source: string;
+    /** File holding the source bitmap (`-b`); defaults to the same file. */
+    readonly sourceFile?: string;
+    /** Source file format (`-F`). */
+    readonly sourceFormat?: ImageFormat;
+  };
+
+/** Options for {@linkcode QemuImg.bitmap}. */
+export interface BitmapOptions extends CallOptions {
+  /** Image format (`-f`). */
+  readonly format?: ImageFormat;
+}
+
+/** Options for {@linkcode QemuImg.check}. */
+export interface CheckOptions extends CallOptions {
+  /** Repair mode (`-r`): fix `"leaks"` only, or `"all"` errors. */
+  readonly repair?: "leaks" | "all";
+  /** Image format (`-f`). */
+  readonly format?: ImageFormat;
+}
+
+/** Options for {@linkcode QemuImg.commit}. */
+export interface CommitOptions extends CallOptions {
+  /** Image format (`-f`). */
+  readonly format?: ImageFormat;
+  /** Commit down to this backing file instead of the immediate one (`-b`). */
+  readonly base?: string;
+  /** Skip emptying the committed image (`-d`). */
+  readonly drop?: boolean;
+  /** I/O rate limit in bytes/second (`-r`). */
+  readonly rate?: SizeValue;
+}
+
+/** Options for {@linkcode QemuImg.compare}. */
+export interface CompareOptions extends CallOptions {
+  /** First image's format (`-f`). */
+  readonly format?: ImageFormat;
+  /** Second image's format (`-F`). */
+  readonly formatB?: ImageFormat;
+  /** Strict mode (`-s`): sizes and allocations must match too. */
+  readonly strict?: boolean;
+}
+
+/** Options for {@linkcode QemuImg.convert}. */
+export interface ConvertOptions extends CallOptions {
+  /** Output format (`-O`). */
+  readonly format: ImageFormat;
+  /** Source format (`-f`, skips probing). */
+  readonly sourceFormat?: ImageFormat;
+  /** Compress output clusters (`-c`; qcow2/qed only). */
+  readonly compress?: boolean;
+  /** Write into a pre-existing output image (`-n`). */
+  readonly noCreate?: boolean;
+  /** Create the output backed by this file (`-B`). */
+  readonly backing?: string;
+  /** Backing file format (`-F`; only meaningful with `backing`). */
+  readonly backingFormat?: ImageFormat;
+  /** Format-specific output options (`-o`). */
+  readonly options?: FormatOptions;
+  /** Sparse-detection chunk size (`-S`). */
+  readonly sparseSize?: SizeValue;
+  /** Continue past source read errors (`--salvage`). */
+  readonly salvage?: boolean;
+  /** Assume a `noCreate` target already reads as zeros (`--target-is-zero`). */
+  readonly targetIsZero?: boolean;
+}
+
+/** Options for {@linkcode QemuImg.create}. */
+export interface CreateOptions extends CallOptions {
+  /** Image format (`-f`). */
+  readonly format: ImageFormat;
+  /** Virtual size; optional when `backing` supplies one. */
+  readonly size?: SizeValue;
+  /** Backing file reference (`-b`). */
+  readonly backing?: string;
+  /** Backing file format (`-F`). */
+  readonly backingFormat?: ImageFormat;
+  /** Format-specific options (`-o`). */
+  readonly options?: FormatOptions;
+}
+
+/** Options for {@linkcode QemuImg.dd}. */
+export interface DdOptions extends CallOptions {
+  /** Input file (`if=`). */
+  readonly input: string;
+  /** Output file (`of=`). */
+  readonly output: string;
+  /** Input format (`-f`). */
+  readonly format?: ImageFormat;
+  /** Output format (`-O`). */
+  readonly outputFormat?: ImageFormat;
+  /** Block size (`bs=`). */
+  readonly blockSize?: SizeValue;
+  /** Blocks to copy (`count=`). */
+  readonly count?: number;
+  /** Input blocks to skip (`skip=`). */
+  readonly skip?: number;
+}
+
+/** Options for {@linkcode QemuImg.info} and {@linkcode QemuImg.infoChain}. */
+export interface InfoOptions extends CallOptions {
+  /** Image format (`-f`, skips probing). */
+  readonly format?: ImageFormat;
+}
+
+/** Options for {@linkcode QemuImg.map}. */
+export interface MapOptions extends CallOptions {
+  /** Image format (`-f`). */
+  readonly format?: ImageFormat;
+}
+
+/** Options for {@linkcode QemuImg.measure} — give exactly one of `source`/`size`. */
+export interface MeasureOptions extends CallOptions {
+  /** Output format the measurement is for (`-O`). */
+  readonly outputFormat: ImageFormat;
+  /** Measure converting this existing image. */
+  readonly source?: string;
+  /** Measure a fresh image of this virtual size (`--size`). */
+  readonly size?: SizeValue;
+  /** Source format (`-f`; only meaningful with `source`). */
+  readonly sourceFormat?: ImageFormat;
+  /** Format-specific output options (`-o`). */
+  readonly options?: FormatOptions;
+}
+
+/** Options for {@linkcode QemuImg.rebase}. */
+export interface RebaseOptions extends CallOptions {
+  /** New backing file reference (`-b`); `""` removes the backing file. */
+  readonly backing: string;
+  /** New backing file format (`-F`). */
+  readonly backingFormat?: ImageFormat;
+  /** Unsafe mode (`-u`): only rewrite the reference, never read data. */
+  readonly unsafe?: boolean;
+  /** Image format (`-f`). */
+  readonly format?: ImageFormat;
+}
+
+/** Options for {@linkcode QemuImg.resize}. */
+export interface ResizeOptions extends CallOptions {
+  /** Image format (`-f`). */
+  readonly format?: ImageFormat;
+  /** Allow shrinking (`--shrink`); data past the new end is lost. */
+  readonly shrink?: boolean;
+  /** Preallocation mode for grown space (`--preallocation`). */
+  readonly preallocation?: "off" | "metadata" | "falloc" | "full";
+}
+
+/** Internal-snapshot operations, bound to a {@linkcode QemuImg} client. */
+export interface SnapshotOps {
+  /** Create snapshot `tag`: `qemu-img snapshot -c <tag> <path>`. */
+  create(path: string, tag: string, options?: CallOptions): Promise<void>;
+  /** Revert the image to snapshot `tag` (`-a`). */
+  apply(path: string, tag: string, options?: CallOptions): Promise<void>;
+  /** Delete snapshot `tag` (`-d`). */
+  delete(path: string, tag: string, options?: CallOptions): Promise<void>;
+  /** List snapshots, via `info --output=json` (richer than `snapshot -l`). */
+  list(path: string, options?: InfoOptions): Promise<readonly SnapshotInfo[]>;
+}
+
+/** The qemu-img client. */
+export class QemuImg {
+  readonly #o: ResolvedOptions;
+
+  /** Internal-snapshot operations (`qemu-img snapshot …`). */
+  readonly snapshot: SnapshotOps;
+
+  /** Create a client; all options default (real runner, `"qemu-img"`). */
+  constructor(options: QemuImgOptions = {}) {
+    this.#o = resolveOptions(options);
+    this.snapshot = {
+      create: (path, tag, call = {}) =>
+        this.#checkedVoid(["snapshot", "-c", tag, path], call),
+      apply: (path, tag, call = {}) =>
+        this.#checkedVoid(["snapshot", "-a", tag, path], call),
+      delete: (path, tag, call = {}) =>
+        this.#checkedVoid(["snapshot", "-d", tag, path], call),
+      list: async (path, call = {}) =>
+        (await this.info(path, call)).snapshots ?? [],
+    };
+  }
+
+  /** The `qemu-img` binary this client drives. */
+  get bin(): string {
+    return this.#o.bin;
+  }
+
+  /** Whether `qemu-img --version` runs successfully (`false` when the binary is missing). */
+  async available(options: CallOptions = {}): Promise<boolean> {
+    try {
+      const result = await this.#o.runner.run(
+        this.#o.bin,
+        ["--version"],
+        buildRunOptions(this.#o, options),
+      );
+      return result.success;
+    } catch (error) {
+      if (error instanceof Deno.errors.NotFound) return false;
+      throw error;
+    }
+  }
+
+  /** Throw {@linkcode QemuImgMissingError} unless qemu-img is runnable. */
+  async ensureAvailable(options: CallOptions = {}): Promise<void> {
+    if (!(await this.available(options))) {
+      throw new QemuImgMissingError(this.#o.bin);
+    }
+  }
+
+  /** The parsed `qemu-img --version`. Throws {@linkcode QemuImgMissingError} when missing. */
+  async version(options: CallOptions = {}): Promise<QemuImgVersion> {
+    let result: CommandResult;
+    try {
+      result = await this.#o.runner.run(
+        this.#o.bin,
+        ["--version"],
+        buildRunOptions(this.#o, options),
+      );
+    } catch (error) {
+      if (error instanceof Deno.errors.NotFound) {
+        throw new QemuImgMissingError(this.#o.bin);
+      }
+      throw error;
+    }
+    if (!result.success) throw new QemuImgMissingError(this.#o.bin);
+    return parseQemuImgVersion(result.stdout);
+  }
+
+  /** Change format-specific options in place: `qemu-img amend -o … <path>`. */
+  async amend(path: string, options: AmendOptions): Promise<void> {
+    await this.#checkedVoid([
+      "amend",
+      ...flag("-f", options.format),
+      ...(options.force === true ? ["--force"] : []),
+      "-o",
+      formatOptionsArg(options.options),
+      path,
+    ], options);
+  }
+
+  /** Benchmark image I/O: `qemu-img bench …`. Returns qemu-img's report text. */
+  async bench(path: string, options: BenchOptions = {}): Promise<string> {
+    const result = await this.#checked([
+      "bench",
+      ...flag("-c", options.count),
+      ...flag("-d", options.depth),
+      ...flag("-f", options.format),
+      ...(options.flushInterval === undefined
+        ? []
+        : [`--flush-interval=${options.flushInterval}`]),
+      ...flag("-o", options.offset),
+      ...(options.pattern === undefined
+        ? []
+        : [`--pattern=${options.pattern}`]),
+      ...flag("-s", options.bufferSize),
+      ...flag("-S", options.stepSize),
+      ...(options.write === true ? ["-w"] : []),
+      ...(options.noDrain === true ? ["--no-drain"] : []),
+      path,
+    ], options);
+    return result.stdout;
+  }
+
+  /** Manipulate a persistent dirty bitmap: `qemu-img bitmap … <path> <name>`. */
+  async bitmap(
+    path: string,
+    name: string,
+    action: BitmapAction,
+    options: BitmapOptions = {},
+  ): Promise<void> {
+    const actionArgs = action.op === "add"
+      ? ["--add", ...flag("-g", action.granularity)]
+      : action.op === "merge"
+      ? [
+        "--merge",
+        action.source,
+        ...flag("-b", action.sourceFile),
+        ...flag("-F", action.sourceFormat),
+      ]
+      : [`--${action.op}`];
+    await this.#checkedVoid([
+      "bitmap",
+      ...flag("-f", options.format),
+      ...actionArgs,
+      path,
+      name,
+    ], options);
+  }
+
+  /**
+   * Check image consistency: `qemu-img check --output=json <path>`.
+   * Exit codes `0`/`2`/`3` (clean / corruptions / unrepaired leaks) all
+   * produce a {@linkcode CheckResult} — inspect {@linkcode CheckResult.code};
+   * any other exit throws a `CommandError`.
+   */
+  async check(path: string, options: CheckOptions = {}): Promise<CheckResult> {
+    const args = [
+      "check",
+      ...flag("-f", options.format),
+      ...flag("-r", options.repair),
+      "--output=json",
+      path,
+    ];
+    const result = await this.#run(args, options, { uncapped: true });
+    if (!result.success && result.code !== 2 && result.code !== 3) {
+      throw new CommandError(result, this.#o.bin, args);
+    }
+    return parseCheckResult(result.stdout, result.code);
+  }
+
+  /** Commit an overlay into its backing file: `qemu-img commit <path>`. */
+  async commit(path: string, options: CommitOptions = {}): Promise<void> {
+    await this.#checkedVoid([
+      "commit",
+      ...flag("-f", options.format),
+      ...flag("-b", options.base),
+      ...(options.drop === true ? ["-d"] : []),
+      ...flag("-r", options.rate),
+      path,
+    ], options);
+  }
+
+  /**
+   * Compare two images' guest-visible contents: `qemu-img compare <a> <b>`.
+   * Exit `0` → identical, `1` → different; anything else throws a
+   * `CommandError`.
+   */
+  async compare(
+    a: string,
+    b: string,
+    options: CompareOptions = {},
+  ): Promise<CompareResult> {
+    const args = [
+      "compare",
+      ...flag("-f", options.format),
+      ...flag("-F", options.formatB),
+      ...(options.strict === true ? ["-s"] : []),
+      a,
+      b,
+    ];
+    const result = await this.#run(args, options);
+    if (result.code !== 0 && result.code !== 1) {
+      throw new CommandError(result, this.#o.bin, args);
+    }
+    return { identical: result.code === 0, output: result.stdout };
+  }
+
+  /**
+   * Convert/copy an image: `qemu-img convert … -O <fmt> <source…> <dest>`.
+   * Multiple sources concatenate into the output (qemu-img's multi-source
+   * form).
+   */
+  async convert(
+    source: string | readonly string[],
+    dest: string,
+    options: ConvertOptions,
+  ): Promise<void> {
+    const sources = typeof source === "string" ? [source] : [...source];
+    await this.#checkedVoid([
+      "convert",
+      ...flag("-f", options.sourceFormat),
+      ...(options.compress === true ? ["-c"] : []),
+      ...(options.noCreate === true ? ["-n"] : []),
+      ...flag("-B", options.backing),
+      ...flag("-F", options.backingFormat),
+      ...(options.options === undefined
+        ? []
+        : ["-o", formatOptionsArg(options.options)]),
+      ...flag("-S", options.sparseSize),
+      ...(options.salvage === true ? ["--salvage"] : []),
+      ...(options.targetIsZero === true ? ["--target-is-zero"] : []),
+      "-O",
+      options.format,
+      ...sources,
+      dest,
+    ], options);
+  }
+
+  /** Create an image: `qemu-img create -f <fmt> <path> [size]`. */
+  async create(path: string, options: CreateOptions): Promise<void> {
+    await this.#checkedVoid([
+      "create",
+      "-f",
+      options.format,
+      ...flag("-b", options.backing),
+      ...flag("-F", options.backingFormat),
+      ...(options.options === undefined
+        ? []
+        : ["-o", formatOptionsArg(options.options)]),
+      path,
+      ...(options.size === undefined ? [] : [sizeArg(options.size)]),
+    ], options);
+  }
+
+  /** dd-style block copy: `qemu-img dd … if=<input> of=<output>`. */
+  async dd(options: DdOptions): Promise<void> {
+    await this.#checkedVoid([
+      "dd",
+      ...flag("-f", options.format),
+      ...flag("-O", options.outputFormat),
+      ...(options.blockSize === undefined
+        ? []
+        : [`bs=${sizeArg(options.blockSize)}`]),
+      ...(options.count === undefined ? [] : [`count=${options.count}`]),
+      ...(options.skip === undefined ? [] : [`skip=${options.skip}`]),
+      `if=${options.input}`,
+      `of=${options.output}`,
+    ], options);
+  }
+
+  /** Typed `qemu-img info --output=json <path>`. */
+  async info(path: string, options: InfoOptions = {}): Promise<QemuImgInfo> {
+    const result = await this.#checked(
+      [
+        "info",
+        ...flag("-f", options.format),
+        "--output=json",
+        path,
+      ],
+      options,
+      { uncapped: true },
+    );
+    return parseQemuImgInfo(result.stdout);
+  }
+
+  /** The whole backing chain: `qemu-img info --backing-chain --output=json`. */
+  async infoChain(
+    path: string,
+    options: InfoOptions = {},
+  ): Promise<QemuImgInfo[]> {
+    const result = await this.#checked(
+      [
+        "info",
+        ...flag("-f", options.format),
+        "--backing-chain",
+        "--output=json",
+        path,
+      ],
+      options,
+      { uncapped: true },
+    );
+    return parseQemuImgInfoChain(result.stdout);
+  }
+
+  /** Allocation map: `qemu-img map --output=json <path>`. */
+  async map(path: string, options: MapOptions = {}): Promise<MapExtent[]> {
+    const result = await this.#checked(
+      [
+        "map",
+        ...flag("-f", options.format),
+        "--output=json",
+        path,
+      ],
+      options,
+      { uncapped: true },
+    );
+    return parseMapExtents(result.stdout);
+  }
+
+  /**
+   * Required size for a conversion: `qemu-img measure --output=json …`.
+   * Give exactly one of `source` (an existing image) or `size` (a fresh
+   * image's virtual size).
+   */
+  async measure(options: MeasureOptions): Promise<MeasureResult> {
+    const hasSource = options.source !== undefined;
+    const hasSize = options.size !== undefined;
+    if (hasSource === hasSize) {
+      throw new TypeError("measure needs exactly one of source or size");
+    }
+    const result = await this.#checked(
+      [
+        "measure",
+        ...flag("-f", options.sourceFormat),
+        ...(options.options === undefined
+          ? []
+          : ["-o", formatOptionsArg(options.options)]),
+        "-O",
+        options.outputFormat,
+        "--output=json",
+        ...(hasSize ? ["--size", sizeArg(options.size!)] : [options.source!]),
+      ],
+      options,
+      { uncapped: true },
+    );
+    return parseMeasureResult(result.stdout);
+  }
+
+  /** Change the backing file reference: `qemu-img rebase -b <backing> <path>`. */
+  async rebase(path: string, options: RebaseOptions): Promise<void> {
+    await this.#checkedVoid([
+      "rebase",
+      ...flag("-f", options.format),
+      ...(options.unsafe === true ? ["-u"] : []),
+      "-b",
+      options.backing,
+      ...flag("-F", options.backingFormat),
+      path,
+    ], options);
+  }
+
+  /** Resize an image: `qemu-img resize <path> <size>` (`"+1G"` grows). */
+  async resize(
+    path: string,
+    size: SizeValue,
+    options: ResizeOptions = {},
+  ): Promise<void> {
+    await this.#checkedVoid([
+      "resize",
+      ...flag("-f", options.format),
+      ...(options.preallocation === undefined
+        ? []
+        : [`--preallocation=${options.preallocation}`]),
+      ...(options.shrink === true ? ["--shrink"] : []),
+      path,
+      sizeArg(size),
+    ], options);
+  }
+
+  /** Escape hatch: run raw qemu-img argv through the seam (recorded by fakes like everything else). */
+  async raw(
+    args: readonly string[],
+    options: RunOptions = {},
+  ): Promise<CommandResult> {
+    return await this.#o.runner.run(this.#o.bin, args, {
+      ...buildRunOptions(this.#o, options, {
+        ...(options.stdin === undefined ? {} : { stdin: options.stdin }),
+        ...(options.uncapped === undefined
+          ? {}
+          : { uncapped: options.uncapped }),
+      }),
+    });
+  }
+
+  #run(
+    args: readonly string[],
+    call: CallOptions,
+    extra: Pick<RunOptions, "stdin" | "uncapped"> = {},
+  ): Promise<CommandResult> {
+    return this.#o.runner.run(
+      this.#o.bin,
+      args,
+      buildRunOptions(this.#o, call, extra),
+    );
+  }
+
+  #checked(
+    args: readonly string[],
+    call: CallOptions,
+    extra: Pick<RunOptions, "stdin" | "uncapped"> = {},
+  ): Promise<CommandResult> {
+    return runChecked(
+      this.#o.runner,
+      this.#o.bin,
+      args,
+      buildRunOptions(this.#o, call, extra),
+    );
+  }
+
+  async #checkedVoid(
+    args: readonly string[],
+    call: CallOptions,
+  ): Promise<void> {
+    await this.#checked(args, call);
+  }
+}
+
+function flag(
+  name: string,
+  value: string | number | undefined,
+): string[] {
+  return value === undefined ? [] : [name, sizeArg(value)];
+}
+
+function sizeArg(value: SizeValue): string {
+  return typeof value === "number" ? String(value) : value;
+}
+
+function formatOptionsArg(options: FormatOptions): string {
+  return Object.keys(options)
+    .sort()
+    .map((key) => {
+      const value = options[key];
+      const rendered = typeof value === "boolean"
+        ? (value ? "on" : "off")
+        : String(value);
+      return `${key}=${rendered}`;
+    })
+    .join(",");
+}

@@ -1,0 +1,12 @@
+{
+    "image-end-offset": 562036736,
+    "total-clusters": 163840,
+    "check-errors": 0,
+    "leaks": 125,
+    "leaks-fixed": 0,
+    "allocated-clusters": 8570,
+    "filename": "/tmp/leaky.qcow2",
+    "format": "qcow2",
+    "fragmented-clusters": 96,
+    "compressed-clusters": 3399
+}

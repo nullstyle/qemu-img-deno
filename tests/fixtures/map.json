@@ -1,0 +1,4 @@
+[
+    { "start": 0, "length": 327680, "depth": 0, "present": true, "zero": false, "data": true, "compressed": false, "offset": 327680},
+    { "start": 327680, "length": 1073414144, "depth": 0, "present": false, "zero": true, "data": false, "compressed": false}
+]

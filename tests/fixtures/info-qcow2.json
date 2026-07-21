@@ -1,0 +1,51 @@
+{
+    "children": [
+        {
+            "name": "file",
+            "info": {
+                "children": [],
+                "virtual-size": 262144,
+                "filename": "/tmp/disk.qcow2",
+                "format": "file",
+                "actual-size": 266240,
+                "format-specific": {
+                    "type": "file",
+                    "data": {}
+                },
+                "dirty-flag": false
+            }
+        }
+    ],
+    "virtual-size": 10737418240,
+    "filename": "/tmp/disk.qcow2",
+    "cluster-size": 65536,
+    "format": "qcow2",
+    "actual-size": 266240,
+    "format-specific": {
+        "type": "qcow2",
+        "data": {
+            "compat": "1.1",
+            "compression-type": "zlib",
+            "lazy-refcounts": false,
+            "refcount-bits": 16,
+            "corrupt": false,
+            "extended-l2": false
+        }
+    },
+    "snapshots": [
+        {
+            "icount": 0,
+            "vm-clock-nsec": 0,
+            "name": "clean",
+            "date-sec": 1721580000,
+            "date-nsec": 123456789,
+            "vm-clock-sec": 0,
+            "id": "1",
+            "vm-state-size": 0
+        }
+    ],
+    "backing-filename": "base.qcow2",
+    "full-backing-filename": "/tmp/base.qcow2",
+    "backing-filename-format": "qcow2",
+    "dirty-flag": false
+}

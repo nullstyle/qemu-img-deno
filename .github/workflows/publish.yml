@@ -1,0 +1,31 @@
+name: publish
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+  id-token: write # OIDC → JSR provenance (Sigstore)
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+      - name: Verify tag matches deno.json version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          version=$(deno eval 'console.log(JSON.parse(Deno.readTextFileSync("deno.json")).version)')
+          if [ "$tag" != "$version" ]; then
+            echo "::error::tag v$tag does not match deno.json version $version"
+            exit 1
+          fi
+      - run: deno task check
+      - run: deno task doc:lint
+      - run: deno task publish:check
+      - run: deno task test
+      - run: deno publish
