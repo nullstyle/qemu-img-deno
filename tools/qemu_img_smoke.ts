@@ -12,6 +12,7 @@
  */
 
 import { QemuImg } from "../src/qemu_img.ts";
+import { QemuImgUnsafeOperationError } from "../src/errors.ts";
 
 const step = (label: string) => console.log(`▸ ${label}`);
 const pass = (label: string) => console.log(`✓ ${label}`);
@@ -118,11 +119,64 @@ try {
   assert(chain[0].backingFormat === "qcow2", "chain[0] backing format");
   pass("infoChain parses");
 
-  step("rebase overlay onto '' (unbacked, unsafe)");
-  await qemu.rebase(overlay, { backing: "", unsafe: true });
+  step("rebase overlay onto '' in safe mode (flatten, data preserved)");
+  await qemu.rebase(overlay, { backing: "" });
   const rebased = await qemu.info(overlay);
   assert(rebased.backingFilename === undefined, "backing removed");
-  pass("rebase");
+  // Safe mode copies the base's clusters down, so contents still match.
+  const flattened = await qemu.compare(base, overlay);
+  assert(flattened.identical, "safe flatten preserves guest-visible data");
+  pass("rebase (safe flatten)");
+
+  step("the unsafe+empty-backing guard, and why it exists");
+  // A base that actually holds data — an empty image would make "lost the
+  // data" indistinguishable from "read back as zeros".
+  const dataRaw = `${dir}/data.raw`;
+  const dataBase = `${dir}/data-base.qcow2`;
+  await Deno.writeFile(dataRaw, new Uint8Array(1024 * 1024).fill(0xab));
+  await qemu.convert(dataRaw, dataBase, {
+    sourceFormat: "raw",
+    format: "qcow2",
+  });
+
+  // Safe mode copies those clusters down: content survives the flatten.
+  const safeFlat = `${dir}/safe-flat.qcow2`;
+  await qemu.create(safeFlat, {
+    format: "qcow2",
+    backing: dataBase,
+    backingFormat: "qcow2",
+  });
+  await qemu.rebase(safeFlat, { backing: "" });
+  assert(
+    (await qemu.compare(dataBase, safeFlat)).identical,
+    "safe flatten preserves the base's data",
+  );
+
+  const guarded = `${dir}/guarded.qcow2`;
+  await qemu.create(guarded, {
+    format: "qcow2",
+    backing: dataBase,
+    backingFormat: "qcow2",
+  });
+  let refused = false;
+  try {
+    await qemu.rebase(guarded, { backing: "", unsafe: true });
+  } catch (error) {
+    refused = error instanceof QemuImgUnsafeOperationError;
+  }
+  assert(refused, "rebase refuses unsafe + empty backing");
+
+  // Prove the refusal is warranted: force it through raw() and the image
+  // reads back as zeros instead of the base's data — while `check` calls it
+  // clean, which is exactly why this fails silently in the wild.
+  await qemu.raw(["rebase", "-u", "-b", "", guarded]);
+  const forced = await qemu.check(guarded);
+  assert(forced.code === 0, "the gutted image still checks clean");
+  assert(
+    !(await qemu.compare(dataBase, guarded)).identical,
+    "unsafe flatten silently lost the base's data",
+  );
+  pass("guard refuses; raw() reproduces the silent data loss it prevents");
 
   step("re-point overlay at base, write nothing, commit");
   await qemu.rebase(overlay, {

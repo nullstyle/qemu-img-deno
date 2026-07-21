@@ -22,7 +22,7 @@ import {
   type ResolvedOptions,
   resolveOptions,
 } from "./options.ts";
-import { QemuImgMissingError } from "./errors.ts";
+import { QemuImgMissingError, QemuImgUnsafeOperationError } from "./errors.ts";
 import {
   type CheckResult,
   type CompareResult,
@@ -172,11 +172,26 @@ export interface ConvertOptions extends CallOptions {
   readonly backing?: string;
   /** Backing file format (`-F`; only meaningful with `backing`). */
   readonly backingFormat?: ImageFormat;
-  /** Format-specific output options (`-o`). */
+  /**
+   * Format-specific output options (`-o`), e.g. `{ cluster_size: "1M" }`.
+   *
+   * Passed through unvalidated. Note `{ compression_type: "zstd" }`: qemu
+   * accepts it, but pure-Go qcow2 readers (notably Lima's `go-qcow2reader`,
+   * used on hosts without qemu-img) only implement DEFLATE and will reject
+   * the image. Prefer plain {@linkcode ConvertOptions.compress} — zlib — for
+   * images other tools must read.
+   */
   readonly options?: FormatOptions;
   /** Sparse-detection chunk size (`-S`). */
   readonly sparseSize?: SizeValue;
-  /** Continue past source read errors (`--salvage`). */
+  /**
+   * Continue past source read errors (`--salvage`).
+   *
+   * Unreadable regions are written as zeros and the conversion still exits
+   * `0`, so a damaged or truncated source yields a silently wrong image
+   * rather than a failure. Use it only to rescue data from media you already
+   * know is failing, and never on a source read over the network.
+   */
   readonly salvage?: boolean;
   /** Assume a `noCreate` target already reads as zeros (`--target-is-zero`). */
   readonly targetIsZero?: boolean;
@@ -242,11 +257,24 @@ export interface MeasureOptions extends CallOptions {
 
 /** Options for {@linkcode QemuImg.rebase}. */
 export interface RebaseOptions extends CallOptions {
-  /** New backing file reference (`-b`); `""` removes the backing file. */
+  /**
+   * New backing file reference (`-b`); `""` removes the backing file.
+   *
+   * In safe mode (the default) `""` flattens the image: the base's data is
+   * copied down first, so guest-visible content is unchanged.
+   */
   readonly backing: string;
   /** New backing file format (`-F`). */
   readonly backingFormat?: ImageFormat;
-  /** Unsafe mode (`-u`): only rewrite the reference, never read data. */
+  /**
+   * Unsafe mode (`-u`): only rewrite the reference, never read data.
+   *
+   * Correct when the backing file merely moved or was renamed. Combined with
+   * `backing: ""` it is data loss — the base's clusters are never copied
+   * down, so they read back as zeros — and this library throws
+   * {@linkcode import("./errors.ts").QemuImgUnsafeOperationError} rather than
+   * emit it. {@linkcode QemuImg.raw} bypasses the guard.
+   */
   readonly unsafe?: boolean;
   /** Image format (`-f`). */
   readonly format?: ImageFormat;
@@ -256,7 +284,14 @@ export interface RebaseOptions extends CallOptions {
 export interface ResizeOptions extends CallOptions {
   /** Image format (`-f`). */
   readonly format?: ImageFormat;
-  /** Allow shrinking (`--shrink`); data past the new end is lost. */
+  /**
+   * Allow shrinking (`--shrink`).
+   *
+   * Truncates the virtual size, discarding everything past the new end —
+   * including a GPT's backup header, which sits in the last sectors. Shrink
+   * only after the guest filesystem and partition table have been reduced
+   * from inside the guest.
+   */
   readonly shrink?: boolean;
   /** Preallocation mode for grown space (`--preallocation`). */
   readonly preallocation?: "off" | "metadata" | "falloc" | "full";
@@ -408,6 +443,11 @@ export class QemuImg {
    * Exit codes `0`/`2`/`3` (clean / corruptions / unrepaired leaks) all
    * produce a {@linkcode CheckResult} — inspect {@linkcode CheckResult.code};
    * any other exit throws a `CommandError`.
+   *
+   * This validates the image's internal structure (refcounts, cluster
+   * references), not that it holds the data you expect. A truncated copy
+   * whose metadata happens to be intact checks clean. To verify content,
+   * compare against a known-good source with {@linkcode QemuImg.compare}.
    */
   async check(path: string, options: CheckOptions = {}): Promise<CheckResult> {
     const args = [
@@ -465,6 +505,14 @@ export class QemuImg {
    * Convert/copy an image: `qemu-img convert … -O <fmt> <source…> <dest>`.
    * Multiple sources concatenate into the output (qemu-img's multi-source
    * form).
+   *
+   * Sources are spliced into argv verbatim, so qemu's block drivers apply: a
+   * `source` may be an `http(s)://`, `ssh://` or `nbd://` URL as well as a
+   * path. Converting bulk data straight from a URL is fragile — a stalled
+   * transfer can leave a truncated output that still exits `0`, and
+   * {@linkcode QemuImg.check} will call that output clean because it verifies
+   * structure, not completeness. Download first, or verify the result with
+   * {@linkcode QemuImg.compare} against a known-good copy.
    */
   async convert(
     source: string | readonly string[],
@@ -602,8 +650,26 @@ export class QemuImg {
     return parseMeasureResult(result.stdout);
   }
 
-  /** Change the backing file reference: `qemu-img rebase -b <backing> <path>`. */
+  /**
+   * Change the backing file reference: `qemu-img rebase -b <backing> <path>`.
+   *
+   * Safe mode (the default) reads the old chain and writes the differences
+   * down, so guest-visible content survives. {@linkcode RebaseOptions.unsafe}
+   * skips that, and combining it with an empty `backing` throws
+   * {@linkcode QemuImgUnsafeOperationError} — see that option's docs.
+   */
   async rebase(path: string, options: RebaseOptions): Promise<void> {
+    if (options.unsafe === true && options.backing === "") {
+      throw new QemuImgUnsafeOperationError(
+        "rebase",
+        "`unsafe` with an empty `backing` drops the backing reference without " +
+          "copying the base's data down, so every cluster the overlay never " +
+          "wrote reads back as zeros. Flatten with rebase(path, { backing: " +
+          '"" }) (safe mode) or convert() instead. If the image really is ' +
+          'self-contained, bypass this guard with raw(["rebase", "-u", "-b", ' +
+          '"", path]).',
+      );
+    }
     await this.#checkedVoid([
       "rebase",
       ...flag("-f", options.format),

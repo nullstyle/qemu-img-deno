@@ -1,6 +1,6 @@
 # @nullstyle/qemu-img
 
-> **Status: 0.1.0.** Pre-1.0 — breaking changes ride a minor bump.
+> **Status: 0.2.0.** Pre-1.0 — breaking changes ride a minor bump.
 
 A typed Deno driver for QEMU's
 [`qemu-img`](https://www.qemu.org/docs/master/tools/qemu-img.html) disk-image
@@ -60,6 +60,21 @@ The runner seam is kept field-identical to
 [`@nullstyle/lima`](https://jsr.io/@nullstyle/lima)'s on purpose: the two
 packages share no dependency, but any runner or fake written for one satisfies
 the other via structural typing.
+
+## Sharp edges
+
+`qemu-img` has invocations that fail silently rather than loudly. This package
+refuses exactly one of them and documents the rest, because each is legitimate
+for some caller. All verified against qemu-img 11.0.2.
+
+| Invocation                                           | What actually happens                                                                                                                                                                |
+| ---------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `rebase({ backing: "", unsafe: true })`              | **Refused** (`QemuImgUnsafeOperationError`). Drops the reference without copying the base down, so unwritten clusters read as zeros. Use safe mode or `convert()`; `raw()` bypasses. |
+| `convert({ options: { compression_type: "zstd" } })` | Valid qcow2, but pure-Go readers (Lima's `go-qcow2reader`) implement DEFLATE only. Use `compress: true`.                                                                             |
+| `convert({ salvage: true })`                         | Read errors become zero-filled regions; still exits `0`.                                                                                                                             |
+| `convert()` from an `http(s)://` source              | Works, but a stalled transfer can truncate the output and still exit `0`.                                                                                                            |
+| `check()`                                            | Validates structure, not completeness — a truncated copy with intact metadata passes. Verify content with `compare()`.                                                               |
+| `resize(…, { shrink: true })`                        | Discards everything past the new end, including a GPT's backup header.                                                                                                               |
 
 ## Compatibility
 

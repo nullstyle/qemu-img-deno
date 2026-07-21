@@ -18,6 +18,25 @@ export class QemuImgMissingError extends Error {
   }
 }
 
+/**
+ * A requested argument combination is valid `qemu-img` but destroys data
+ * silently, so this library refuses to emit it.
+ *
+ * Every such guard is escapable: {@linkcode import("./qemu_img.ts").QemuImg.raw}
+ * passes argv through untouched for callers who really mean it.
+ */
+export class QemuImgUnsafeOperationError extends Error {
+  /** The subcommand that was refused (e.g. `"rebase"`). */
+  readonly operation: string;
+
+  /** Build the error; `detail` explains the hazard and the safe alternatives. */
+  constructor(operation: string, detail: string) {
+    super(`refusing unsafe ${operation}: ${detail}`);
+    this.name = "QemuImgUnsafeOperationError";
+    this.operation = operation;
+  }
+}
+
 /** `qemu-img` produced output the library could not interpret. */
 export class QemuImgOutputError extends Error {
   /** The offending output. */

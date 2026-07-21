@@ -44,7 +44,11 @@ export {
 export { type CallOptions, type QemuImgOptions } from "./src/options.ts";
 
 // Errors:
-export { QemuImgMissingError, QemuImgOutputError } from "./src/errors.ts";
+export {
+  QemuImgMissingError,
+  QemuImgOutputError,
+  QemuImgUnsafeOperationError,
+} from "./src/errors.ts";
 
 // Version:
 export { parseQemuImgVersion, type QemuImgVersion } from "./src/version.ts";

@@ -1,6 +1,14 @@
-import { assert, assertEquals, assertRejects } from "@std/assert";
+import {
+  assert,
+  assertEquals,
+  assertRejects,
+  assertStringIncludes,
+} from "@std/assert";
 import { CommandError } from "../../src/runner.ts";
-import { QemuImgMissingError } from "../../src/errors.ts";
+import {
+  QemuImgMissingError,
+  QemuImgUnsafeOperationError,
+} from "../../src/errors.ts";
 import { QemuImg } from "../../src/qemu_img.ts";
 import { failed, FakeQemuImg, ok } from "../../testing/mod.ts";
 
@@ -332,6 +340,7 @@ Deno.test("measure supports the --size and source forms, exactly one", async () 
 Deno.test("rebase pins argv; empty backing removes the reference", async () => {
   const { qemu, fake } = client();
   fake.setImage("/img.qcow2", { backingFilename: "/old.qcow2" });
+  // Unsafe re-pointing at a real file is legitimate: the base merely moved.
   await qemu.rebase("/img.qcow2", {
     format: "qcow2",
     unsafe: true,
@@ -339,12 +348,30 @@ Deno.test("rebase pins argv; empty backing removes the reference", async () => {
     backingFormat: "qcow2",
   });
   assertEquals(fake.images.get("/img.qcow2")?.backingFilename, "/new.qcow2");
-  await qemu.rebase("/img.qcow2", { backing: "", unsafe: true });
+  // Safe mode flattens: the base's data is copied down first.
+  await qemu.rebase("/img.qcow2", { backing: "" });
   assertEquals(fake.images.get("/img.qcow2")?.backingFilename, undefined);
   assertEquals(fake.commandLines(), [
     "qemu-img rebase -f qcow2 -u -b /new.qcow2 -F qcow2 /img.qcow2",
-    "qemu-img rebase -u -b  /img.qcow2",
+    "qemu-img rebase -b  /img.qcow2",
   ]);
+});
+
+Deno.test("rebase refuses unsafe + empty backing (silent data loss)", async () => {
+  const { qemu, fake } = client();
+  fake.setImage("/img.qcow2", { backingFilename: "/old.qcow2" });
+  const error = await assertRejects(
+    () => qemu.rebase("/img.qcow2", { backing: "", unsafe: true }),
+    QemuImgUnsafeOperationError,
+  );
+  assertEquals(error.operation, "rebase");
+  assertStringIncludes(error.message, "reads back as zeros");
+  // The guard fires before the seam: nothing ran, the image is untouched.
+  assertEquals(fake.commandLines(), []);
+  assertEquals(fake.images.get("/img.qcow2")?.backingFilename, "/old.qcow2");
+  // raw() remains the documented escape hatch for callers who mean it.
+  await qemu.raw(["rebase", "-u", "-b", "", "/img.qcow2"]);
+  assertEquals(fake.commandLines(), ["qemu-img rebase -u -b  /img.qcow2"]);
 });
 
 Deno.test("resize pins argv, honors deltas, and guards shrinks", async () => {
