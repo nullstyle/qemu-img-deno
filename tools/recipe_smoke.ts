@@ -14,6 +14,7 @@
 import { QemuImg } from "../src/qemu_img.ts";
 import {
   build,
+  contentDigest,
   defineRecipe,
   dir,
   LayerIntegrityError,
@@ -21,6 +22,7 @@ import {
   LocalInputResolver,
   plan,
   resolveRecipe,
+  sha256Hex,
   VVFAT_USABLE_BYTES,
 } from "../src/recipe/mod.ts";
 
@@ -194,6 +196,129 @@ try {
     "a cached rebuild is byte-identical in guest-visible content",
   );
   pass("cache hits, and the rebuild compares identical (strict)");
+
+  // ── content identity vs container bytes ──────────────────────────────────
+  // The distinction the cache keys turn on, tested where it can be tested
+  // without booting anything: a layer's key folds its parent's CONTENT digest,
+  // and the container digest it used to fold moves for reasons that have
+  // nothing to do with what the guest reads.
+  step("the same content in a different container digests the same");
+  const digests = `${work}/digests`;
+  await Deno.mkdir(digests, { recursive: true });
+  const digestOf = (path: string) =>
+    contentDigest(qemu, path, { scratch: digests, format: "qcow2" });
+  const containerOf = async (path: string) =>
+    await sha256Hex(await Deno.readFile(path));
+
+  // A different cluster size rewrites every L2 table and relocates every data
+  // cluster, which is a bigger layout change than two guest boots produce and
+  // an exactly content-preserving one.
+  const relaid = `${work}/relaid.qcow2`;
+  await qemu.convert(output, relaid, {
+    format: "qcow2",
+    sourceFormat: "qcow2",
+    options: { cluster_size: "1M" },
+    parallel: 1,
+  });
+  assert(
+    await containerOf(output) !== await containerOf(relaid),
+    "the two containers really do differ",
+  );
+  assert(
+    (await qemu.compare(output, relaid)).identical,
+    "…while qemu calls their guest-visible content identical",
+  );
+  // And strict compare does not, because a 1 MiB cluster allocates in 1 MiB
+  // units: allocation status is a property of the container, which is why it
+  // is not the oracle for "the same filesystem" either.
+  assert(
+    !(await qemu.compare(output, relaid, { strict: true })).identical,
+    "strict compare, meanwhile, reports a difference",
+  );
+  assert(
+    await digestOf(output) === await digestOf(relaid),
+    `and so does the content digest:\n  ${await digestOf(
+      output,
+    )}\n  ${await digestOf(
+      relaid,
+    )}`,
+  );
+  pass("container digest moved, content digest did not");
+
+  step("allocation is not content: written zeros digest as absent zeros");
+  const SMALL = 64 * 1024 * 1024;
+  const hole = `${work}/hole.qcow2`;
+  const written = `${work}/written.qcow2`;
+  await qemu.create(hole, { format: "qcow2", size: SMALL });
+  await qemu.create(written, { format: "qcow2", size: SMALL });
+  await Deno.writeFile(`${work}/zeros.bin`, new Uint8Array(1024 * 1024));
+  // `-S 0` disables sparse detection, so these zeros are really written and
+  // really allocate clusters. This is the case that makes a strict compare —
+  // and any digest over the container — report a difference where a guest
+  // reads none, and it is why the digest folds blocks of zeros in as nothing.
+  await qemu.convert(
+    `${work}/zeros.bin`,
+    {
+      imageOpts: {
+        driver: "raw",
+        offset: 32 * 1024 * 1024,
+        size: 1024 * 1024,
+        file: { driver: "qcow2", file: { driver: "file", filename: written } },
+      },
+    },
+    { sourceFormat: "raw", noCreate: true, parallel: 1, sparseSize: 0 },
+  );
+  assert(
+    (await qemu.map(hole, { format: "qcow2" })).every((e) => e.data !== true),
+    "nothing is allocated in the untouched image",
+  );
+  assert(
+    (await qemu.map(written, { format: "qcow2" })).some((e) => e.data === true),
+    "the written zeros did allocate clusters",
+  );
+  assert(
+    !(await qemu.compare(hole, written, { strict: true })).identical,
+    "strict compare calls that a difference",
+  );
+  assert(
+    (await qemu.compare(hole, written)).identical,
+    "…though a guest reads the same disk from both",
+  );
+  assert(
+    await digestOf(hole) === await digestOf(written),
+    "the content digest agrees with the guest, not with the allocator",
+  );
+  pass("allocated zeros and unallocated zeros share one digest");
+
+  step("but a single changed byte moves it");
+  const poked = `${work}/poked.qcow2`;
+  await qemu.convert(hole, poked, {
+    format: "qcow2",
+    sourceFormat: "qcow2",
+    parallel: 1,
+  });
+  // A whole sector, because a window's size must be a multiple of 512 — but
+  // only its first byte is non-zero, so exactly one byte of content moves.
+  const poke = new Uint8Array(512);
+  poke[0] = 0x5a;
+  await Deno.writeFile(`${work}/poke.bin`, poke);
+  await qemu.convert(
+    `${work}/poke.bin`,
+    {
+      imageOpts: {
+        driver: "raw",
+        offset: 32 * 1024 * 1024,
+        size: 512,
+        file: { driver: "qcow2", file: { driver: "file", filename: poked } },
+      },
+    },
+    { sourceFormat: "raw", noCreate: true, parallel: 1 },
+  );
+  assert(
+    await digestOf(poked) !== await digestOf(hole),
+    "one byte in 64 MiB of zeros is a different disk",
+  );
+  pass("one byte moves the digest — the tamper case still has teeth");
 
   step("a tampered cached layer is caught, not silently trusted");
   const victim = artifact.layers[artifact.layers.length - 1];

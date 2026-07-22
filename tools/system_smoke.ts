@@ -291,7 +291,7 @@ try {
   );
   pass("no VM booted on the rebuild");
 
-  step("mke2fs is reproducible: a cold rebuild lands on the same bytes");
+  step("mke2fs is reproducible: a cold rebuild lands on the same filesystem");
   const fresh = new LayerStore(`${work}/cache-cold`);
   const rebuilt = await build(planned, resolved, {
     store: fresh,
@@ -300,20 +300,85 @@ try {
     guest,
   });
   const mkfsIndex = planned.steps.findIndex((s) => s.id === "table:mkfs");
+  const first = artifact.layers[mkfsIndex];
+  const second = rebuilt.layers[mkfsIndex];
   // This is what turns the mke2fs determinism flags from a claim into a
   // tested property. Without E2FSPROGS_FAKE_TIME, -U and -E hash_seed the two
   // filesystems differ, every descendant's key moves, and the store thrashes.
+  //
+  // What they promise is a byte-identical FILESYSTEM, so that is what is
+  // asserted, by two oracles that share nothing: qemu's own comparison of the
+  // guest-visible content, and the digest the realization key folds. This
+  // assertion used to read `containerSha256 === containerSha256`, which is a
+  // strictly stronger claim that mke2fs never made — see the observations
+  // below, and `realizationKey` in src/recipe/keys.ts.
+  const same = await qemu.compare(first.path, second.path, {
+    format: "qcow2",
+    formatB: "qcow2",
+  });
   assert(
-    artifact.layers[mkfsIndex].containerSha256 ===
-      rebuilt.layers[mkfsIndex].containerSha256,
-    "two independent boots produced byte-identical ext4:\n" +
-      `  first  ${artifact.layers[mkfsIndex].containerSha256}\n` +
-      `  second ${rebuilt.layers[mkfsIndex].containerSha256}`,
+    same.identical,
+    `two independent boots produced the same ext4:\n${same.output}`,
+  );
+  assert(
+    first.contentSha256 === second.contentSha256,
+    "and the same content digest:\n" +
+      `  first  ${first.contentSha256}\n  second ${second.contentSha256}`,
   );
   pass(
-    `ext4 layer is byte-identical across boots (${
-      artifact.layers[mkfsIndex].containerSha256.slice(0, 16)
+    `ext4 content is identical across boots (${
+      first.contentSha256.slice(0, 16)
     }…)`,
+  );
+
+  step("so two cold stores land on the same keys, layer for layer");
+  // The point of all of the above: a layer's key folds its parent's CONTENT
+  // digest, so a parent whose container bytes moved does not rename every
+  // directory beneath it. Folding the container digest instead, this failed
+  // whenever the ext4 layer's container came out differently — measured at 5
+  // runs in 10, and the two guest layers below are exactly the ones it cost
+  // the most to rebuild.
+  //
+  // Note what this does NOT claim: that a store transfers between machines.
+  // It cannot yet, and not because of anything here — vvfat stamps the HOST's
+  // mtimes into the FAT directory entries, so re-staging the same ESP tree
+  // moves the `table` layer's content (measured: 6 bytes) and every key above
+  // it. Within one staging, as here, the chain is stable.
+  assert(
+    artifact.layers.map((l) => l.realizationKey).join(",") ===
+      rebuilt.layers.map((l) => l.realizationKey).join(","),
+    "every layer landed on the same realization key in both cold stores:\n" +
+      artifact.layers.map((l, i) =>
+        `  ${planned.steps[i].id.padEnd(12)} ${l.realizationKey.slice(0, 16)}` +
+        ` vs ${rebuilt.layers[i].realizationKey.slice(0, 16)}`
+      ).join("\n"),
+  );
+  pass("both cold builds agree on all four keys");
+
+  // Observations, never assertions. The container digest moves with cluster
+  // and refcount ordering, which follows I/O completion order inside the
+  // guest; strict compare adds allocation status, which is the same class of
+  // property. Measured before this smoke stopped asserting on it: three
+  // distinct container digests over ten cold builds — 5 red runs in 10 — with
+  // the filesystem byte-identical every single time.
+  const strict = await qemu.compare(first.path, second.path, {
+    format: "qcow2",
+    formatB: "qcow2",
+    strict: true,
+  });
+  console.log(
+    `  · allocation ${
+      strict.identical ? "identical too" : `differs: ${strict.output.trim()}`
+    }`,
+  );
+  console.log(
+    `  · container  ${
+      first.containerSha256 === second.containerSha256
+        ? "identical too, this run"
+        : `${first.containerSha256.slice(0, 12)}… vs ${
+          second.containerSha256.slice(0, 12)
+        }… — expected, and no longer anyone's cache key`
+    }`,
   );
 
   console.log("\nsystem smoke: all green");

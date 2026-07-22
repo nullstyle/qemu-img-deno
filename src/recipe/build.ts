@@ -27,6 +27,7 @@ import {
   stepNonce,
 } from "../system/mod.ts";
 import { sha256Hex } from "../digest.ts";
+import { contentDigest } from "./content.ts";
 import { type RealizationKey, realizationKey } from "./keys.ts";
 import {
   type Plan,
@@ -383,7 +384,7 @@ export async function build(
       step.recipeKey,
       parent === undefined ? undefined : {
         realizationKey: parent.realizationKey,
-        containerSha256: parent.containerSha256,
+        contentSha256: parent.contentSha256,
       },
     );
 
@@ -484,11 +485,16 @@ export async function build(
         }
       }
 
+      // Digested from the `.partial` image, through its whole backing chain —
+      // this is the layer's identity, and every descendant's key folds it.
+      // Cheap despite the flattening: the materialization it reads through is
+      // sparse, so it costs the allocated bytes, not the virtual size.
       published = await store.publish(
         key,
         step.recipeKey,
+        await contentDigest(qemu, imagePath, { scratch, format: "qcow2" }),
         parent === undefined ? undefined : {
-          containerSha256: parent.containerSha256,
+          contentSha256: parent.contentSha256,
           realizationKey: parent.realizationKey,
         },
       );

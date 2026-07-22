@@ -56,7 +56,11 @@ an ESP gets built on a machine with no `mkfs.fat`.
   descendants stay hits, and since a qcow2 overlay is a block-level delta the
   image becomes `merge(parent_now, child_written_against_parent_then)` at
   cluster granularity: it mounts, and `qemu-img check` passes, because qcow2
-  records no size, digest or generation counter for a backing file.
+  records no size, digest or generation counter for a backing file. The digest
+  it folds is the parent's **guest-visible content**, not its container bytes:
+  an overlay's delta is addressed in guest space, so content is the one thing a
+  cached child can be silently wrong about — and container bytes move on their
+  own (see _Fixed_).
 
   Plan-time refusals, each naming its fix: a FAT partition below vvfat's fixed
   geometry (528450048 bytes at FAT16, regardless of content), an over-long FAT
@@ -81,7 +85,17 @@ an ESP gets built on a machine with no `mkfs.fat`.
   resolves a backing reference against the target's own directory and opens it
   before creating anything, so a `tmp/<uuid>/` staging dir can never resolve
   `../<parent>/image.qcow2`. Layers are `chmod 0444` and re-verified against
-  their recorded digest on every cache hit.
+  their recorded **container** digest on every cache hit.
+- **`contentDigest()`** — a digest over an image's guest-visible content, read
+  through its whole backing chain. Cluster layout, chain depth, allocation
+  status and the difference between an unallocated region and a written-out zero
+  cluster are all invisible to it; one changed byte is not. It is a layer's
+  identity in the store (`StoredLayer.contentSha256`) and what every
+  descendant's key chains through, while the container digest keeps the
+  tamper-check job it is actually right for. Cost is the image's _allocated_
+  bytes, not its virtual size: it flattens to a sparse raw file, then reads only
+  the extents `qemu-img map` reports as data. Measured on a 2 GiB image: 20 ms
+  holding 4 MiB, 49 ms holding 64 MiB, 152 ms holding 256 MiB.
 
 - **`./system`** — the guest tier, and the `build()` executor that dispatches
   through it. `ApplianceGuestRunner` boots the pinned appliance with the layer's
@@ -130,6 +144,26 @@ an ESP gets built on a machine with no `mkfs.fat`.
 
 ### Fixed
 
+- **A guest layer's container bytes are not reproducible, and every descendant's
+  cache key was chained through them.** A qcow2 written by a booted guest
+  records cluster and refcount ordering that follows I/O completion order, so
+  two boots that produce a byte-identical filesystem still produce different
+  container digests: measured on the system smoke's `table:mkfs` layer, at least
+  four distinct digests — same 2424832-byte length, same content,
+  `qemu-img compare --strict` identical on every pair. Because
+  `realizationKey()` folded the parent's `containerSha256`, a rebuilt guest
+  layer renamed every directory beneath it and forced a full downstream rebuild
+  for no semantic reason — including another VM boot per guest layer. Keys now
+  chain through `contentDigest()`. The on-disk tamper check is unchanged and
+  still container-based: it is the bytes on disk, which is exactly right for
+  catching a layer edited in place, and strictly stronger than content equality.
+  Preimage bumped to `qemu-img-realization@2`, so keys minted under the old
+  scheme are unreachable rather than merely unlikely to hit.
+- **`smoke:system` asserted byte-identical containers where it meant an
+  identical filesystem**, and so failed on the above — 5 runs in 10. It now
+  compares guest-visible content with `qemu-img compare` and content digests,
+  asserts that two cold stores agree on every realization key, and reports the
+  container and allocation comparisons as observations rather than failures.
 - **`LayerStore.publish()` could never re-publish a key.** `rename` onto a
   non-empty directory is `ENOTEMPTY`, and an uncacheable layer skips the cache
   lookup and so reaches `publish()` on _every_ run — meaning any recipe with a

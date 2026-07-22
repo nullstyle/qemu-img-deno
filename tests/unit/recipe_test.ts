@@ -496,19 +496,19 @@ Deno.test("a step's key changes when its input tree's content changes", async ()
 
 // ────────────────────────────────────────── the realization-key requirement ──
 
-Deno.test("realization keys chain through the parent's ACTUAL bytes", async () => {
+Deno.test("realization keys chain through the parent's ACTUAL content", async () => {
   const key = "k".repeat(64) as RecipeKey;
   const root = await realizationKey(key);
   const childA = await realizationKey(key, {
     realizationKey: root,
-    containerSha256: "a".repeat(64),
+    contentSha256: "a".repeat(64),
   });
   const childB = await realizationKey(key, {
     realizationKey: root,
-    containerSha256: "b".repeat(64),
+    contentSha256: "b".repeat(64),
   });
   // This is the guard against the worst failure the design can have: a parent
-  // whose bytes changed while its recipe key did not. If these collided, the
+  // whose content changed while its recipe key did not. If these collided, the
   // child would be a cache HIT whose overlay carries clusters written against
   // the parent's OLD layout — structural corruption that `qemu-img check`
   // cannot see, because qcow2 records nothing about a backing file's content.

@@ -59,12 +59,15 @@ export {
 
 export {
   canonicalJson,
+  type ParentRealization,
   type RealizationKey,
   realizationKey,
   type RecipeKey,
   recipeKey,
   sha256Hex,
 } from "./keys.ts";
+
+export { contentDigest, type ContentDigestOptions } from "./content.ts";
 
 export {
   type BaseSpec,

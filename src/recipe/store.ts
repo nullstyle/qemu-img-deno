@@ -35,15 +35,37 @@ export interface StoredLayer {
    * sha256 of the container file, recorded at publish and re-verified on hit.
    *
    * This is deliberately the wrong artifact *identity* — it moves with cluster
-   * layout and chain depth — but exactly the right tamper check, and it is
-   * what a child's realization key folds in. It catches the likeliest real
-   * corruption: someone boots a cached layer directly, qemu opens it
-   * read-write, and every descendant is now built on sand. `qemu-img check`
-   * cannot detect that, because the chain stays structurally perfect.
+   * layout, chain depth and, for a layer a guest wrote, with I/O completion
+   * order between two boots that produced the same filesystem — but exactly
+   * the right tamper check. It catches the likeliest real corruption: someone
+   * boots a cached layer directly, qemu opens it read-write, and every
+   * descendant is now built on sand. `qemu-img check` cannot detect that,
+   * because the chain stays structurally perfect.
+   *
+   * Identity is {@linkcode StoredLayer.contentSha256}'s job. Both are recorded
+   * because they answer different questions, and neither substitutes for the
+   * other.
    */
   readonly containerSha256: string;
-  /** The parent's container digest, for auditing. */
-  readonly parentContainerSha256?: string;
+  /**
+   * sha256 over the layer's guest-visible content — what a guest READS through
+   * it, including every byte inherited from its parents.
+   *
+   * This is the layer's identity, and it is what a child's realization key
+   * folds in: a child's overlay is a delta in guest address space, so content
+   * is the only property of a parent it can be silently wrong about. Unlike
+   * the container digest it does not move when qemu stores the same bytes
+   * differently. See `contentDigest()` in `./content.ts`.
+   */
+  readonly contentSha256: string;
+  /**
+   * The parent's content digest — the value this layer's realization key
+   * folded.
+   *
+   * Recorded so a published key can be re-derived from this manifest alone,
+   * with no need to open a parent that may since have been collected.
+   */
+  readonly parentContentSha256?: string;
   /**
    * The parent layer's key, absent on a base layer.
    *
@@ -319,15 +341,23 @@ export class LayerStore {
    * Publish a completed layer: hash it, write its manifest, make it read-only,
    * then rename into place.
    *
+   * `contentSha256` comes from the caller rather than being computed here, and
+   * that is the one thing about this signature worth defending: reading a
+   * layer's guest-visible content means running `qemu-img`, and this module
+   * otherwise touches nothing but the filesystem — which is what lets its
+   * tests cover locking, publishing and collection with no binary installed.
+   * `build()` computes it with the driver it already holds.
+   *
    * The image is `chmod 0444` because the one corruption this design cannot
    * otherwise prevent is someone opening a cached layer read-write.
    */
   async publish(
     key: RealizationKey,
     recipeKey: RecipeKey,
+    contentSha256: string,
     parent?: {
-      /** The parent's container digest. */
-      readonly containerSha256: string;
+      /** The parent's content digest — the value the key folded. */
+      readonly contentSha256: string;
       /** The parent's key, for garbage collection. */
       readonly realizationKey: RealizationKey;
     },
@@ -340,8 +370,9 @@ export class LayerStore {
       realizationKey: key,
       recipeKey,
       containerSha256,
+      contentSha256,
       ...(parent === undefined ? {} : {
-        parentContainerSha256: parent.containerSha256,
+        parentContentSha256: parent.contentSha256,
         parentRealizationKey: parent.realizationKey,
       }),
     };

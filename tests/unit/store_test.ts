@@ -20,11 +20,20 @@ async function layer(
   store: LayerStore,
   name: string,
   content: string,
-  parent?: { containerSha256: string; realizationKey: RealizationKey },
+  parent?: { contentSha256: string; realizationKey: RealizationKey },
 ) {
   const dir = await store.begin(key(name));
   await Deno.writeTextFile(`${dir}/image.qcow2`, content);
-  return await store.publish(key(name), recipeKey(`r-${name}`), parent);
+  // The content digest arrives from the caller: reading a layer's
+  // guest-visible content means running qemu-img, and this module is pure
+  // filesystem — which is what lets these tests cover locking, publishing and
+  // collection with no binary installed. A stand-in is all the store sees.
+  return await store.publish(
+    key(name),
+    recipeKey(`r-${name}`),
+    `content-of-${name}`,
+    parent,
+  );
 }
 
 Deno.test("a layer's manifest holds no absolute path, so the store relocates", async () => {
