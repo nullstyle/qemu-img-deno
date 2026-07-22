@@ -61,6 +61,7 @@ export {
   type ApplianceArch,
   type ApplianceIdentity,
   type ApplianceIdentityRecord,
+  DEFAULT_LOCK_URL,
   IDENTITY_FILE,
   readApplianceIdentity,
   type ReadApplianceIdentityOptions,

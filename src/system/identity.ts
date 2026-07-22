@@ -66,15 +66,47 @@ export type ApplianceIdentityRecord = Omit<
 
 /** Options for {@linkcode readApplianceIdentity}. */
 export interface ReadApplianceIdentityOptions {
-  /** Root holding `<arch>/`. @default ".appliance" */
+  /**
+   * Root holding `<arch>/`, resolved against the process's cwd.
+   *
+   * Cwd-relative on purpose, unlike {@linkcode lockPath}: an appliance is a
+   * build product belonging to whoever built it, so it lives in the *caller's*
+   * project, not beside this package's source.
+   *
+   * @default ".appliance"
+   */
   readonly root?: string;
   /** Which appliance to read. */
   readonly arch: ApplianceArch;
-  /** Path to the lockfile to verify against. @default "appliance.lock.json" */
-  readonly lockPath?: string;
+  /**
+   * The lockfile whose bytes the appliance must have been built from.
+   *
+   * Defaults to the `appliance.lock.json` published *with this package*,
+   * addressed through the module's own URL — see {@linkcode DEFAULT_LOCK_URL}.
+   * Pass a path or URL to verify against a different copy.
+   */
+  readonly lockPath?: string | URL;
   /** Subprocess seam used to probe the qemu version. @default a real runner */
   readonly qemu?: CommandRunner;
 }
+
+/**
+ * The `appliance.lock.json` published with this package, as a URL.
+ *
+ * Addressed through the MODULE's own location rather than the process's cwd.
+ * The previous default was the bare string `"appliance.lock.json"`, which
+ * `Deno.readFile` resolves against `Deno.cwd()` — this repository only when the
+ * caller happens to *be* this repository. Measured against a staged copy of the
+ * published file set, from a consumer's own project directory, the default
+ * failed with `NotFound: No such file or directory (os error 2): readfile
+ * 'appliance.lock.json'`: a raw errno naming a file the reader never wrote.
+ *
+ * This resolves to a `file:` URL for a checkout or a vendored copy, and to the
+ * registry origin for a package installed from JSR.
+ */
+export const DEFAULT_LOCK_URL: string = import.meta.resolve(
+  "../../appliance.lock.json",
+);
 
 /** The identity file's name inside `<root>/<arch>/`. */
 export const IDENTITY_FILE = "appliance.json";
@@ -114,7 +146,6 @@ export async function readApplianceIdentity(
 ): Promise<ApplianceIdentity> {
   const arch = options.arch;
   const work = `${options.root ?? ".appliance"}/${arch}`;
-  const lockPath = options.lockPath ?? "appliance.lock.json";
   const identityPath = `${work}/${IDENTITY_FILE}`;
 
   const text = await Deno.readTextFile(identityPath).catch(() => undefined);
@@ -147,7 +178,7 @@ export async function readApplianceIdentity(
       arch,
     );
   }
-  const expectedLock = await sha256Hex(await Deno.readFile(lockPath));
+  const expectedLock = await sha256Hex(await readLockBytes(options.lockPath));
   if (record.lockSha256 !== expectedLock) {
     throw new StaleApplianceError(
       "lock",
@@ -182,6 +213,45 @@ export async function readApplianceIdentity(
     qemuSystemVersion,
   };
   return { ...fields, digest: await sha256Hex(canonicalJson(fields)) };
+}
+
+/**
+ * The lockfile's exact bytes, from an explicit path or from the package's own.
+ *
+ * Bytes, never a re-serialized parse: the digest this feeds has to match the
+ * one the builder recorded over the file as it sits on disk, so any
+ * normalization here would fail every appliance ever built.
+ *
+ * `Deno.readFile` covers a `file:` module — a checkout, a vendored copy, or a
+ * path dependency. A package installed from JSR resolves to `https:`, which
+ * `Deno.readFile` cannot open at all, so that case goes through `fetch` and
+ * needs read access to the registry origin.
+ */
+async function readLockBytes(
+  lockPath: string | URL | undefined,
+): Promise<Uint8Array> {
+  const target = lockPath ?? new URL(DEFAULT_LOCK_URL);
+  try {
+    if (target instanceof URL && target.protocol !== "file:") {
+      const response = await fetch(target);
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      return new Uint8Array(await response.arrayBuffer());
+    }
+    return await Deno.readFile(target);
+  } catch (cause) {
+    throw new Error(
+      `cannot read the appliance lockfile at ${target}\n  ` +
+        (cause instanceof Error ? cause.message : String(cause)) + "\n" +
+        "readApplianceIdentity() hashes this file to prove the appliance on " +
+        "disk was built from the pins this package version declares. Skipping " +
+        "the check is not an option it offers: an appliance built from other " +
+        "pins carries a different e2fsprogs and a different kernel, and would " +
+        "publish guest layers under keys that promise these ones. The file " +
+        "ships with the package — pass `lockPath` to name your own copy, or " +
+        "grant read access to the module's own origin.",
+      { cause },
+    );
+  }
 }
 
 /**
