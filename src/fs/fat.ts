@@ -6,7 +6,8 @@
  * It exists because `Deno.utime()` cannot close the loop. vvfat reads each
  * staged file's `st_mtime`, `st_atime` and `st_ctime` and packs them into the
  * entry's write, access and creation fields; pinning the first two settles
- * `DIR_WrtTime` and `DIR_LstAccDate`, but no userspace call sets a birth time,
+ * `DIR_WrtTime` and `DIR_LstAccDate`, but no userspace call can pin `st_ctime` —
+ * `utimes()` bumps it to now as a side effect of setting the other two,
  * so `DIR_CrtTime` records the wall clock at which the staging copy was made.
  * Measured on qemu 11.0.2 over the system smoke's ESP, two builds three
  * seconds apart: 8 bytes differed, every one at offset 14 of a 32-byte

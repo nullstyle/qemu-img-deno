@@ -198,36 +198,58 @@ try {
   step("the ext4 root is real: independent parsers agree");
   const raw = `${work}/appliance.raw`;
   await qemu.convert(output, raw, { format: "raw", parallel: 1 });
-  const attach = await new Deno.Command("hdiutil", {
-    args: [
-      "attach",
-      "-nomount",
-      "-imagekey",
-      "diskimage-class=CRawDiskImage",
-      raw,
-    ],
-    stdout: "piped",
-    stderr: "piped",
-  }).output();
-  const attached = new TextDecoder().decode(attach.stdout);
+  // `Deno.Command#output()` throws SYNCHRONOUSLY when the binary is missing,
+  // so `.catch()` never sees it — this needs a real try/catch. Without one
+  // the whole smoke died with `Failed to spawn 'hdiutil'` on any machine
+  // without it, which is every Linux CI runner, so none of the assertions
+  // below or after ever ran there.
+  let attached = "";
+  try {
+    const attach = await new Deno.Command("hdiutil", {
+      args: [
+        "attach",
+        "-nomount",
+        "-imagekey",
+        "diskimage-class=CRawDiskImage",
+        raw,
+      ],
+      stdout: "piped",
+      stderr: "piped",
+    }).output();
+    attached = new TextDecoder().decode(attach.stdout);
+  } catch {
+    // Not macOS. The guest-side verification below is the portable oracle.
+  }
   const device = /^(\/dev\/disk\d+)/m.exec(attached)?.[1];
   if (device === undefined) {
     console.log("  · hdiutil unavailable — parser cross-check skipped");
   } else {
     try {
-      const list = await new Deno.Command("diskutil", {
-        args: ["list", device],
-        stdout: "piped",
-      }).output();
-      const text = new TextDecoder().decode(list.stdout);
-      assert(/EFI/.test(text), `diskutil sees the ESP:\n${text}`);
-      // diskutil has no friendly name for the aarch64 root type, so it prints
-      // the GUID — which is a stricter check than a name would have been.
-      assert(
-        /B921B045-1DF0-41C3-AF44-4C6F280D3FAE/i.test(text),
-        `diskutil reports the aarch64 root type GUID:\n${text}`,
-      );
-      pass("diskutil parsed the GPT and typed both partitions");
+      // Same synchronous-throw hazard as hdiutil above, and a separate one:
+      // hdiutil lives in /usr/bin and diskutil in /usr/sbin, so a PATH can
+      // easily have one and not the other.
+      let text: string | undefined;
+      try {
+        const list = await new Deno.Command("diskutil", {
+          args: ["list", device],
+          stdout: "piped",
+        }).output();
+        text = new TextDecoder().decode(list.stdout);
+      } catch {
+        text = undefined;
+      }
+      if (text === undefined) {
+        console.log("  · diskutil unavailable — GPT parser check skipped");
+      } else {
+        assert(/EFI/.test(text), `diskutil sees the ESP:\n${text}`);
+        // diskutil has no friendly name for the aarch64 root type, so it prints
+        // the GUID — which is a stricter check than a name would have been.
+        assert(
+          /B921B045-1DF0-41C3-AF44-4C6F280D3FAE/i.test(text),
+          `diskutil reports the aarch64 root type GUID:\n${text}`,
+        );
+        pass("diskutil parsed the GPT and typed both partitions");
+      }
     } finally {
       await new Deno.Command("hdiutil", {
         args: ["detach", device, "-force"],

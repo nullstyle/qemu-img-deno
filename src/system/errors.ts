@@ -59,13 +59,17 @@ export class StaleApplianceError extends Error {
     arch: string,
   ) {
     super(
-      `the ${arch} build appliance does not match this source tree ` +
+      `the ${arch} build appliance does not match the package driving it ` +
         `(${field})\n  expected ${expected}\n  actual   ${actual}\n` +
         "A guest layer's bytes are a function of the appliance that produced " +
         "them, and nothing in the recipe declares it — so an appliance built " +
         "from a different /init, lockfile or kernel would publish layers " +
-        `under keys that promise this one's. Rebuild it: deno task appliance ` +
-        `--arch=${arch}`,
+        "under keys that promise this one's. Rebuild the appliance for this " +
+        "package version. In a checkout of this repository that is " +
+        `\`deno task appliance --arch=${arch}\`` +
+        "; installed from JSR there is no appliance build — supply your own " +
+        'GuestRunner through BuildOptions.guest instead (README, "Producing ' +
+        'an appliance").',
     );
     this.name = "StaleApplianceError";
     this.field = field;

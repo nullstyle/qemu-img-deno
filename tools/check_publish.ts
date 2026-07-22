@@ -14,6 +14,12 @@ const REQUIRED_INCLUDE = [
   "mod.ts",
   "src/**",
   "testing/**",
+  // Package DATA, not build scripts: readApplianceIdentity() hashes
+  // appliance.lock.json to prove an appliance matches this version's pins.
+  // Omitting them let publish:check pass while the published package was
+  // unusable, which is the regression this list exists to prevent.
+  "appliance.lock.json",
+  "cloud.lock.json",
   "README.md",
   "LICENSE",
   "deno.json",

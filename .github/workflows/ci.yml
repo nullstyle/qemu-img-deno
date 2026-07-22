@@ -107,14 +107,17 @@ jobs:
   # tens of minutes -- affordable even under TCG.
   #
   # Manual-only all the same, because two things are unproven:
-  #   - tools/system_smoke.ts spawns `hdiutil` unguarded, so on any Linux host
-  #     it FAILS where it means to skip (verified: exit 1, "Failed to spawn
-  #     'hdiutil'"). Wrapping that one call in try/catch -- not `.catch()`,
-  #     Deno.Command#output() throws synchronously -- takes the whole smoke to
-  #     green with no macOS tools present, also verified. Until that lands,
-  #     this job is red by construction.
-  #   - no GitHub runner has been observed emulating aarch64 here at all.
-  # Give it a `schedule:` trigger once it has passed once for real.
+  #   - the Linux blocker is FIXED: system_smoke.ts guarded its `hdiutil` and
+  #     `diskutil` spawns (Deno.Command#output() throws SYNCHRONOUSLY on a
+  #     missing binary, so `.catch()` does not see it). Verified locally with
+  #     a PATH holding neither: both smokes skip the macOS-only oracles and
+  #     exit 0, and smoke:cloud was already clean.
+  #   - what is STILL unverified is this runner: no GitHub runner has been
+  #     observed emulating aarch64 here at all, and the job additionally needs
+  #     qemu-system-aarch64 plus a network appliance build.
+  # So: run it once by hand from the Actions tab. If it goes green, give it a
+  # `schedule:` trigger. It stays manual until someone has seen it pass, since
+  # a scheduled red is worse than an inert manual job.
   smoke-guest:
     name: guest-tier smoke (manual)
     if: github.event_name == 'workflow_dispatch'
