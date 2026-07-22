@@ -65,6 +65,48 @@ export type FormatOptions = Readonly<
  */
 export type SizeValue = number | string;
 
+/**
+ * A qemu block-driver node: a `driver` plus its options, with child nodes
+ * nested under their role (`file`, `backing`).
+ *
+ * Rendered to qemu's `key=value,child.key=value` form with keys sorted, so
+ * argv stays deterministic and test-pinnable. Booleans render as `on`/`off`.
+ *
+ * The `raw` driver's `offset`/`size` pair is the useful one: it exposes a
+ * *window* onto a larger image, which is how bytes are written into one
+ * partition without touching its neighbours.
+ *
+ * @example A 512 MiB window starting 1 MiB into a qcow2
+ * ```ts
+ * const window = {
+ *   driver: "raw",
+ *   offset: 1048576,
+ *   size: 536870912,
+ *   file: { driver: "qcow2", file: { driver: "file", filename: "/disk.qcow2" } },
+ * };
+ * ```
+ */
+export type BlockNodeSpec = {
+  /** The block driver name (`"raw"`, `"qcow2"`, `"file"`, `"vvfat"`, …). */
+  readonly driver: string;
+  /** Driver options, and child nodes under their role. */
+  readonly [key: string]: string | number | boolean | BlockNodeSpec;
+};
+
+/**
+ * An image operand: a path, or an option graph passed through qemu's
+ * `--image-opts`.
+ *
+ * A plain string behaves exactly as before and emits identical argv. An
+ * option graph is mutually exclusive with the format flags (`-f`/`-O`/`-F`) —
+ * qemu rejects the combination, and so does this library, earlier and with a
+ * typed error.
+ */
+export type ImageRef = string | {
+  /** The block-node graph describing this operand. */
+  readonly imageOpts: BlockNodeSpec;
+};
+
 /** Options for {@linkcode QemuImg.amend}. */
 export interface AmendOptions extends CallOptions {
   /** Format-specific options to apply (`-o`). */
@@ -160,8 +202,19 @@ export interface CompareOptions extends CallOptions {
 
 /** Options for {@linkcode QemuImg.convert}. */
 export interface ConvertOptions extends CallOptions {
-  /** Output format (`-O`). */
-  readonly format: ImageFormat;
+  /**
+   * Output format (`-O`). Required for a path destination; refused for an
+   * option-graph destination, which carries its own `driver`.
+   */
+  readonly format?: ImageFormat;
+  /**
+   * Number of coroutines running in parallel (`-m`).
+   *
+   * Pin to `1` whenever the output will be hashed: higher values let writes
+   * complete out of order, so the resulting file's cluster layout — though not
+   * its guest-visible content — varies between runs. `-W` is never emitted.
+   */
+  readonly parallel?: number;
   /** Source format (`-f`, skips probing). */
   readonly sourceFormat?: ImageFormat;
   /** Compress output clusters (`-c`; qcow2/qed only). */
@@ -247,7 +300,7 @@ export interface MeasureOptions extends CallOptions {
   /** Output format the measurement is for (`-O`). */
   readonly outputFormat: ImageFormat;
   /** Measure converting this existing image. */
-  readonly source?: string;
+  readonly source?: ImageRef;
   /** Measure a fresh image of this virtual size (`--size`). */
   readonly size?: SizeValue;
   /** Source format (`-f`; only meaningful with `source`). */
@@ -503,17 +556,31 @@ export class QemuImg {
    * `CommandError`.
    */
   async compare(
-    a: string,
-    b: string,
+    a: ImageRef,
+    b: ImageRef,
     options: CompareOptions = {},
   ): Promise<CompareResult> {
+    const graph = isOptionGraph(a) || isOptionGraph(b);
+    if (graph && !(isOptionGraph(a) && isOptionGraph(b))) {
+      throw new TypeError(
+        "compare needs both operands as option graphs or neither: " +
+          "--image-opts applies to FILE1 and FILE2 together",
+      );
+    }
+    if (
+      graph &&
+      (options.format !== undefined || options.formatB !== undefined)
+    ) {
+      throw new TypeError(MUTUALLY_EXCLUSIVE("compare"));
+    }
     const args = [
       "compare",
-      ...flag("-f", options.format),
-      ...flag("-F", options.formatB),
+      ...(graph
+        ? ["--image-opts"]
+        : [...flag("-f", options.format), ...flag("-F", options.formatB)]),
       ...(options.strict === true ? ["-s"] : []),
-      a,
-      b,
+      refArg(a),
+      refArg(b),
     ];
     const result = await this.#run(args, options);
     if (result.code !== 0 && result.code !== 1) {
@@ -538,14 +605,49 @@ export class QemuImg {
    * {@linkcode QemuImg.prototype.compare} against a known-good copy.
    */
   async convert(
-    source: string | readonly string[],
-    dest: string,
+    source: ImageRef | readonly ImageRef[],
+    dest: ImageRef,
     options: ConvertOptions,
   ): Promise<void> {
-    const sources = typeof source === "string" ? [source] : [...source];
+    const sources: ImageRef[] = Array.isArray(source)
+      ? [...(source as readonly ImageRef[])]
+      : [source as ImageRef];
+    const sourceIsGraph = sources.some(isOptionGraph);
+    if (sourceIsGraph && sources.length > 1) {
+      throw new TypeError(
+        "convert accepts at most one source when it is an option graph: " +
+          "--image-opts applies to every source, so paths and graphs cannot " +
+          "be mixed",
+      );
+    }
+    if (sourceIsGraph && options.sourceFormat !== undefined) {
+      throw new TypeError(
+        "convert cannot combine an option-graph source with sourceFormat: " +
+          "--image-opts and --format are mutually exclusive (put the format " +
+          "in the graph's `driver` instead)",
+      );
+    }
+    const destIsGraph = isOptionGraph(dest);
+    if (destIsGraph && options.noCreate !== true) {
+      throw new TypeError(
+        "convert into an option-graph destination requires noCreate: qemu " +
+          "refuses --target-image-opts without -n, because an option graph " +
+          "names an existing node rather than a file to create",
+      );
+    }
+    if (destIsGraph && options.format !== undefined) {
+      throw new TypeError(
+        "convert cannot combine an option-graph destination with format: " +
+          "--target-image-opts and -O are mutually exclusive (put the format " +
+          "in the graph's `driver` instead)",
+      );
+    }
+    if (!destIsGraph && options.format === undefined) {
+      throw new TypeError("convert needs a format for a path destination");
+    }
     await this.#checkedVoid([
       "convert",
-      ...flag("-f", options.sourceFormat),
+      ...(sourceIsGraph ? ["--image-opts"] : flag("-f", options.sourceFormat)),
       ...(options.compress === true ? ["-c"] : []),
       ...(options.noCreate === true ? ["-n"] : []),
       // `-B ""` alongside `-F` segfaults qemu-img 11.0.2 (SIGSEGV, 3/3) after
@@ -558,12 +660,12 @@ export class QemuImg {
         ? []
         : ["-o", formatOptionsArg(options.options)]),
       ...flag("-S", options.sparseSize),
+      ...flag("-m", options.parallel),
       ...(options.salvage === true ? ["--salvage"] : []),
       ...(options.targetIsZero === true ? ["--target-is-zero"] : []),
-      "-O",
-      options.format,
-      ...sources,
-      dest,
+      ...(destIsGraph ? ["--target-image-opts"] : ["-O", options.format!]),
+      ...sources.map(refArg),
+      refArg(dest),
     ], options);
   }
 
@@ -600,13 +702,17 @@ export class QemuImg {
   }
 
   /** Typed `qemu-img info --output=json <path>`. */
-  async info(path: string, options: InfoOptions = {}): Promise<QemuImgInfo> {
+  async info(path: ImageRef, options: InfoOptions = {}): Promise<QemuImgInfo> {
+    const graph = isOptionGraph(path);
+    if (graph && options.format !== undefined) {
+      throw new TypeError(MUTUALLY_EXCLUSIVE("info"));
+    }
     const result = await this.#checked(
       [
         "info",
-        ...flag("-f", options.format),
+        ...(graph ? ["--image-opts"] : flag("-f", options.format)),
         "--output=json",
-        path,
+        refArg(path),
       ],
       options,
       { uncapped: true },
@@ -616,16 +722,20 @@ export class QemuImg {
 
   /** The whole backing chain: `qemu-img info --backing-chain --output=json`. */
   async infoChain(
-    path: string,
+    path: ImageRef,
     options: InfoOptions = {},
   ): Promise<QemuImgInfo[]> {
+    const graph = isOptionGraph(path);
+    if (graph && options.format !== undefined) {
+      throw new TypeError(MUTUALLY_EXCLUSIVE("info"));
+    }
     const result = await this.#checked(
       [
         "info",
-        ...flag("-f", options.format),
+        ...(graph ? ["--image-opts"] : flag("-f", options.format)),
         "--backing-chain",
         "--output=json",
-        path,
+        refArg(path),
       ],
       options,
       { uncapped: true },
@@ -634,13 +744,17 @@ export class QemuImg {
   }
 
   /** Allocation map: `qemu-img map --output=json <path>`. */
-  async map(path: string, options: MapOptions = {}): Promise<MapExtent[]> {
+  async map(path: ImageRef, options: MapOptions = {}): Promise<MapExtent[]> {
+    const graph = isOptionGraph(path);
+    if (graph && options.format !== undefined) {
+      throw new TypeError(MUTUALLY_EXCLUSIVE("map"));
+    }
     const result = await this.#checked(
       [
         "map",
-        ...flag("-f", options.format),
+        ...(graph ? ["--image-opts"] : flag("-f", options.format)),
         "--output=json",
-        path,
+        refArg(path),
       ],
       options,
       { uncapped: true },
@@ -659,17 +773,25 @@ export class QemuImg {
     if (hasSource === hasSize) {
       throw new TypeError("measure needs exactly one of source or size");
     }
+    const sourceIsGraph = hasSource && isOptionGraph(options.source!);
+    if (sourceIsGraph && options.sourceFormat !== undefined) {
+      throw new TypeError(MUTUALLY_EXCLUSIVE("measure"));
+    }
     const result = await this.#checked(
       [
         "measure",
-        ...flag("-f", options.sourceFormat),
+        ...(sourceIsGraph
+          ? ["--image-opts"]
+          : flag("-f", options.sourceFormat)),
         ...(options.options === undefined
           ? []
           : ["-o", formatOptionsArg(options.options)]),
         "-O",
         options.outputFormat,
         "--output=json",
-        ...(hasSize ? ["--size", sizeArg(options.size!)] : [options.source!]),
+        ...(hasSize
+          ? ["--size", sizeArg(options.size!)]
+          : [refArg(options.source!)]),
       ],
       options,
       { uncapped: true },
@@ -784,6 +906,51 @@ function flag(
   value: string | number | undefined,
 ): string[] {
   return value === undefined ? [] : [name, sizeArg(value)];
+}
+
+/** The shared refusal message for an option graph paired with a format flag. */
+function MUTUALLY_EXCLUSIVE(verb: string): string {
+  return `${verb} cannot combine an option graph with a format flag: ` +
+    "qemu rejects --image-opts alongside --format (put the format in the " +
+    "graph's `driver` instead)";
+}
+
+/** Whether an {@linkcode ImageRef} is an option graph rather than a path. */
+function isOptionGraph(
+  ref: ImageRef,
+): ref is { readonly imageOpts: BlockNodeSpec } {
+  return typeof ref !== "string";
+}
+
+/** The argv token for an {@linkcode ImageRef}. */
+function refArg(ref: ImageRef): string {
+  return isOptionGraph(ref) ? renderBlockNode(ref.imageOpts) : ref;
+}
+
+/**
+ * Render a {@linkcode BlockNodeSpec} to `key=value,child.key=value`, keys
+ * sorted so the argv a given graph produces is stable.
+ */
+export function renderBlockNode(node: BlockNodeSpec): string {
+  const flat: Record<string, string> = {};
+  const walk = (current: BlockNodeSpec, prefix: string): void => {
+    for (const key of Object.keys(current)) {
+      const value = current[key];
+      const path = prefix === "" ? key : `${prefix}.${key}`;
+      if (typeof value === "object" && value !== null) {
+        walk(value, path);
+      } else {
+        flat[path] = typeof value === "boolean"
+          ? (value ? "on" : "off")
+          : String(value);
+      }
+    }
+  };
+  walk(node, "");
+  return Object.keys(flat)
+    .sort()
+    .map((key) => `${key}=${flat[key]}`)
+    .join(",");
 }
 
 function sizeArg(value: SizeValue): string {

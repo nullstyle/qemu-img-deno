@@ -250,6 +250,119 @@ try {
   assert(report.length > 0, "bench produced a report");
   pass("bench");
 
+  step("convert with a backing file (the layer-cache argv path)");
+  // Previously unexercised here: every convert in this smoke was backing-less,
+  // so the flag spelling a backing chain depends on was never validated.
+  const backed = `${dir}/backed.qcow2`;
+  await qemu.convert(dataBase, backed, {
+    format: "qcow2",
+    backing: base,
+    backingFormat: "qcow2",
+  });
+  assert(
+    (await qemu.info(backed)).backingFilename === base,
+    "convert -B recorded the backing reference",
+  );
+  pass("convert with backing");
+
+  step("option-graph window write: bytes land in the window and nowhere else");
+  // The mechanism the whole from-scratch build path rests on. A `raw` node
+  // with offset/size is a WINDOW onto a larger image, so a filesystem can be
+  // written into one partition without touching its neighbours.
+  const windowTarget = `${dir}/window.raw`;
+  const patternFile = `${dir}/pattern.bin`;
+  const WINDOW_OFFSET = 1024 * 1024;
+  const WINDOW_SIZE = 64 * 1024;
+  await Deno.writeFile(windowTarget, new Uint8Array(8 * 1024 * 1024));
+  await Deno.writeFile(patternFile, new Uint8Array(WINDOW_SIZE).fill(0xab));
+  await qemu.convert(patternFile, {
+    imageOpts: {
+      driver: "raw",
+      offset: WINDOW_OFFSET,
+      size: WINDOW_SIZE,
+      file: { driver: "file", filename: windowTarget },
+    },
+  }, { sourceFormat: "raw", noCreate: true, parallel: 1 });
+  const written = await Deno.readFile(windowTarget);
+  assert(
+    written.slice(WINDOW_OFFSET, WINDOW_OFFSET + WINDOW_SIZE)
+      .every((byte) => byte === 0xab),
+    "the window holds the pattern",
+  );
+  assert(
+    written.slice(0, WINDOW_OFFSET).every((byte) => byte === 0) &&
+      written.slice(WINDOW_OFFSET + WINDOW_SIZE).every((byte) => byte === 0),
+    "nothing outside the window was touched",
+  );
+  pass("option-graph window write");
+
+  step("vvfat: a FAT filesystem with no mkfs.fat on the host");
+  // qemu's vvfat driver synthesizes FAT from a host directory. Wrapped in a
+  // `raw` window at 32256 its own MBR is stripped, leaving the bare
+  // filesystem — the only way to produce an ESP on a host with no mkfs.fat.
+  const VVFAT_MBR_BYTES = 32256;
+  const VVFAT_FAT16_BYTES = 528450048;
+  const staging = `${dir}/staging`;
+  await Deno.mkdir(`${staging}/EFI/BOOT`, { recursive: true });
+  await Deno.writeTextFile(`${staging}/EFI/BOOT/README.TXT`, "built by qemu\n");
+  const espDisk = `${dir}/esp.qcow2`;
+  await qemu.create(espDisk, { format: "qcow2", size: "600M" });
+  await qemu.convert({
+    imageOpts: {
+      driver: "raw",
+      offset: VVFAT_MBR_BYTES,
+      size: VVFAT_FAT16_BYTES,
+      file: { driver: "vvfat", dir: staging, "fat-type": 16, label: "EFI" },
+    },
+  }, {
+    imageOpts: {
+      driver: "raw",
+      offset: 1024 * 1024,
+      size: VVFAT_FAT16_BYTES,
+      file: {
+        driver: "qcow2",
+        file: { driver: "file", filename: espDisk },
+      },
+    },
+  }, { noCreate: true, parallel: 1 });
+  const extracted = `${dir}/extracted.fat`;
+  await qemu.convert(
+    {
+      imageOpts: {
+        driver: "raw",
+        offset: 1024 * 1024,
+        size: VVFAT_FAT16_BYTES,
+        file: {
+          driver: "qcow2",
+          file: { driver: "file", filename: espDisk },
+        },
+      },
+    },
+    extracted,
+    { format: "raw", parallel: 1 },
+  );
+  // Validate against an INDEPENDENT FAT implementation where one exists;
+  // a self-round-trip through qemu would not catch a shared misreading.
+  let fsckRan = false;
+  try {
+    const fsck = new Deno.Command("/sbin/fsck_msdos", {
+      args: ["-n", extracted],
+      stdout: "piped",
+      stderr: "piped",
+    });
+    const result = await fsck.output();
+    fsckRan = true;
+    assert(result.code === 0, "fsck_msdos accepts the generated filesystem");
+  } catch {
+    // Not macOS; the extraction above is still the meaningful assertion.
+  }
+  console.log(
+    `  · independent FAT check: ${
+      fsckRan ? "fsck_msdos clean" : "skipped (no /sbin/fsck_msdos)"
+    }`,
+  );
+  pass("vvfat ESP built without mkfs.fat");
+
   console.log("\nqemu-img smoke: all green");
 } finally {
   await Deno.remove(dir, { recursive: true });

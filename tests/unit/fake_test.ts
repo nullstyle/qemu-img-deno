@@ -1,4 +1,4 @@
-import { assertEquals, assertRejects } from "@std/assert";
+import { assertEquals, assertRejects, assertThrows } from "@std/assert";
 import { failed, FakeQemuImg, ok } from "../../testing/mod.ts";
 
 Deno.test("run records calls; commandLines flattens them", async () => {
@@ -175,4 +175,66 @@ Deno.test("info --backing-chain walks links; ok/failed helpers shape results", (
     stdout: "",
     stderr: "e",
   });
+});
+
+Deno.test("create accepts the long backing spellings and builds the right image", () => {
+  const fake = new FakeQemuImg();
+  fake.setImage("/base.qcow2", { virtualSizeBytes: 1024 });
+  fake.dispatch({
+    bin: "qemu-img",
+    args: [
+      "create",
+      "-f",
+      "qcow2",
+      "--backing",
+      "/base.qcow2",
+      "--backing-format",
+      "qcow2",
+      "/out.qcow2",
+    ],
+  });
+  // Regression: these flags used to be skipped as unknown, so their values
+  // became positionals — the fake registered an image at "/base.qcow2",
+  // clobbered the real base, never created /out.qcow2, and returned exit 0.
+  const out = fake.images.get("/out.qcow2");
+  assertEquals(out?.backingFilename, "/base.qcow2");
+  assertEquals(out?.backingFormat, "qcow2");
+  assertEquals(out?.virtualSizeBytes, 1024, "size inherited from the backing");
+  assertEquals(fake.images.get("/base.qcow2")?.virtualSizeBytes, 1024);
+});
+
+Deno.test("an unrecognized flag throws instead of mis-parsing positionals", () => {
+  const fake = new FakeQemuImg();
+  fake.setImage("/x.qcow2");
+  assertThrows(
+    () =>
+      fake.dispatch({
+        bin: "qemu-img",
+        args: ["create", "-f", "qcow2", "--not-a-flag", "value", "/y.qcow2"],
+      }),
+    Error,
+    "unrecognized flag --not-a-flag",
+  );
+});
+
+Deno.test("refuseContentOracles refuses the verbs the fake cannot honestly answer", () => {
+  const fake = new FakeQemuImg();
+  fake.setImage("/a.qcow2");
+  fake.setImage("/b.qcow2");
+  fake.refuseContentOracles = true;
+  for (
+    const args of [
+      ["compare", "/a.qcow2", "/b.qcow2"],
+      ["check", "--output=json", "/a.qcow2"],
+      ["map", "--output=json", "/a.qcow2"],
+    ]
+  ) {
+    assertThrows(
+      () => fake.dispatch({ bin: "qemu-img", args }),
+      Error,
+      "models no image content",
+    );
+  }
+  // Everything else still works, so a suite can opt in wholesale.
+  assertEquals(fake.dispatch({ bin: "qemu-img", args: ["--version"] }).code, 0);
 });

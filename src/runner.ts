@@ -53,6 +53,19 @@ export interface RunOptions {
   readonly signal?: AbortSignal;
   /** Deadline sugar: composed with `signal` via `AbortSignal.any`. */
   readonly timeoutMs?: number;
+  /**
+   * Disposition of the child's stdout. `"piped"` captures it into
+   * {@linkcode CommandResult.stdout}; `"inherit"` lets it reach this process's
+   * own stdout; `"null"` discards it.
+   *
+   * Prefer `"null"` or `"inherit"` for a child that spawns long-lived
+   * grandchildren: a captured pipe stays open as long as *any* descendant holds
+   * its write end, so a command whose grandchild outlives it cannot report
+   * completion through captured output alone. @default "piped"
+   */
+  readonly stdout?: "piped" | "inherit" | "null";
+  /** Disposition of the child's stderr; see {@linkcode RunOptions.stdout}. @default "piped" */
+  readonly stderr?: "piped" | "inherit" | "null";
 }
 
 /** The seam: run one command, capture its result. */
@@ -97,13 +110,32 @@ export class CommandAbortedError extends Error {
   readonly bin: string;
   /** The argv it ran with. */
   readonly args: readonly string[];
+  /**
+   * Whatever the child had already written to stdout when the abort fired
+   * (bounded by the capture cap). Empty when it produced none, when the run
+   * was aborted before spawning, or when stdout was not `"piped"`.
+   *
+   * A timed-out command is exactly the case where its output matters most —
+   * the last line before a hang usually names the thing that hung.
+   */
+  readonly stdout: string;
+  /** Error output captured before the abort; see {@linkcode CommandAbortedError.stdout}. */
+  readonly stderr: string;
 
   /** Build the error; `reason` becomes the `cause`. */
-  constructor(bin: string, args: readonly string[], reason?: unknown) {
+  constructor(
+    bin: string,
+    args: readonly string[],
+    reason?: unknown,
+    stdout: string = "",
+    stderr: string = "",
+  ) {
     super(`command aborted: ${bin} ${args.join(" ")}`, { cause: reason });
     this.name = "CommandAbortedError";
     this.bin = bin;
     this.args = [...args];
+    this.stdout = stdout;
+    this.stderr = stderr;
   }
 }
 
@@ -114,6 +146,11 @@ export const MAX_CAPTURE_BYTES = 64 * 1024;
 export interface DenoCommandRunnerOptions {
   /** Capture cap in bytes when a run is not `uncapped`. @default MAX_CAPTURE_BYTES */
   readonly captureLimit?: number;
+  /**
+   * Grace period between `SIGTERM` and `SIGKILL` when a run is aborted.
+   * @default 5000
+   */
+  readonly killGraceMs?: number;
 }
 
 /**
@@ -122,13 +159,21 @@ export interface DenoCommandRunnerOptions {
  * the cut falls inside a UTF-8 sequence), pipes `stdin` when provided, kills
  * the child when the composed abort signal fires, and never throws on a
  * nonzero exit — the caller decides whether a nonzero code is fatal.
+ *
+ * An abort races the child's *exit status*, never its captured output, and
+ * escalates `SIGTERM` → grace → `SIGKILL`. Waiting on output would not be a
+ * deadline at all: a pipe stays readable while any grandchild holds its write
+ * end, so `sh -c 'echo x; sleep 5'` with a 500 ms timeout would block for the
+ * full 5 s even though the shell died on schedule.
  */
 export class DenoCommandRunner implements CommandRunner {
   readonly #captureLimit: number;
+  readonly #killGraceMs: number;
 
-  /** Create a runner, optionally overriding the capture cap. */
+  /** Create a runner, optionally overriding the capture cap and kill grace. */
   constructor(options: DenoCommandRunnerOptions = {}) {
     this.#captureLimit = options.captureLimit ?? MAX_CAPTURE_BYTES;
+    this.#killGraceMs = options.killGraceMs ?? 5_000;
   }
 
   /** Run one command via `Deno.Command` and capture its result. */
@@ -137,16 +182,35 @@ export class DenoCommandRunner implements CommandRunner {
     args: readonly string[],
     options: RunOptions = {},
   ): Promise<CommandResult> {
-    const signal = composeSignal(options);
+    const { signal, dispose } = composeSignal(options);
+    try {
+      return await this.#runWith(bin, args, options, signal);
+    } finally {
+      // Release the deadline timer on every path, or it holds the process
+      // open for the remainder of the timeout after the command is done.
+      dispose();
+    }
+  }
+
+  async #runWith(
+    bin: string,
+    args: readonly string[],
+    options: RunOptions,
+    signal: AbortSignal | undefined,
+  ): Promise<CommandResult> {
     if (signal?.aborted) {
       throw new CommandAbortedError(bin, args, signal.reason);
     }
+    const limit = options.uncapped === true ? Infinity : this.#captureLimit;
+    const stdoutMode = options.stdout ?? "piped";
+    const stderrMode = options.stderr ?? "piped";
+    // `signal` is deliberately NOT handed to Deno.Command: it kills the child
+    // but leaves us awaiting output that a surviving grandchild still holds.
     const command = new Deno.Command(bin, {
       args: [...args],
       stdin: options.stdin === undefined ? "null" : "piped",
-      stdout: "piped",
-      stderr: "piped",
-      signal,
+      stdout: stdoutMode,
+      stderr: stderrMode,
     });
     const child = command.spawn();
     if (options.stdin !== undefined) {
@@ -156,31 +220,167 @@ export class DenoCommandRunner implements CommandRunner {
         await writer.close();
       } catch {
         // The child exited (or was aborted) mid-write — e.g. a broken pipe.
-        // Never rethrow here: the exit status below (or the post-output abort
-        // check) is authoritative, and bailing out would leak a live child.
+        // Never rethrow here: the exit status below is authoritative, and
+        // bailing out would leak a live child.
       }
     }
-    const { success, code, stdout, stderr } = await child.output();
-    if (signal?.aborted) {
-      throw new CommandAbortedError(bin, args, signal.reason);
+    const outSink = stdoutMode === "piped"
+      ? drain(child.stdout, limit)
+      : undefined;
+    const errSink = stderrMode === "piped"
+      ? drain(child.stderr, limit)
+      : undefined;
+
+    const status = signal === undefined
+      ? await child.status
+      : await Promise.race([child.status, abortSignalled(signal)]);
+
+    if (status === ABORTED) {
+      await this.#terminate(child);
+      // Report what the child had already produced rather than discarding it;
+      // the streams are cancelled instead of drained because a grandchild may
+      // hold them open indefinitely.
+      const [captured, capturedErr] = await Promise.all([
+        outSink?.cancel() ?? Promise.resolve(""),
+        errSink?.cancel() ?? Promise.resolve(""),
+      ]);
+      throw new CommandAbortedError(
+        bin,
+        args,
+        signal?.reason,
+        captured,
+        capturedErr,
+      );
     }
-    const decoder = new TextDecoder();
-    const cap = (bytes: Uint8Array): string =>
-      options.uncapped === true
-        ? decoder.decode(bytes)
-        : decoder.decode(bytes.slice(0, this.#captureLimit));
-    return { success, code, stdout: cap(stdout), stderr: cap(stderr) };
+
+    const stdout = await (outSink?.collected() ?? Promise.resolve(""));
+    const stderr = await (errSink?.collected() ?? Promise.resolve(""));
+    return { success: status.success, code: status.code, stdout, stderr };
+  }
+
+  /** `SIGTERM`, then `SIGKILL` after the grace period. Always reaps. */
+  async #terminate(child: Deno.ChildProcess): Promise<void> {
+    try {
+      child.kill("SIGTERM");
+    } catch {
+      // Already exited between the race resolving and this call.
+    }
+    const grace = new AbortController();
+    const exited = await Promise.race([
+      child.status.then(() => true),
+      sleep(this.#killGraceMs, grace.signal).then(() => false),
+    ]);
+    grace.abort();
+    if (exited) return;
+    try {
+      child.kill("SIGKILL");
+    } catch {
+      // Raced us to the exit; the await below still reaps it.
+    }
+    await child.status;
   }
 }
 
-function composeSignal(options: RunOptions): AbortSignal | undefined {
+/** Sentinel distinguishing "the abort won the race" from a real exit status. */
+const ABORTED = Symbol("aborted");
+
+function abortSignalled(signal: AbortSignal): Promise<typeof ABORTED> {
+  return new Promise((resolve) => {
+    signal.addEventListener("abort", () => resolve(ABORTED), { once: true });
+  });
+}
+
+function sleep(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    signal.addEventListener("abort", () => {
+      clearTimeout(timer);
+      resolve();
+    }, { once: true });
+  });
+}
+
+/** A stream being accumulated, capped, and readable even before it ends. */
+interface Sink {
+  /** Resolve when the stream ends, with everything captured. */
+  collected(): Promise<string>;
+  /** Stop reading now and return whatever arrived so far. */
+  cancel(): Promise<string>;
+}
+
+function drain(stream: ReadableStream<Uint8Array>, limit: number): Sink {
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  const reader = stream.getReader();
+  const pump = (async () => {
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        // Keep reading past the cap so the child never blocks on a full pipe,
+        // but stop retaining once the cap is reached.
+        if (total < limit) {
+          chunks.push(value);
+          total += value.byteLength;
+        }
+      }
+    } catch {
+      // Cancelled, or the pipe broke; whatever arrived is still reportable.
+    }
+  })();
+  const decode = (): string => {
+    const joined = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+      joined.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    const bounded = Number.isFinite(limit) ? joined.slice(0, limit) : joined;
+    return new TextDecoder().decode(bounded);
+  };
+  return {
+    collected: async () => {
+      await pump;
+      return decode();
+    },
+    cancel: async () => {
+      await reader.cancel().catch(() => {});
+      return decode();
+    },
+  };
+}
+
+/** A composed signal plus the cleanup that releases its timer. */
+interface ComposedSignal {
+  readonly signal: AbortSignal | undefined;
+  /** Cancel the deadline timer. Must be called on every exit path. */
+  readonly dispose: () => void;
+}
+
+function composeSignal(options: RunOptions): ComposedSignal {
   const signals: AbortSignal[] = [];
+  let timer: ReturnType<typeof setTimeout> | undefined;
   if (options.signal !== undefined) signals.push(options.signal);
   if (options.timeoutMs !== undefined) {
-    signals.push(AbortSignal.timeout(options.timeoutMs));
+    // Deliberately NOT `AbortSignal.timeout()`: its timer is referenced, so it
+    // keeps the process alive until the deadline elapses even when the command
+    // finished long before. A `timeoutMs: 120_000` run that completes in 300 ms
+    // would still hang the program for two minutes.
+    const controller = new AbortController();
+    timer = setTimeout(
+      () => controller.abort(new DOMException("timed out", "TimeoutError")),
+      options.timeoutMs,
+    );
+    signals.push(controller.signal);
   }
-  if (signals.length === 0) return undefined;
-  return signals.length === 1 ? signals[0] : AbortSignal.any(signals);
+  const dispose = () => {
+    if (timer !== undefined) clearTimeout(timer);
+  };
+  if (signals.length === 0) return { signal: undefined, dispose };
+  return {
+    signal: signals.length === 1 ? signals[0] : AbortSignal.any(signals),
+    dispose,
+  };
 }
 
 /** Run a command and throw {@linkcode CommandError} on a nonzero exit. */

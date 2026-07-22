@@ -76,6 +76,56 @@ Deno.test("stdin to a child that exits early resolves with its status (no broken
   assertEquals(result.code, 1);
 });
 
+Deno.test("timeoutMs is a deadline even when a grandchild holds the stdout pipe", async () => {
+  const runner = new DenoCommandRunner();
+  const started = Date.now();
+  await assertRejects(
+    // `sleep` inherits the shell's stdout, so the pipe stays readable for the
+    // full 5s after SIGTERM kills `sh`. Racing captured output instead of the
+    // exit status would block here; the bare `sleep 5` above cannot show this
+    // because it has no children.
+    () => runner.run("sh", ["-c", "echo x; sleep 5"], { timeoutMs: 200 }),
+    CommandAbortedError,
+  );
+  assert(
+    Date.now() - started < 2_000,
+    "the deadline must not wait on a grandchild's pipe",
+  );
+});
+
+Deno.test("an aborted run reports the output it already captured", async () => {
+  const runner = new DenoCommandRunner();
+  const error = await assertRejects(
+    () =>
+      runner.run("sh", ["-c", "echo before-the-hang; sleep 5"], {
+        timeoutMs: 200,
+      }),
+    CommandAbortedError,
+  );
+  // The last line before a hang usually names the thing that hung; discarding
+  // it leaves a timeout with no diagnostics at all.
+  assertEquals(error.stdout, "before-the-hang\n");
+});
+
+Deno.test("stdout disposition null avoids capture entirely", async () => {
+  const runner = new DenoCommandRunner();
+  const result = await runner.run("echo", ["unwanted"], { stdout: "null" });
+  assertEquals(result.success, true);
+  assertEquals(result.stdout, "");
+});
+
+Deno.test("a long timeoutMs leaves no pending timer once the run completes", async () => {
+  const runner = new DenoCommandRunner();
+  const started = Date.now();
+  const result = await runner.run("echo", ["quick"], { timeoutMs: 120_000 });
+  assertEquals(result.success, true);
+  // The assertion that matters is Deno's own op sanitizer: an unreleased
+  // deadline timer fails this test. `AbortSignal.timeout()` keeps a
+  // REFERENCED timer, so a 120s deadline on a 300ms command used to hold the
+  // whole process open for the remaining two minutes.
+  assert(Date.now() - started < 5_000, "the run itself must not wait");
+});
+
 Deno.test("a pre-aborted signal rejects before spawning", async () => {
   const runner = new DenoCommandRunner();
   const controller = new AbortController();

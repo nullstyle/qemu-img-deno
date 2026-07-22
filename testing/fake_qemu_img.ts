@@ -59,6 +59,10 @@ export interface FakeConvert {
   readonly compress: boolean;
   /** The `-f` source format, when given. */
   readonly sourceFormat?: string;
+  /** Whether the source was an `--image-opts` graph rather than a path. */
+  readonly sourceIsGraph?: boolean;
+  /** Whether the destination was a `--target-image-opts` graph (a window write). */
+  readonly destIsGraph?: boolean;
   /** The raw recorded call. */
   readonly raw: RecordedCall;
 }
@@ -104,6 +108,18 @@ export class FakeQemuImg implements CommandRunner {
    * {@linkcode FakeQemuImg.images}.
    */
   onConvert?: (convert: FakeConvert) => CommandResult | undefined | void;
+  /**
+   * Make `compare`, `check` and `map` throw instead of answering.
+   *
+   * Those three verbs are the fake's content oracles, and the fake models no
+   * content: `compare` reports "Images are identical" whenever both paths
+   * exist, `check` hardcodes zero errors, and `map` always returns one
+   * full-length data extent. Code whose correctness *depends* on what they
+   * report — anything verifying that an image holds the bytes it should —
+   * passes against this fake for the wrong reason. Set this to refuse the
+   * question rather than answer it falsely. @default false
+   */
+  refuseContentOracles = false;
 
   readonly #stubs: Stub[] = [];
   #nextSnapshotId = 1;
@@ -168,7 +184,25 @@ export class FakeQemuImg implements CommandRunner {
    */
   dispatch(call: RecordedCall): CommandResult {
     const args = call.args;
-    switch (args[0]) {
+    const subcommand = args[0];
+    // Validate flags for every subcommand at one choke point, including the
+    // ones whose handlers read only the last positional.
+    if (subcommand !== undefined && subcommand in FLAGS) {
+      positionalsOf(args.slice(1), FLAGS[subcommand]);
+    }
+    if (
+      this.refuseContentOracles &&
+      (subcommand === "compare" || subcommand === "check" ||
+        subcommand === "map")
+    ) {
+      throw new Error(
+        `fake qemu-img: refusing to answer '${subcommand}' — this fake models ` +
+          "no image content, so its answer would be fiction. Assert on the " +
+          "recorded argv, or exercise this path against a real qemu-img in a " +
+          "smoke test.",
+      );
+    }
+    switch (subcommand) {
       case "--version":
         return ok(`${this.versionOutput}\n`);
       case "amend":
@@ -229,7 +263,7 @@ export class FakeQemuImg implements CommandRunner {
 
   #bitmap(args: readonly string[]): CommandResult {
     // bitmap [-f F] <action…> PATH NAME — the last two positionals.
-    const positionals = positionalsOf(args.slice(1), BITMAP_VALUE_FLAGS);
+    const positionals = positionalsOf(args.slice(1), FLAGS.bitmap);
     const name = positionals[positionals.length - 1];
     const path = positionals[positionals.length - 2];
     if (name === undefined || path === undefined) {
@@ -278,7 +312,7 @@ export class FakeQemuImg implements CommandRunner {
   }
 
   #compare(args: readonly string[]): CommandResult {
-    const positionals = positionalsOf(args.slice(1), COMPARE_VALUE_FLAGS);
+    const positionals = positionalsOf(args.slice(1), FLAGS.compare);
     const [a, b] = positionals.slice(-2);
     if (a === undefined || b === undefined) {
       return failed(2, "fake qemu-img: compare needs two images");
@@ -306,33 +340,47 @@ export class FakeQemuImg implements CommandRunner {
 
   #convert(call: RecordedCall): CommandResult {
     const args = call.args;
-    const format = valueOf(args, "-O");
+    // Option-graph operands (`--image-opts` / `--target-image-opts`) are
+    // opaque node descriptions, not paths: they are never looked up in the
+    // image store, and a graph destination writes INTO an existing node
+    // rather than creating one.
+    const sourceIsGraph = args.includes("--image-opts");
+    const destIsGraph = args.includes("--target-image-opts");
+    const format = valueOf(args, "-O", "--target-format") ??
+      (destIsGraph ? "raw" : undefined);
     if (format === undefined) {
       return failed(1, "fake qemu-img: convert needs -O");
     }
-    const positionals = positionalsOf(args.slice(1), CONVERT_VALUE_FLAGS);
+    const positionals = positionalsOf(args.slice(1), FLAGS.convert);
     if (positionals.length < 2) {
       return failed(1, "fake qemu-img: convert needs SOURCE… DEST");
     }
     const dest = positionals[positionals.length - 1];
     const sources = positionals.slice(0, -1);
-    const sourceFormat = valueOf(args, "-f");
+    const sourceFormat = valueOf(args, "-f", "--source-format");
     const convert: FakeConvert = {
       sources,
       dest,
       format,
       compress: args.includes("-c"),
       ...(sourceFormat === undefined ? {} : { sourceFormat }),
+      ...(sourceIsGraph ? { sourceIsGraph } : {}),
+      ...(destIsGraph ? { destIsGraph } : {}),
       raw: call,
     };
     this.converts.push(convert);
-    for (const source of sources) {
-      if (!this.images.has(source)) {
-        return failed(1, `qemu-img: Could not open '${source}'`);
+    if (!sourceIsGraph) {
+      for (const source of sources) {
+        if (!this.images.has(source)) {
+          return failed(1, `qemu-img: Could not open '${source}'`);
+        }
       }
     }
     const hooked = this.onConvert?.(convert);
     if (hooked !== undefined) return hooked;
+    // A graph destination targets a node inside an image that already exists;
+    // there is nothing to register, and its size is unchanged.
+    if (destIsGraph) return ok();
     // Concatenated sources sum their virtual sizes, like real convert.
     let virtualSizeBytes = 0;
     let known = true;
@@ -341,7 +389,7 @@ export class FakeQemuImg implements CommandRunner {
       if (size === undefined) known = false;
       else virtualSizeBytes += size;
     }
-    const backing = valueOf(args, "-B");
+    const backing = valueOf(args, "-B", "-b", "--backing");
     this.setImage(dest, {
       format,
       snapshots: [],
@@ -353,17 +401,17 @@ export class FakeQemuImg implements CommandRunner {
   }
 
   #create(args: readonly string[]): CommandResult {
-    const format = valueOf(args, "-f");
+    const format = valueOf(args, "-f", "--format");
     if (format === undefined) {
       return failed(1, "fake qemu-img: create needs -f");
     }
-    const positionals = positionalsOf(args.slice(1), CREATE_VALUE_FLAGS);
+    const positionals = positionalsOf(args.slice(1), FLAGS.create);
     const [path, size] = positionals;
     if (path === undefined) {
       return failed(1, "fake qemu-img: create needs PATH");
     }
-    const backing = valueOf(args, "-b");
-    const backingFormat = valueOf(args, "-F");
+    const backing = valueOf(args, "-b", "--backing");
+    const backingFormat = valueOf(args, "-F", "-B", "--backing-format");
     const virtualSizeBytes = size !== undefined
       ? parseSizeBytes(size)
       : backing !== undefined
@@ -480,21 +528,21 @@ export class FakeQemuImg implements CommandRunner {
   }
 
   #rebase(args: readonly string[]): CommandResult {
-    const backing = valueOf(args, "-b");
+    const backing = valueOf(args, "-b", "--backing");
     if (backing === undefined) {
       return failed(1, "fake qemu-img: rebase needs -b");
     }
     return this.#requireImage(lastPositional(args), (state) => {
       if (backing === "") delete state.backingFilename;
       else state.backingFilename = backing;
-      const backingFormat = valueOf(args, "-F");
+      const backingFormat = valueOf(args, "-F", "-B", "--backing-format");
       if (backingFormat !== undefined) state.backingFormat = backingFormat;
       return ok();
     });
   }
 
   #resize(args: readonly string[]): CommandResult {
-    const positionals = positionalsOf(args.slice(1), RESIZE_VALUE_FLAGS);
+    const positionals = positionalsOf(args.slice(1), FLAGS.resize);
     const [path, size] = positionals.slice(-2);
     if (path === undefined || size === undefined) {
       return failed(1, "fake qemu-img: resize needs PATH SIZE");
@@ -558,41 +606,212 @@ export class FakeQemuImg implements CommandRunner {
   }
 }
 
-// Flags whose next argv entry is a value (per subcommand), for positional
-// extraction. Kept in sync with the argv shapes the client emits.
-const BITMAP_VALUE_FLAGS = new Set(["-f", "-g", "-b", "-F", "--merge"]);
-const COMPARE_VALUE_FLAGS = new Set(["-f", "-F"]);
-const CONVERT_VALUE_FLAGS = new Set(["-f", "-B", "-F", "-o", "-S", "-O"]);
-const CREATE_VALUE_FLAGS = new Set(["-f", "-b", "-F", "-o"]);
-const RESIZE_VALUE_FLAGS = new Set(["-f"]);
+/** The flags one subcommand accepts, split by whether they consume a value. */
+interface FlagSpec {
+  /** Flags whose value is the next argv entry (or follows a `=`). */
+  readonly value: ReadonlySet<string>;
+  /** Flags that stand alone. */
+  readonly boolean: ReadonlySet<string>;
+}
+
+function spec(value: string[], boolean: string[] = []): FlagSpec {
+  return { value: new Set(value), boolean: new Set(boolean) };
+}
+
+/**
+ * Per-subcommand flag tables, covering both the short spellings the client
+ * emits and the long ones qemu-img documents. qemu-img 11.0 renamed the
+ * backing flags in opposite directions — `create`'s backing FORMAT moved
+ * `-F` → `-B`, while `convert`'s backing FILE moved `-B` → `-b` — so the
+ * spellings are listed per subcommand rather than shared.
+ */
+const FLAGS: Readonly<Record<string, FlagSpec>> = {
+  amend: spec(["-f", "--format", "-o", "--options", "-t", "--object"], [
+    "-q",
+    "--quiet",
+    "--force",
+  ]),
+  bench: spec([
+    "-c",
+    "-d",
+    "-f",
+    "--format",
+    "-o",
+    "-s",
+    "-S",
+    "-t",
+    "--flush-interval",
+    "--pattern",
+  ], ["-w", "-n", "--no-drain", "-U", "-q", "--image-opts"]),
+  bitmap: spec(["-f", "--format", "-g", "-b", "-F", "--merge", "--object"], [
+    "--add",
+    "--remove",
+    "--clear",
+    "--enable",
+    "--disable",
+    "-q",
+  ]),
+  check: spec(["-f", "--format", "-r", "--repair", "-t", "--output"], [
+    "-q",
+    "-U",
+    "--image-opts",
+  ]),
+  commit: spec(["-f", "--format", "-b", "--base", "-r", "--rate", "-t"], [
+    "-d",
+    "-p",
+    "-q",
+  ]),
+  compare: spec(["-f", "-F", "-T", "-t", "--object"], [
+    "-s",
+    "--strict",
+    "-p",
+    "-q",
+    "-U",
+    "--image-opts",
+  ]),
+  convert: spec([
+    "-f",
+    "--source-format",
+    "-O",
+    "--target-format",
+    "-o",
+    "--options",
+    "-B",
+    "-b",
+    "--backing",
+    "-F",
+    "--backing-format",
+    "-S",
+    "--sparse-size",
+    "-m",
+    "-r",
+    "-t",
+    "-T",
+    "--object",
+  ], [
+    "-c",
+    "-n",
+    "-p",
+    "-q",
+    "-U",
+    "-W",
+    "-C",
+    "--target-is-zero",
+    "--salvage",
+    "--image-opts",
+    "--target-image-opts",
+  ]),
+  create: spec([
+    "-f",
+    "--format",
+    "-o",
+    "--options",
+    "-b",
+    "--backing",
+    "-F",
+    "-B",
+    "--backing-format",
+    "--object",
+  ], ["-u", "--backing-unsafe", "-q", "--quiet"]),
+  dd: spec(["-f", "-O", "--object"], ["-q", "-U", "--image-opts"]),
+  info: spec(["-f", "--format", "--output", "--object"], [
+    "--backing-chain",
+    "-U",
+    "--image-opts",
+  ]),
+  map: spec(["-f", "--format", "--output", "--object"], [
+    "-U",
+    "--image-opts",
+  ]),
+  measure: spec([
+    "-f",
+    "-O",
+    "-o",
+    "--size",
+    "--output",
+    "--object",
+  ], ["--image-opts", "-U"]),
+  rebase: spec([
+    "-f",
+    "--format",
+    "-b",
+    "--backing",
+    "-F",
+    "-B",
+    "--backing-format",
+    "-t",
+    "-T",
+    "--object",
+  ], ["-u", "-c", "-p", "-q", "-U", "--image-opts"]),
+  resize: spec(["-f", "--format", "--preallocation", "--object"], [
+    "--shrink",
+    "-q",
+    "-p",
+  ]),
+  snapshot: spec(["-c", "-a", "-d", "--object"], ["-l", "-q", "-U"]),
+};
+
+/** Split `--flag=value` into its name; a bare flag is its own name. */
+function flagName(arg: string): string {
+  const equals = arg.indexOf("=");
+  return equals === -1 ? arg : arg.slice(0, equals);
+}
 
 function lastPositional(args: readonly string[]): string {
   return args[args.length - 1] ?? "";
 }
 
+/**
+ * Extract positionals, **throwing** on any flag the subcommand does not
+ * declare.
+ *
+ * Skipping unknown flags silently is the failure this test kit exists to
+ * prevent: `create -f qcow2 --backing base.qcow2 … /out.qcow2` used to yield
+ * positionals `["base.qcow2", "qcow2", "/out.qcow2"]`, so the fake registered
+ * an image at `base.qcow2`, clobbered the real base's state, never created
+ * `/out.qcow2`, and returned exit 0 — every assertion downstream passing
+ * against an image that was never built. Loud beats silent, in the test kit
+ * as much as in the client.
+ */
 function positionalsOf(
   args: readonly string[],
-  valueFlags: ReadonlySet<string>,
+  flags: FlagSpec,
 ): string[] {
   const positionals: string[] = [];
   for (let index = 0; index < args.length; index++) {
     const arg = args[index];
-    if (valueFlags.has(arg)) {
-      index++;
+    if (!arg.startsWith("-")) {
+      positionals.push(arg);
       continue;
     }
-    if (arg.startsWith("-")) continue;
-    positionals.push(arg);
+    const name = flagName(arg);
+    if (flags.value.has(name)) {
+      // `--flag=value` carries its own value; `--flag value` consumes the next.
+      if (arg.indexOf("=") === -1) index++;
+      continue;
+    }
+    if (flags.boolean.has(name)) continue;
+    throw new Error(
+      `fake qemu-img: unrecognized flag ${name} in [${args.join(" ")}]. ` +
+        "Add it to this subcommand's FLAGS entry in testing/fake_qemu_img.ts " +
+        "— silently skipping it would mis-parse the positionals.",
+    );
   }
   return positionals;
 }
 
+/** The value of the first spelling present, supporting `--flag=value`. */
 function valueOf(
   args: readonly string[],
-  flag: string,
+  ...spellings: readonly string[]
 ): string | undefined {
-  const index = args.indexOf(flag);
-  return index === -1 ? undefined : args[index + 1];
+  for (let index = 0; index < args.length; index++) {
+    const arg = args[index];
+    if (!spellings.includes(flagName(arg))) continue;
+    const equals = arg.indexOf("=");
+    return equals === -1 ? args[index + 1] : arg.slice(equals + 1);
+  }
+  return undefined;
 }
 
 const SIZE_PATTERN = /^(\d+(?:\.\d+)?)(?:([kKmMgGtTpP])i?)?[bB]?$/;

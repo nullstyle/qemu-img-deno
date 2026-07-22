@@ -4,7 +4,7 @@ import {
   QemuImgMissingError,
   QemuImgUnsafeOperationError,
 } from "../../src/errors.ts";
-import { QemuImg } from "../../src/qemu_img.ts";
+import { QemuImg, renderBlockNode } from "../../src/qemu_img.ts";
 import { failed, FakeQemuImg, ok } from "../../testing/mod.ts";
 
 function client(): { qemu: QemuImg; fake: FakeQemuImg } {
@@ -459,4 +459,78 @@ Deno.test("raw passes argv through and returns the raw result", async () => {
   assert(result.success);
   assertEquals(result.stdout, "custom output");
   assertEquals(fake.commandLines(), ["qemu-img weird --flag"]);
+});
+
+Deno.test("renderBlockNode flattens children to dotted keys, sorted", () => {
+  assertEquals(
+    renderBlockNode({
+      driver: "raw",
+      offset: 1048576,
+      size: 65536,
+      file: { driver: "qcow2", file: { driver: "file", filename: "/d.qcow2" } },
+    }),
+    "driver=raw,file.driver=qcow2,file.file.driver=file," +
+      "file.file.filename=/d.qcow2,offset=1048576,size=65536",
+  );
+  // Booleans render like qemu's other option lists.
+  assertEquals(
+    renderBlockNode({ driver: "vvfat", rw: true, "fat-type": 16 }),
+    "driver=vvfat,fat-type=16,rw=on",
+  );
+});
+
+Deno.test("convert splices an option-graph source into an option-graph window", async () => {
+  const fake = new FakeQemuImg();
+  fake.setImage("/disk.qcow2", { virtualSizeBytes: 1024 ** 3 });
+  const qemu = new QemuImg({ runner: fake });
+  await qemu.convert(
+    { imageOpts: { driver: "vvfat", dir: "/staging", "fat-type": 16 } },
+    {
+      imageOpts: {
+        driver: "raw",
+        offset: 1048576,
+        size: 528450048,
+        file: {
+          driver: "qcow2",
+          file: { driver: "file", filename: "/disk.qcow2" },
+        },
+      },
+    },
+    { noCreate: true, parallel: 1 },
+  );
+  assertEquals(fake.commandLines(), [
+    "qemu-img convert --image-opts -n -m 1 --target-image-opts " +
+    "dir=/staging,driver=vvfat,fat-type=16 " +
+    "driver=raw,file.driver=qcow2,file.file.driver=file," +
+    "file.file.filename=/disk.qcow2,offset=1048576,size=528450048",
+  ]);
+});
+
+Deno.test("the option-graph guards refuse what qemu would reject later", async () => {
+  const qemu = new QemuImg({ runner: new FakeQemuImg() });
+  const graph = { imageOpts: { driver: "raw" as const } };
+  // --target-image-opts without -n
+  await assertRejects(
+    () => qemu.convert("/a.raw", graph, {}),
+    TypeError,
+    "requires noCreate",
+  );
+  // --image-opts alongside a format flag
+  await assertRejects(
+    () => qemu.info(graph, { format: "raw" }),
+    TypeError,
+    "cannot combine an option graph with a format flag",
+  );
+  // one graph operand, one path
+  await assertRejects(
+    () => qemu.compare(graph, "/b.raw"),
+    TypeError,
+    "both operands",
+  );
+  // a path destination still needs a format
+  await assertRejects(
+    () => qemu.convert("/a.raw", "/b.raw", {}),
+    TypeError,
+    "needs a format",
+  );
 });
