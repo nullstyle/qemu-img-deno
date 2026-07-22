@@ -90,6 +90,13 @@ jobs:
       - name: Record the binary under test
         run: qemu-img --version
 
+      # The unit suite too, WITH a real binary present. Two tests are gated on
+      # `qemu-img` being runnable and simply do not execute without it — the
+      # content-digest equivalence test among them, which is the property every
+      # cache key depends on. The `test` matrix job has no qemu, so before this
+      # they ran nowhere at all.
+      - run: deno task test
+
       - run: deno task smoke
       # The macOS-only oracles in these two (fsck_msdos, hdiutil, diskutil)
       # skip themselves rather than fail: verified by running both with all

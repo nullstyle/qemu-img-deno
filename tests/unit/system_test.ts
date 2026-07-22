@@ -579,8 +579,18 @@ const CAN_BOOT_X86 = await (async () => {
     name: "run",
     command: "qemu-system-x86_64",
   });
-  const read = await Deno.permissions.query({ name: "read", path: "." });
-  const write = await Deno.permissions.query({ name: "write", path: "." });
+  // Query the paths this test ACTUALLY uses, not `.`. Asking about the whole
+  // cwd meant a correctly-scoped permission set — which is what `deno task
+  // test` grants — always answered "no", so this test was ignored on every
+  // machine including ones with an x86_64 appliance sitting right there.
+  const read = await Deno.permissions.query({
+    name: "read",
+    path: ".appliance",
+  });
+  const write = await Deno.permissions.query({
+    name: "write",
+    path: "tests/.tmp",
+  });
   if (run.state !== "granted" || read.state !== "granted") return false;
   if (write.state !== "granted") return false;
   return await Deno.stat(".appliance/x86_64/appliance.json")

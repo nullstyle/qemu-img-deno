@@ -27,7 +27,7 @@
     "lint": "deno lint",
     "check": "deno fmt --check && deno lint && deno check .",
     "doc:lint": "deno doc --lint mod.ts src/runner.ts src/recipe/mod.ts src/fs/mod.ts src/system/mod.ts testing/mod.ts",
-    "test": "deno test --allow-run=echo,cat,false,sleep,sh --allow-read=tests,deno.json --allow-write=tests/.tmp tests/",
+    "test": "deno test --allow-run=echo,cat,false,sleep,sh,qemu-img,qemu-system-x86_64 --allow-read=tests,deno.json,.appliance,appliance.lock.json --allow-write=tests/.tmp tests/",
     "smoke": "deno run --allow-run=qemu-img,/sbin/fsck_msdos --allow-read --allow-write --allow-env tools/qemu_img_smoke.ts",
     "smoke:recipe": "deno run --allow-run --allow-read --allow-write --allow-env tools/recipe_smoke.ts",
     "appliance": "deno run --allow-run=bsdtar,sh --allow-read --allow-write=.appliance --allow-net=dl-cdn.alpinelinux.org tools/build_appliance.ts",

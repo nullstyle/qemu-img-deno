@@ -332,10 +332,21 @@ an appliance that disagree refuse each other rather than negotiating.
 
 ## Compatibility
 
-Exercised against qemu-img 8.x–11.x (the release smoke last ran against 11.0.2);
-the argv shapes it emits are stable across that range. The real-binary smoke
-(`deno task smoke`, with qemu installed) validates every parser against real
-output and is the release gate; unit tests run anywhere Deno runs.
+**Measured** against two qemu-img versions, on every push: CI runs the
+real-binary smokes on `ubuntu-24.04` (qemu-utils, currently 8.2.x) and on
+`macos-latest` (Homebrew, currently 11.x), so both ends of the supported range
+are exercised by the same argv and the same parsers rather than asserted.
+
+Versions **between** those two are expected to work and are not tested — the
+argv shapes this package emits have been stable across the range, but nobody
+runs 9.x or 10.x here. If you depend on one of those, run `deno task smoke`
+against it; it is the same gate CI uses.
+
+The macOS leg is not redundant with the Linux one. `deno task smoke:recipe`
+validates a generated FAT against `/sbin/fsck_msdos` and a generated GPT against
+`diskutil` — two parsers with no qemu code in them. On Linux both are skipped,
+so that leg alone would be qemu checking qemu. Unit tests run anywhere Deno
+runs, with no binary at all.
 
 ## License
 
