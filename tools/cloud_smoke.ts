@@ -122,6 +122,13 @@ const FINGERPRINT = (dev: string) =>
     ' | sort | sha256sum)"',
     "echo \"FILES $(find /mnt -type f ! -path '/mnt/opt/app*' " +
     '! -name qimg-cloud-smoke | wc -l)"',
+    // CONTENT, not just the path list. A path-list digest plus a file count is
+    // unchanged by truncating every file in the image: measured, this
+    // fingerprint's earlier form passed identically before and after a step
+    // that emptied all of /etc and /usr/bin. A customize flow that cannot
+    // notice that is not verifying the thing it claims to verify.
+    "echo \"CONTENT $(find /mnt -type f ! -path '/mnt/opt/app*' " +
+    '! -name qimg-cloud-smoke -exec sha256sum {} + | sort | sha256sum)"',
     'echo "OSREL $(sha256sum /mnt/etc/os-release)"',
     "umount /mnt",
     "",
@@ -182,6 +189,15 @@ try {
   );
   const basePaths = field(before, "PATHS");
   const baseFiles = field(before, "FILES");
+  const baseContent = field(before, "CONTENT");
+  // A digest that came back empty would make the comparison below `"" === ""`
+  // — a vacuous pass that looks exactly like a real one.
+  assert(
+    /^[0-9a-f]{64}$/.test(baseContent),
+    `the content fingerprint produced a real digest (got ${
+      JSON.stringify(baseContent)
+    })`,
+  );
   const baseOsRelease = field(before, "OSREL");
   assert(basePaths !== "", "got a path-set digest from the base");
   assert(
@@ -317,6 +333,11 @@ try {
   assert(
     field(after, "FILES") === baseFiles,
     `still ${baseFiles} pre-existing files (got ${field(after, "FILES")})`,
+  );
+  assert(
+    field(after, "CONTENT") === baseContent,
+    "every pre-existing file's CONTENT is untouched:\n" +
+      `  before ${baseContent}\n  after  ${field(after, "CONTENT")}`,
   );
   assert(
     field(after, "OSREL") === baseOsRelease,

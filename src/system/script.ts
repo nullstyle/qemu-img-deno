@@ -146,6 +146,22 @@ export function copyInScript(args: CopyInScriptArgs): string {
     "exit 67; }",
     `qi_mount_root ${node} ${args.rootPartitionNumber}`,
     `mkdir -p ${dest}`,
+    // The destination must still be INSIDE the image after the kernel has
+    // resolved it. A base image brings its own symlinks, and an ABSOLUTE one
+    // anywhere in the path (Alpine's cloud image ships
+    // `/etc/ssl1.1/certs -> /etc/ssl/certs`) resolves against the APPLIANCE's
+    // root, not the mounted image — so `tar -x` would write into the
+    // initramfs, the tmpfs would evaporate at poweroff, and the build would
+    // exit 0 having copied nothing. `cd` + `pwd -P` is the resolution the
+    // kernel itself will perform. A blank base has no symlinks to traverse,
+    // which is why this only became reachable with `base.kind: "image"`.
+    `qi_real=$(cd ${dest} 2>/dev/null && pwd -P) || qi_real=""`,
+    `case "$qi_real" in`,
+    `  /mnt/root|/mnt/root/*) ;;`,
+    `  *) echo "qi: ${dest} resolves to '$qi_real', outside the image root."; ` +
+    `echo "qi: a symlink in that path points outside the image; name the ` +
+    `resolved destination instead."; exit 73 ;;`,
+    `esac`,
     // No -m (mtimes come from the archive, which the writer pins), no -o (the
     // writer already emits uid/gid 0), and no --numeric-owner /
     // --strip-components / --xattrs — busybox tar has none of them.
