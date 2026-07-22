@@ -53,7 +53,9 @@ export {
   BaseImageSizeMismatchError,
   type CapabilityTrait,
   GuestExecutorUnavailableError,
+  InputResolutionError,
   RecipePlanError,
+  type RecipePlanErrorCode,
   UnrepresentableContentError,
   type UnrepresentableEntry,
 } from "./errors.ts";
@@ -121,6 +123,7 @@ export {
   type Executor,
   type Plan,
   plan,
+  type PlanAppliance,
   type PlannedPartition,
   type PlannedStep,
   type PlanOptions,

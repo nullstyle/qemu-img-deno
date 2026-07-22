@@ -11,6 +11,8 @@
  */
 
 import { sha256Hex } from "./keys.ts";
+import { sha256HexFile } from "../digest.ts";
+import { InputResolutionError } from "./errors.ts";
 import type { CapabilityTrait } from "./errors.ts";
 import type {
   DirInput,
@@ -73,7 +75,11 @@ async function walkTree(root: string): Promise<ResolvedEntry[]> {
         type: "file",
         mode: info.mode ?? 0,
         sizeBytes: info.size,
-        sha256: await sha256Hex(await Deno.readFile(full)),
+        // Streamed, not `sha256Hex(await Deno.readFile(full))`: that held the
+        // whole file and `crypto.subtle` copied it again to hash it, so one
+        // 2 GiB member of a staging tree peaked at 4.05 GiB of RSS. Same
+        // digest, so no key moves — see sha256HexFile.
+        sha256: await sha256HexFile(full),
         ...(info.uid === null ? {} : { uid: info.uid }),
         ...(info.gid === null ? {} : { gid: info.gid }),
       });
@@ -121,11 +127,15 @@ export class LocalInputResolver implements InputResolver {
   /** Hash a file, or walk and hash a directory tree. */
   async resolve(input: Input): Promise<ResolvedInput> {
     if (input.kind === "file") {
-      const bytes = await Deno.readFile(input.path);
+      // A `kind: "image"` base is a declared file input, and cloud images are
+      // measured in GiB — Alpine's aarch64 qcow2 is 225378304 bytes on disk
+      // and the ones people actually start from are far larger. Reading the
+      // whole thing to hash it peaked at twice the file in RSS, and it did so
+      // BEFORE plan() had a chance to refuse the recipe for any other reason.
       return {
         input,
-        sha256: await sha256Hex(bytes),
-        sizeBytes: bytes.byteLength,
+        sha256: await sha256HexFile(input.path),
+        sizeBytes: (await Deno.stat(input.path)).size,
       };
     }
     const entries = await walkTree(input.path);
@@ -155,42 +165,96 @@ export class LocalInputResolver implements InputResolver {
   }
 }
 
-/** Every input a step declares, in declaration order. */
-export function inputsOf(step: Step): Input[] {
+/**
+ * A declared input plus where in the recipe it was declared.
+ *
+ * Carried so a failure to read it can be reported in the recipe's own
+ * coordinates. `recipeInputs()` throws the provenance away, which is why a
+ * mistyped path used to surface as a bare errno and a path.
+ */
+interface InputSite {
+  /** The declaration. */
+  readonly input: Input;
+  /** The declaring step's id, or `"recipe"` for `base.from`. */
+  readonly stepId: string;
+  /** Where in the recipe it sits, e.g. `steps[0].from`. */
+  readonly field: string;
+}
+
+/** Every input a step declares, with its position, in declaration order. */
+function stepInputSites(step: Step, index: number): InputSite[] {
+  const at = `steps[${index}]`;
   switch (step.kind) {
     case "partition":
       // Only FAT declares a tree. An ext4 partition is formatted and left
       // empty; it is populated by a `copyIn` step, which declares its own.
-      return step.partitions.flatMap((partition) =>
-        partition.contents.kind === "fat" ? [partition.contents.from] : []
+      return step.partitions.flatMap((partition, i) =>
+        partition.contents.kind === "fat"
+          ? [{
+            input: partition.contents.from,
+            stepId: step.id,
+            field: `${at}.partitions[${i}].contents.from`,
+          }]
+          : []
       );
     case "copyIn":
-      return [step.from];
+      return [{ input: step.from, stepId: step.id, field: `${at}.from` }];
     case "run":
       return [];
   }
 }
 
+/** Every input a step declares, in declaration order. */
+export function inputsOf(step: Step): Input[] {
+  return stepInputSites(step, 0).map((site) => site.input);
+}
+
+/** Every input the whole recipe declares, with its position. */
+function recipeInputSites(recipe: Recipe): InputSite[] {
+  const sites: InputSite[] = recipe.base.kind === "image"
+    ? [{ input: recipe.base.from, stepId: "recipe", field: "base.from" }]
+    : [];
+  for (const [index, step] of recipe.steps.entries()) {
+    sites.push(...stepInputSites(step, index));
+  }
+  return sites;
+}
+
 /** Every input the whole recipe declares. */
 export function recipeInputs(recipe: Recipe): Input[] {
-  const inputs: Input[] = recipe.base.kind === "image"
-    ? [recipe.base.from]
-    : [];
-  for (const step of recipe.steps) inputs.push(...inputsOf(step));
-  return inputs;
+  return recipeInputSites(recipe).map((site) => site.input);
 }
 
 /**
  * Replace every declared input with its digest. The only I/O before planning.
+ *
+ * A resolver failure is rethrown as {@linkcode InputResolutionError} naming the
+ * step and field that declared the path. The raw `Deno.errors.NotFound` it
+ * replaces named neither, and every input in a recipe is read here — so with
+ * more than one staging tree, the reader was left matching an errno against
+ * paths by hand.
  */
 export async function resolveRecipe(
   recipe: Recipe,
   options: { readonly resolver: InputResolver },
 ): Promise<ResolvedRecipe> {
   const inputs: Record<string, ResolvedInput> = {};
-  for (const input of recipeInputs(recipe)) {
-    if (inputs[input.path] === undefined) {
+  for (const site of recipeInputSites(recipe)) {
+    const { input } = site;
+    if (inputs[input.path] !== undefined) continue;
+    try {
       inputs[input.path] = await options.resolver.resolve(input);
+    } catch (cause) {
+      // Never double-wrapped: a resolver may already speak this vocabulary,
+      // and re-wrapping would bury the field it named under this one.
+      if (cause instanceof InputResolutionError) throw cause;
+      throw new InputResolutionError(
+        site.stepId,
+        site.field,
+        input.kind,
+        input.path,
+        cause,
+      );
     }
   }
   return { recipe, inputs };
