@@ -1,0 +1,2 @@
+[{ "start": 0, "length": 65536, "depth": 0, "present": true, "zero": false, "data": true, "compressed": false, "offset": 327680},
+{ "start": 65536, "length": 983040, "depth": 0, "present": false, "zero": true, "data": false, "compressed": false}]

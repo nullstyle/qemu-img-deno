@@ -53,27 +53,39 @@ export interface QemuImgInfo {
   readonly raw: Readonly<Record<string, unknown>>;
 }
 
-/** Parsed `qemu-img check --output=json` (plus the process exit code). */
+/**
+ * Parsed `qemu-img check --output=json` (plus the process exit code).
+ *
+ * **An absent counter means zero.** qemu-img omits `corruptions`, `leaks` and
+ * the `*-fixed` fields entirely when they are zero — a clean 11.0.2 report is
+ * `{"image-end-offset":…,"total-clusters":64,"check-errors":0,…}` with no
+ * `corruptions` key at all. So test `corruptions ?? 0`, never
+ * `corruptions !== 0`, which reads as "corrupt" for every healthy image.
+ */
 export interface CheckResult {
   /**
    * The `check` exit code: `0` clean, `2` corruptions found, `3` leaks found
-   * but not repaired. (Codes `1`/`63` mean the check itself failed and raise
-   * a `CommandError` instead of producing a result.)
+   * but not repaired.
+   *
+   * `1` reaches here only when qemu-img still printed a report — the check ran
+   * but hit internal errors — and then its counters are partial, so treat it
+   * as a failed check no matter what they say. A `1` with no report, and `63`
+   * (the format has no check), raise a `CommandError` instead.
    */
   readonly code: number;
   /** The file that was checked. */
   readonly filename?: string;
   /** Image format. */
   readonly format?: string;
-  /** Errors encountered while checking (`check-errors`). */
+  /** Errors encountered while checking (`check-errors`). Absent means zero. */
   readonly checkErrors?: number;
-  /** Corruptions found. */
+  /** Corruptions found. Absent means zero. */
   readonly corruptions?: number;
-  /** Leaked clusters found. */
+  /** Leaked clusters found. Absent means zero. */
   readonly leaks?: number;
-  /** Corruptions repaired (with `repair`). */
+  /** Corruptions repaired (with `repair`). Absent means zero. */
   readonly corruptionsFixed?: number;
-  /** Leaks repaired (with `repair`). */
+  /** Leaks repaired (with `repair`). Absent means zero. */
   readonly leaksFixed?: number;
   /** Offset after the last used cluster (`image-end-offset`). */
   readonly imageEndOffset?: number;
@@ -177,15 +189,16 @@ export function parseCheckResult(stdout: string, code: number): CheckResult {
     );
   }
   const raw = parsed as Record<string, unknown>;
+  const verdict = (key: string) => countedNumber(raw, key, stdout);
   return {
     code,
     ...optional("filename", asString(raw.filename)),
     ...optional("format", asString(raw.format)),
-    ...optional("checkErrors", asNumber(raw["check-errors"])),
-    ...optional("corruptions", asNumber(raw.corruptions)),
-    ...optional("leaks", asNumber(raw.leaks)),
-    ...optional("corruptionsFixed", asNumber(raw["corruptions-fixed"])),
-    ...optional("leaksFixed", asNumber(raw["leaks-fixed"])),
+    ...optional("checkErrors", verdict("check-errors")),
+    ...optional("corruptions", verdict("corruptions")),
+    ...optional("leaks", verdict("leaks")),
+    ...optional("corruptionsFixed", verdict("corruptions-fixed")),
+    ...optional("leaksFixed", verdict("leaks-fixed")),
     ...optional("imageEndOffset", asNumber(raw["image-end-offset"])),
     ...optional("totalClusters", asNumber(raw["total-clusters"])),
     ...optional("allocatedClusters", asNumber(raw["allocated-clusters"])),
@@ -345,6 +358,39 @@ function asNumber(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value)
     ? value
     : undefined;
+}
+
+/**
+ * Read one of `check`'s verdict counters, where absence and a wrong type mean
+ * opposite things.
+ *
+ * Everywhere else in this module a mistyped field degrades to `undefined`,
+ * which is honest because `undefined` reads as "not reported". Here it does
+ * not: qemu-img omits these counters when they are zero, so `undefined` reads
+ * as **"zero"**. Degrading would make `{"corruptions": "7"}` — a field that
+ * changed type between qemu versions, or a value too large for a C `int` —
+ * parse byte-identically to a clean image, turning a corrupt image into a
+ * passing one with no diagnostic anywhere. A present-but-unreadable counter
+ * therefore throws.
+ */
+function countedNumber(
+  raw: Record<string, unknown>,
+  key: string,
+  stdout: string,
+): number | undefined {
+  const value = raw[key];
+  if (value === undefined) return undefined;
+  const parsed = asNumber(value);
+  if (parsed === undefined) {
+    throw new QemuImgOutputError(
+      `qemu-img check reported a non-numeric ${JSON.stringify(key)} ` +
+        `(${JSON.stringify(value)}); an absent counter means zero, so this ` +
+        "cannot be skipped without reporting a corrupt image as clean. " +
+        "Read the count from the result's `raw` instead",
+      stdout,
+    );
+  }
+  return parsed;
 }
 
 function asBoolean(value: unknown): boolean | undefined {
