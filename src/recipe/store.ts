@@ -11,13 +11,25 @@
 import type { RealizationKey, RecipeKey } from "./keys.ts";
 import { sha256Hex } from "./keys.ts";
 
+/** The container filename inside every layer directory. */
+const IMAGE_NAME = "image.qcow2";
+
 /** A published layer. */
 export interface StoredLayer {
   /** The key naming this layer's directory. */
   readonly realizationKey: RealizationKey;
   /** The recipe key it realizes. */
   readonly recipeKey: RecipeKey;
-  /** Absolute path to `image.qcow2`. */
+  /**
+   * Path to `image.qcow2`, resolved against the store's current root.
+   *
+   * Derived on read, never read back from the manifest. A manifest recording
+   * an absolute path would defeat the relocatability this module promises in
+   * two different ways: a store that MOVED would throw `ENOENT`, and — worse —
+   * a store that was COPIED would verify happily and hand back the *original's*
+   * bytes, since both the digest and the path it checked would still describe
+   * the file left behind.
+   */
   readonly path: string;
   /**
    * sha256 of the container file, recorded at publish and re-verified on hit.
@@ -97,7 +109,8 @@ export class LayerStore {
     const manifestPath = `${dir}/manifest.json`;
     const manifest = await Deno.readTextFile(manifestPath).catch(() => null);
     if (manifest === null) return undefined;
-    const stored = JSON.parse(manifest) as StoredLayer;
+    const record = JSON.parse(manifest) as Omit<StoredLayer, "path">;
+    const stored: StoredLayer = { ...record, path: `${dir}/${IMAGE_NAME}` };
     if (options.trust !== true) {
       const actual = await sha256Hex(await Deno.readFile(stored.path));
       if (actual !== stored.containerSha256) {
@@ -128,23 +141,31 @@ export class LayerStore {
     parentContainerSha256?: string,
   ): Promise<StoredLayer> {
     const partial = this.partialDir(key);
-    const imagePath = `${partial}/image.qcow2`;
+    const imagePath = `${partial}/${IMAGE_NAME}`;
     const containerSha256 = await sha256Hex(await Deno.readFile(imagePath));
     const published = this.layerDir(key);
-    const layer: StoredLayer = {
+    const record: Omit<StoredLayer, "path"> = {
       realizationKey: key,
       recipeKey,
-      path: `${published}/image.qcow2`,
       containerSha256,
       ...(parentContainerSha256 === undefined ? {} : { parentContainerSha256 }),
     };
     await Deno.writeTextFile(
       `${partial}/manifest.json`,
-      `${JSON.stringify(layer, null, 2)}\n`,
+      `${JSON.stringify(record, null, 2)}\n`,
     );
     await Deno.chmod(imagePath, 0o444).catch(() => {});
     await Deno.mkdir(`${this.root}/layers`, { recursive: true });
+    // `rename` onto a non-empty directory is ENOTEMPTY, so re-publishing a key
+    // has to replace rather than overwrite. Reachable without any concurrency:
+    // an uncacheable layer skips `get()` and so reaches `publish()` on every
+    // single run, and would otherwise fail the second one with a raw Deno
+    // error. Last writer wins is the right rule here — a cacheable layer only
+    // gets this far when `get()` missed, in which case the same key means the
+    // same content, and an uncacheable one is by definition not promised to
+    // reproduce, so the freshly built bytes are the ones to keep.
+    await Deno.remove(published, { recursive: true }).catch(() => {});
     await Deno.rename(partial, published);
-    return layer;
+    return { ...record, path: `${published}/${IMAGE_NAME}` };
   }
 }

@@ -15,10 +15,12 @@ import {
   UnrepresentableContentError,
 } from "./errors.ts";
 import { resolvedDir } from "./resolve.ts";
+import { USTAR_MAX_SIZE_BYTES } from "../fs/tar.ts";
 import type {
   FilesystemSpec,
   GuestArch,
   PartitionSpec,
+  ResolvedInput,
   ResolvedRecipe,
   Step,
 } from "./types.ts";
@@ -36,6 +38,18 @@ export const VVFAT_USABLE_BYTES: Readonly<Record<12 | 16, number>> = {
   12: 33_005_568,
   16: 528_450_048,
 };
+
+/**
+ * Why a guest step cannot be planned without an appliance identity.
+ *
+ * Shared by both places that can raise it, so the two never drift apart.
+ */
+const APPLIANCE_REQUIRED =
+  "a guest step's result depends on the appliance that produced it — the " +
+  "kernel, the e2fsprogs build and the /init — none of which this recipe " +
+  "declares. Plan with `plan(resolved, { appliance: await " +
+  "readApplianceIdentity({ arch }) })`, or the store will serve layers built " +
+  "by a different toolchain under a key that claims they match.";
 
 /** GPT reserves 34 sectors at the head and 33 at the tail. */
 const GPT_HEAD_SECTORS = 34;
@@ -80,9 +94,31 @@ export interface PlannedPartition {
   readonly filesystem: FilesystemSpec["kind"];
 }
 
+/**
+ * What the ustar transport used by `copyIn` can carry.
+ *
+ * Deliberately narrower than ext4's own capabilities. The archive records uid
+ * and gid as 0 by construction, so a tree whose ownership varies would arrive
+ * flattened — valid, mountable, and not what was staged. A `copyIn`
+ * destination is checked against the intersection of this and the target
+ * filesystem's traits, so the narrower of the two always wins.
+ */
+export const TAR_TRANSPORT_TRAITS: readonly CapabilityTrait[] = [
+  "symlinks",
+  "posixModes",
+  "largeFiles",
+];
+
 /** One step, resolved and keyed. */
 export interface PlannedStep {
-  /** Position in `Recipe.steps`; `-1` for the base layer. */
+  /**
+   * Position in `Recipe.steps`; `-1` for the base layer.
+   *
+   * NOT unique. A declared `partition` step carrying a kernel filesystem plans
+   * as two layers that share this index — they are two mechanisms realizing
+   * one declaration. Tell them apart by `id`; `index` stays a lookup into
+   * `recipe.steps`, which both of them need.
+   */
   readonly index: number;
   /** The step's declared id, or `"base"`. */
   readonly id: string;
@@ -100,6 +136,15 @@ export interface PlannedStep {
   readonly cacheable: boolean;
   /** Capability traits derived from the actual staging data. */
   readonly requiredTraits: readonly CapabilityTrait[];
+  /**
+   * Indices into {@linkcode Plan.layout} whose CONTENTS this layer produces.
+   * Present only on partition layers.
+   *
+   * The two split layers divide the index set between them, so no executor
+   * ever re-decides which side of the host/guest boundary a filesystem falls
+   * on — the planner decided once, and both halves read the same answer.
+   */
+  readonly partitionIndices?: readonly number[];
   /** A one-line human description. */
   readonly summary: string;
 }
@@ -112,7 +157,14 @@ export interface Plan {
   readonly steps: readonly PlannedStep[];
   /** The final layer's recipe key. */
   readonly outputRecipeKey: RecipeKey;
-  /** `true` when any step needs the guest appliance. */
+  /**
+   * `true` when any step needs the guest appliance.
+   *
+   * Every layer BEFORE the first guest one still builds and caches without
+   * it — which only became true once partition steps stopped being classified
+   * wholesale. A machine with no appliance now gets a correct, cached partial
+   * chain and a typed refusal at the first layer that genuinely needs Linux.
+   */
   readonly requiresAppliance: boolean;
   /** Resolved partition geometry, when the recipe declares a table. */
   readonly layout?: readonly PlannedPartition[];
@@ -120,21 +172,42 @@ export interface Plan {
   explain(): string;
 }
 
+/** Options for {@linkcode plan}. */
+export interface PlanOptions {
+  /**
+   * The appliance any `guest` step will run on.
+   *
+   * Required as soon as the plan contains one. A guest layer's bytes are a
+   * function of the kernel, the `e2fsprogs` build and the `/init` that
+   * produced them, and the recipe declares none of those — so leaving the
+   * appliance out of the key would let a store hand back layers built by a
+   * different toolchain under a key that claims they match. Obtain it with
+   * `readApplianceIdentity()` from `./system`.
+   */
+  readonly appliance?: {
+    /** Digest over every field of the appliance's identity. */
+    readonly digest: string;
+  };
+}
+
 function sectorSizeOf(resolved: ResolvedRecipe): number {
   return resolved.recipe.platform.sectorSize ?? 512;
 }
 
-function totalSizeBytes(resolved: ResolvedRecipe): number {
+/**
+ * The target disk's virtual size.
+ *
+ * Exported because `build()` needs the identical number when it writes the
+ * GPT: the backup header's position is derived from it, and two definitions
+ * that disagree put the backup somewhere the plan did not intend.
+ */
+export function totalSizeBytes(resolved: ResolvedRecipe): number {
   const base = resolved.recipe.base;
   if (base.kind === "blank") return base.sizeBytes;
-  const input = resolved.inputs[base.from.path];
-  if (input === undefined) {
-    throw new RecipePlanError(
-      "recipe",
-      `base image ${base.from.path} unresolved`,
-    );
-  }
-  return input.sizeBytes;
+  // NOT the resolver's sizeBytes, which is the FILE's size. A 600 MiB sparse
+  // qcow2 describing a 20 GiB disk would put every partition, and the backup
+  // GPT, in the wrong place — while looking entirely reasonable.
+  return base.virtualSizeBytes;
 }
 
 /** Compute GPT geometry, refusing anything that cannot fit or align. */
@@ -233,18 +306,46 @@ function validateContents(
       );
     }
   }
+  if (contents.kind === "ext4") {
+    // The type has no `from`, but untyped JavaScript can still pass one, and
+    // ignoring it would build exactly the empty-but-valid filesystem the type
+    // comment warns about.
+    if ("from" in contents) {
+      throw new RecipePlanError(
+        stepId,
+        `partition "${partition.label}" declares ext4 contents with a ` +
+          "`from` tree, but the layer that creates an ext4 filesystem formats " +
+          "it and nothing else. The tree would be dropped, leaving a " +
+          "filesystem that mounts and passes e2fsck holding none of it. " +
+          "Stage it with a separate `copyIn` step.",
+      );
+    }
+    return;
+  }
   // Traits are derived from the data, so this catches a tree whose author
   // never noticed it had a symlink in it.
-  const from = contents.kind === "fat"
-    ? contents.from
-    : contents.kind === "ext4"
-    ? contents.from
-    : undefined;
-  if (from === undefined) return;
-  const input = resolvedDir(resolved, from);
-  const supported = FILESYSTEM_TRAITS[contents.kind] ?? [];
-  const unsupported = (input.traits ?? []).filter((t) =>
-    !supported.includes(t)
+  if (contents.kind !== "fat") return;
+  const input = resolvedDir(resolved, contents.from);
+  refuseUnrepresentable(
+    stepId,
+    contents.kind,
+    input,
+    FILESYSTEM_TRAITS[contents.kind] ?? [],
+  );
+}
+
+/**
+ * Refuse a staging tree carrying metadata the destination cannot hold, naming
+ * the entries that would have been dropped.
+ */
+function refuseUnrepresentable(
+  stepId: string,
+  destination: string,
+  input: ResolvedInput,
+  supported: readonly CapabilityTrait[],
+): void {
+  const unsupported = (input.traits ?? []).filter((trait) =>
+    !supported.includes(trait)
   );
   if (unsupported.length === 0) return;
   const offenders = (input.entries ?? [])
@@ -268,21 +369,32 @@ function validateContents(
       }
       return reasons.map((reason) => ({ path: entry.path, reason }));
     });
-  throw new UnrepresentableContentError(stepId, contents.kind, offenders);
+  throw new UnrepresentableContentError(stepId, destination, offenders);
 }
 
 /** The executor a step runs on. */
 function executorOf(step: Step): Executor {
   switch (step.kind) {
     case "partition":
-      // A table plus FAT is pure host-side byte work; ext4 needs a kernel.
-      return step.partitions.some((p) => p.contents.kind === "ext4")
-        ? "guest"
-        : "bytes";
+      // Always the host. The table and every FAT filesystem are host-side by
+      // construction — the appliance ships e2fsprogs and nothing else, no
+      // sgdisk, no parted, no mkfs.fat — so a partition step can never run
+      // wholesale in the guest. Only its kernel filesystems leave the host,
+      // as a second layer.
+      return "bytes";
     case "run":
     case "copyIn":
       return "guest";
   }
+}
+
+/** Indices of partitions whose filesystem only a Linux kernel can create. */
+function guestFilesystems(
+  step: Extract<Step, { kind: "partition" }>,
+): number[] {
+  return step.partitions.flatMap((partition, index) =>
+    partition.contents.kind === "ext4" ? [index] : []
+  );
 }
 
 function summarize(step: Step): string {
@@ -295,6 +407,53 @@ function summarize(step: Step): string {
       return `run: ${step.script.split("\n")[0].slice(0, 48)}`;
     case "copyIn":
       return `copyIn: ${step.from.path} -> ${step.to}`;
+  }
+}
+
+/**
+ * Refuse a `copyIn` whose destination or payload cannot survive the transport.
+ *
+ * The tree is checked against the INTERSECTION of what the destination
+ * filesystem can hold and what the ustar transport can carry — a check that
+ * did not exist before, so the one step kind whose whole job is moving a host
+ * tree into an image was the one kind with nothing verifying it arrived whole.
+ */
+function validateCopyIn(
+  step: Extract<Step, { kind: "copyIn" }>,
+  resolved: ResolvedRecipe,
+): void {
+  const to = step.to;
+  const bad = !to.startsWith("/") ||
+    to.includes("//") ||
+    to.includes("\0") ||
+    to.split("/").some((segment) => segment === "." || segment === "..");
+  if (bad) {
+    throw new RecipePlanError(
+      step.id,
+      `copyIn "to" must be an absolute, normalized path inside the image's ` +
+        `root filesystem (got ${JSON.stringify(to)}). A relative or ` +
+        "`..`-bearing path would resolve against whatever the guest's working " +
+        "directory happened to be, which is not something this recipe states.",
+    );
+  }
+  const input = resolvedDir(resolved, step.from);
+  const destination = FILESYSTEM_TRAITS.ext4 ?? [];
+  refuseUnrepresentable(
+    step.id,
+    "the ustar transport into ext4",
+    input,
+    destination.filter((trait) => TAR_TRANSPORT_TRAITS.includes(trait)),
+  );
+  const huge = (input.entries ?? []).find((entry) =>
+    entry.sizeBytes > USTAR_MAX_SIZE_BYTES
+  );
+  if (huge !== undefined) {
+    throw new RecipePlanError(
+      step.id,
+      `${huge.path} is ${huge.sizeBytes} bytes; a ustar size field holds at ` +
+        `most ${USTAR_MAX_SIZE_BYTES}. Split the file, or deliver it out of ` +
+        "band and reference it from a `run` step.",
+    );
   }
 }
 
@@ -317,6 +476,58 @@ function validateRecipe(resolved: ResolvedRecipe): void {
       throw new RecipePlanError(step.id, "duplicate step id");
     }
     ids.add(step.id);
+    if (step.id.includes(":")) {
+      throw new RecipePlanError(
+        step.id,
+        "`:` is reserved in step ids — the planner uses it to name layers it " +
+          "generates, so a partition step carrying ext4 plans as `<id>` plus " +
+          "`<id>:mkfs`. Rename the step.",
+      );
+    }
+  }
+
+  const ext4Count = recipe.steps
+    .filter((step) => step.kind === "partition")
+    .flatMap((step) =>
+      (step as Extract<Step, { kind: "partition" }>).partitions
+    )
+    .filter((partition) => partition.contents.kind === "ext4").length;
+
+  if (recipe.base.kind === "image") {
+    if (recipe.base.rootPartition < 1) {
+      throw new RecipePlanError(
+        "recipe",
+        `base.rootPartition is ${recipe.base.rootPartition}; GPT partition ` +
+          "numbers are 1-based, and /dev/vda0 does not exist.",
+      );
+    }
+    const laying = recipe.steps.find((step) => step.kind === "partition");
+    if (laying !== undefined) {
+      throw new RecipePlanError(
+        laying.id,
+        "a partition step on an existing base image lays a new GPT over the " +
+          "one the image already has, discarding every partition in it. Start " +
+          'from `base: { kind: "blank" }` to own the layout, or drop this ' +
+          "step and address the existing table through `base.rootPartition`.",
+      );
+    }
+  }
+
+  for (const step of recipe.steps) {
+    if (step.kind !== "copyIn" && step.kind !== "run") continue;
+    // Both mount the image's root filesystem, so there has to be exactly one
+    // thing that unambiguously IS the root filesystem.
+    if (recipe.base.kind === "blank" && ext4Count !== 1) {
+      throw new RecipePlanError(
+        step.id,
+        `a ${step.kind} step mounts the recipe's root filesystem, and this ` +
+          `recipe declares ${ext4Count} ext4 partitions. Declare exactly one, ` +
+          'or start from `base: { kind: "image", rootPartition }` to name the ' +
+          "one already in the image.",
+      );
+    }
+    if (step.kind !== "copyIn") continue;
+    validateCopyIn(step, resolved);
   }
   if (recipe.boot.kind === "uefi-removable") {
     const partitionSteps = recipe.steps.filter((s) => s.kind === "partition");
@@ -354,7 +565,10 @@ function validateRecipe(resolved: ResolvedRecipe): void {
  * Plan a resolved recipe. Deterministic: the same inputs always give the same
  * keys, geometry and refusals.
  */
-export async function plan(resolved: ResolvedRecipe): Promise<Plan> {
+export async function plan(
+  resolved: ResolvedRecipe,
+  options: PlanOptions = {},
+): Promise<Plan> {
   validateRecipe(resolved);
   const { recipe } = resolved;
   const sector = sectorSizeOf(resolved);
@@ -373,6 +587,8 @@ export async function plan(resolved: ResolvedRecipe): Promise<Plan> {
         kind: "image",
         format: recipe.base.format,
         sha256: resolved.inputs[recipe.base.from.path]?.sha256 ?? "",
+        virtualSizeBytes: recipe.base.virtualSizeBytes,
+        rootPartition: recipe.base.rootPartition,
       },
     platform: {
       arch: recipe.platform.arch,
@@ -412,20 +628,25 @@ export async function plan(resolved: ResolvedRecipe): Promise<Plan> {
     const stepInputs = step.kind === "copyIn"
       ? [resolvedDir(resolved, step.from)]
       : step.kind === "partition"
-      ? step.partitions.flatMap((p) => {
-        const from = p.contents.kind === "fat"
-          ? p.contents.from
-          : p.contents.kind === "ext4"
-          ? p.contents.from
-          : undefined;
-        return from === undefined ? [] : [resolvedDir(resolved, from)];
-      })
+      ? step.partitions.flatMap((p) =>
+        p.contents.kind === "fat"
+          ? [resolvedDir(resolved, p.contents.from)]
+          : []
+      )
       : [];
     const traits = [
       ...new Set(stepInputs.flatMap((input) => input.traits ?? [])),
     ].sort();
     const usesNetwork = step.kind === "run" && step.network === true;
     if (usesNetwork) ancestorUncacheable = true;
+
+    const guestIndices = step.kind === "partition"
+      ? guestFilesystems(step)
+      : [];
+    const executor = executorOf(step);
+    if (executor === "guest" && options.appliance === undefined) {
+      throw new RecipePlanError(step.id, APPLIANCE_REQUIRED);
+    }
 
     const key = await recipeKey({
       stepKind: step.kind,
@@ -440,6 +661,10 @@ export async function plan(resolved: ResolvedRecipe): Promise<Plan> {
         machine: recipe.platform.machine ?? "",
       },
       determinism: recipe.determinism,
+      // Only guest layers carry it: their bytes depend on the appliance, and
+      // folding it into a host-side layer's key would invalidate every cached
+      // GPT and FAT for a toolchain they never touch.
+      ...(executor === "guest" ? { appliance: options.appliance?.digest } : {}),
       // In the preimage so that uncacheability actually propagates, rather
       // than being asserted in prose and forgotten.
       ancestorUncacheable,
@@ -449,12 +674,70 @@ export async function plan(resolved: ResolvedRecipe): Promise<Plan> {
       id: step.id,
       recipeKey: key,
       parentRecipeKey: parentKey,
-      executor: executorOf(step),
+      executor,
       cacheable: !ancestorUncacheable,
       requiredTraits: traits,
+      ...(step.kind === "partition"
+        ? {
+          partitionIndices: step.partitions
+            .map((_, i) => i)
+            .filter((i) => !guestIndices.includes(i)),
+        }
+        : {}),
       summary: summarize(step),
     });
     parentKey = key;
+
+    // A partition step carrying a kernel filesystem plans as a SECOND layer.
+    // The table and any FAT came from the host above; only the mkfs crosses
+    // into the guest, and it does so with a digest boundary in front of it —
+    // so its realization key folds in the actual bytes of the GPT whose
+    // partitions its kernel is about to parse.
+    if (guestIndices.length === 0) continue;
+    if (options.appliance === undefined) {
+      throw new RecipePlanError(`${step.id}:mkfs`, APPLIANCE_REQUIRED);
+    }
+    const partitionStep = step as Extract<Step, { kind: "partition" }>;
+    const mkfsKey = await recipeKey({
+      stepKind: "partition:mkfs",
+      stepId: step.id,
+      parentRecipeKey: parentKey,
+      payload: {
+        partitions: guestIndices.map((i) => ({
+          index: i,
+          fsLabel:
+            (partitionStep.partitions[i].contents as { label: string }).label,
+        })),
+      },
+      inputs: [],
+      // A moved partition must rekey the format: the same mke2fs run against a
+      // different window is a different filesystem in a different place.
+      geometry: layout ?? [],
+      platform: {
+        arch: recipe.platform.arch,
+        sectorSize: sector,
+        machine: recipe.platform.machine ?? "",
+      },
+      determinism: recipe.determinism,
+      appliance: options.appliance.digest,
+      ancestorUncacheable,
+    });
+    steps.push({
+      index,
+      id: `${step.id}:mkfs`,
+      recipeKey: mkfsKey,
+      parentRecipeKey: parentKey,
+      executor: "guest",
+      cacheable: !ancestorUncacheable,
+      requiredTraits: [],
+      partitionIndices: guestIndices,
+      summary: `mkfs: ${
+        guestIndices
+          .map((i) => `${partitionStep.partitions[i].label}/ext4`)
+          .join(", ")
+      }`,
+    });
+    parentKey = mkfsKey;
   }
 
   const requiresAppliance = steps.some((s) => s.executor === "guest");
@@ -466,7 +749,7 @@ export async function plan(resolved: ResolvedRecipe): Promise<Plan> {
     ...(layout === undefined ? {} : { layout }),
     explain(): string {
       const lines = steps.map((s) =>
-        `${s.id.padEnd(10)} ${s.executor.padEnd(6)} ${s.summary.padEnd(44)} ` +
+        `${s.id.padEnd(16)} ${s.executor.padEnd(6)} ${s.summary.padEnd(44)} ` +
         `${s.recipeKey.slice(0, 12)}${s.cacheable ? "" : "  (uncacheable)"}`
       );
       if (layout !== undefined) {

@@ -106,11 +106,17 @@ export type FilesystemSpec =
     /**
      * ext4, created in the guest appliance. There is no host-side path: ext4
      * creation needs a Linux kernel executing target-architecture ELF.
+     *
+     * Deliberately has no `from`. The layer that creates an ext4 filesystem
+     * formats it and does nothing else, so a staging tree declared here would
+     * produce an empty filesystem that mounts and passes `e2fsck` while
+     * holding none of it. Populate it with a `copyIn` step, which is a layer of
+     * its own and can say whether it worked. A `from` property reaching this
+     * arm from untyped JavaScript is refused at plan time rather than ignored.
      */
     readonly kind: "ext4";
+    /** Volume label, stamped by `mke2fs -L`. */
     readonly label: string;
-    /** Optional staging tree copied in after the filesystem is created. */
-    readonly from?: DirInput;
   }
   | { readonly kind: "empty" };
 
@@ -200,7 +206,31 @@ export type BaseSpec =
     /** Start from an existing image. */
     readonly kind: "image";
     readonly from: FileInput;
+    /**
+     * The base's format, always stated. Never left for qemu to probe: format
+     * probing on a file this recipe did not produce is how a crafted image
+     * gets read as something other than what it is.
+     */
     readonly format: string;
+    /**
+     * The base's VIRTUAL size in bytes.
+     *
+     * Declared rather than measured, because `plan()` runs no binary — and the
+     * only size the resolver can see is the FILE's, which for a sparse or
+     * compressed qcow2 is nowhere near the disk's. `build()` checks this
+     * against `qemu-img info` and refuses a mismatch, so a wrong number costs
+     * a clear error rather than a table laid out for the wrong disk.
+     */
+    readonly virtualSizeBytes: number;
+    /**
+     * 1-based GPT partition number holding the root filesystem, which `copyIn`
+     * and `run` steps mount.
+     *
+     * There is no declared layout to infer it from — the table came with the
+     * image — and guessing produces something that mounts, populates, and is
+     * the wrong partition.
+     */
+    readonly rootPartition: number;
   };
 
 /** A complete, buildable image definition. */

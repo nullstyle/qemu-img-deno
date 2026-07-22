@@ -159,14 +159,11 @@ export class LocalInputResolver implements InputResolver {
 export function inputsOf(step: Step): Input[] {
   switch (step.kind) {
     case "partition":
-      return step.partitions.flatMap((partition) => {
-        const contents = partition.contents;
-        if (contents.kind === "fat") return [contents.from];
-        if (contents.kind === "ext4" && contents.from !== undefined) {
-          return [contents.from];
-        }
-        return [];
-      });
+      // Only FAT declares a tree. An ext4 partition is formatted and left
+      // empty; it is populated by a `copyIn` step, which declares its own.
+      return step.partitions.flatMap((partition) =>
+        partition.contents.kind === "fat" ? [partition.contents.from] : []
+      );
     case "copyIn":
       return [step.from];
     case "run":

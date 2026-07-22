@@ -3,9 +3,11 @@ import {
   canonicalJson,
   defineRecipe,
   dir,
+  file,
   type Input,
   type InputResolver,
   plan,
+  type PlanOptions,
   realizationKey,
   type Recipe,
   type RecipeKey,
@@ -79,14 +81,23 @@ function baseRecipe(overrides: Partial<Recipe> = {}): Recipe {
   });
 }
 
+/**
+ * A stand-in appliance identity. Guest steps refuse to plan without one, and
+ * the planner only ever reads its digest — so the tests need no appliance on
+ * disk, and the digest's effect on keys stays directly assertable.
+ */
+const STUB_APPLIANCE = { digest: "stub-appliance-digest" };
+
 async function planOf(
   recipe: Recipe,
   trees: Record<string, ResolvedEntry[]> = { "./esp": ESP_TREE },
+  options: PlanOptions = { appliance: STUB_APPLIANCE },
 ) {
   return await plan(
     await resolveRecipe(recipe, {
       resolver: new StubResolver(trees),
     }),
+    options,
   );
 }
 
@@ -118,8 +129,9 @@ Deno.test("plan geometry: 1 MiB alignment, GPT tail reserved", async () => {
   assertEquals(planned.steps.map((s) => s.executor), ["image", "bytes"]);
 });
 
-Deno.test("ext4 forces the guest executor; FAT alone does not", async () => {
-  const withExt4 = baseRecipe({
+/** A recipe whose one partition needs a kernel filesystem. */
+function ext4Recipe(): Recipe {
+  return baseRecipe({
     boot: { kind: "none" },
     steps: [{
       kind: "partition",
@@ -132,9 +144,118 @@ Deno.test("ext4 forces the guest executor; FAT alone does not", async () => {
       }],
     }],
   });
-  const planned = await planOf(withExt4, {});
+}
+
+/**
+ * A recipe with a real root filesystem, for the step kinds that mount one.
+ * `run` and `copyIn` are refused without exactly one, so they cannot be
+ * exercised against a recipe that declares no partitions at all.
+ */
+function rootedRecipe(steps: readonly Step[]): Recipe {
+  return baseRecipe({
+    boot: { kind: "none" },
+    steps: [
+      {
+        kind: "partition",
+        id: "table",
+        partitions: [{
+          label: "root",
+          type: "linux-root",
+          size: "rest",
+          contents: { kind: "ext4", label: "root" },
+        }],
+      },
+      ...steps,
+    ],
+  });
+}
+
+Deno.test("one declared partition step with ext4 plans as two layers", async () => {
+  const planned = await planOf(ext4Recipe(), {});
+  // The table is host-side ALWAYS: the appliance has e2fsprogs and nothing
+  // else, so a guest could not write a GPT even if we asked it to.
+  assertEquals(
+    planned.steps.map((s) => [s.id, s.executor]),
+    [["base", "image"], ["table", "bytes"], ["table:mkfs", "guest"]],
+  );
   assertEquals(planned.requiresAppliance, true);
-  assertEquals(planned.steps[1].executor, "guest");
+  // Both layers point at the same declaration, and split the partitions.
+  assertEquals(planned.steps[1].index, planned.steps[2].index);
+  assertEquals(planned.steps[1].partitionIndices, []);
+  assertEquals(planned.steps[2].partitionIndices, [0]);
+});
+
+Deno.test("a mixed ESP + ext4 table splits the partitions between the layers", async () => {
+  const mixed = baseRecipe({
+    base: { kind: "blank", sizeBytes: 4 * 1024 ** 3 },
+    steps: [{
+      kind: "partition",
+      id: "table",
+      partitions: [
+        {
+          label: "EFI",
+          type: "esp",
+          size: VVFAT_USABLE_BYTES[16],
+          contents: {
+            kind: "fat",
+            fatType: 16,
+            label: "EFI",
+            from: dir("./esp"),
+          },
+        },
+        {
+          label: "root",
+          type: "linux-root",
+          size: "rest",
+          contents: { kind: "ext4", label: "root" },
+        },
+      ],
+    }],
+  });
+  const planned = await planOf(mixed);
+  assertEquals(planned.steps.length, 3);
+  // The FAT stays with the host layer; only the ext4 window crosses over.
+  assertEquals(planned.steps[1].partitionIndices, [0]);
+  assertEquals(planned.steps[2].partitionIndices, [1]);
+});
+
+Deno.test("FAT alone never reaches the guest", async () => {
+  const planned = await planOf(baseRecipe());
+  assertEquals(planned.steps.map((s) => s.executor), ["image", "bytes"]);
+  assertEquals(planned.requiresAppliance, false);
+});
+
+Deno.test("a guest step refuses to plan without an appliance identity", async () => {
+  const error = await assertRejects(
+    () => planOf(ext4Recipe(), {}, {}),
+    RecipePlanError,
+  );
+  // The message has to name the consequence, not just the missing argument:
+  // a key that omits the toolchain is a key that lies about what it names.
+  assert(error.message.includes("readApplianceIdentity"), error.message);
+  assert(error.message.includes("different toolchain"), error.message);
+});
+
+Deno.test("the appliance digest is part of a guest layer's key, and only a guest layer's", async () => {
+  const withA = await planOf(ext4Recipe(), {}, {
+    appliance: { digest: "appliance-a" },
+  });
+  const withB = await planOf(ext4Recipe(), {}, {
+    appliance: { digest: "appliance-b" },
+  });
+  // Rebuilding the appliance on a new Alpine must not leave every guest layer
+  // a cache hit on bytes the new toolchain would never have produced.
+  assert(
+    withA.steps[2].recipeKey !== withB.steps[2].recipeKey,
+    "the mkfs layer's key must move with the appliance",
+  );
+  // …but the host-side table below it is untouched by the toolchain, and
+  // rekeying it would throw away a correct cached layer for nothing.
+  assertEquals(
+    withA.steps[1].recipeKey,
+    withB.steps[1].recipeKey,
+    "the host-side table layer must NOT move with the appliance",
+  );
 });
 
 // ─────────────────────────────────────────────── the key-sensitivity matrix ──
@@ -142,8 +263,31 @@ Deno.test("ext4 forces the guest executor; FAT alone does not", async () => {
 // only by rebuilding and comparing — which is the work the cache exists to
 // avoid — so this is the cheapest test for the most expensive bug.
 
+/** The image arm of {@linkcode BaseSpec}, for spreading in mutations. */
+type ImageBase = Extract<Recipe["base"], { kind: "image" }>;
+
+/** A recipe starting from an existing image, which declares no table. */
+function imageBaseRecipe(): Recipe {
+  return baseRecipe({
+    boot: { kind: "none" },
+    base: {
+      kind: "image",
+      from: file("./cloud.qcow2"),
+      format: "qcow2",
+      virtualSizeBytes: 4 * 1024 ** 3,
+      rootPartition: 1,
+    },
+    steps: [{ kind: "run", id: "configure", script: "true" }],
+  });
+}
+
 const MUTATIONS: Array<
-  { name: string; mutate: (r: Recipe) => Recipe; baseline?: () => Recipe }
+  {
+    name: string;
+    mutate: (r: Recipe) => Recipe;
+    baseline?: () => Recipe;
+    trees?: Record<string, ResolvedEntry[]>;
+  }
 > = [
   {
     name: "recipe name",
@@ -246,12 +390,56 @@ const MUTATIONS: Array<
       }],
     }),
   },
+  {
+    name: "copyIn destination",
+    baseline: () =>
+      rootedRecipe([
+        { kind: "copyIn", id: "app", from: dir("./app"), to: "/opt/app" },
+      ]),
+    trees: { "./esp": ESP_TREE, "./app": [] },
+    mutate: (r) => ({
+      ...r,
+      steps: [r.steps[0], {
+        kind: "copyIn",
+        id: "app",
+        from: dir("./app"),
+        to: "/srv/app",
+      }],
+    }),
+  },
+  {
+    // The declared virtual size decides every partition LBA and where the
+    // backup GPT goes, so it cannot be a free-floating annotation.
+    name: "base image virtual size",
+    baseline: imageBaseRecipe,
+    trees: {},
+    mutate: (r) => ({
+      ...r,
+      base: { ...(r.base as ImageBase), virtualSizeBytes: 8 * 1024 ** 3 },
+    }),
+  },
+  {
+    name: "base image root partition",
+    baseline: imageBaseRecipe,
+    trees: {},
+    mutate: (r) => ({
+      ...r,
+      base: { ...(r.base as ImageBase), rootPartition: 2 },
+    }),
+  },
 ];
 
-for (const { name, mutate, baseline = baseRecipe } of MUTATIONS) {
+for (
+  const {
+    name,
+    mutate,
+    baseline = baseRecipe,
+    trees = { "./esp": ESP_TREE },
+  } of MUTATIONS
+) {
   Deno.test(`key sensitivity: ${name} changes the output key`, async () => {
-    const before = await planOf(baseline());
-    const after = await planOf(mutate(baseline()));
+    const before = await planOf(baseline(), trees);
+    const after = await planOf(mutate(baseline()), trees);
     assert(
       before.outputRecipeKey !== after.outputRecipeKey,
       `changing the ${name} must move the key, or a stale layer is served`,
@@ -517,24 +705,140 @@ Deno.test("refuses duplicate step ids and a second partition table", async () =>
   );
 });
 
+Deno.test("refuses a step id containing the separator the planner reserves", async () => {
+  await assertRejects(
+    () =>
+      planOf(
+        baseRecipe({
+          boot: { kind: "none" },
+          steps: [{ kind: "run", id: "build:app", script: "true" }],
+        }),
+        {},
+      ),
+    RecipePlanError,
+    "`:` is reserved in step ids",
+  );
+});
+
+Deno.test("refuses a run or copyIn step with no unambiguous root filesystem", async () => {
+  // Both mount "the root filesystem". With none declared there is nothing to
+  // mount; with two there is no answer to which one.
+  const error = await assertRejects(
+    () =>
+      planOf(
+        baseRecipe({
+          boot: { kind: "none" },
+          steps: [{ kind: "run", id: "configure", script: "true" }],
+        }),
+        {},
+      ),
+    RecipePlanError,
+    "mounts the recipe's root filesystem",
+  );
+  assert(error.message.includes("declares 0 ext4"), error.message);
+});
+
+Deno.test("refuses a copyIn destination that is not absolute and normalized", async () => {
+  for (const to of ["opt/app", "/opt/../etc", "/opt//app", "/opt/./app"]) {
+    await assertRejects(
+      () =>
+        planOf(
+          rootedRecipe([
+            { kind: "copyIn", id: "app", from: dir("./app"), to },
+          ]),
+          { "./esp": ESP_TREE, "./app": [] },
+        ),
+      RecipePlanError,
+      "absolute, normalized path",
+      `"${to}" must be refused`,
+    );
+  }
+});
+
+Deno.test("refuses a copyIn tree the ustar transport would flatten", async () => {
+  // ext4 holds ownership perfectly well — but the archive that carries the
+  // tree there writes uid/gid 0, so varying ownership arrives flattened. The
+  // narrower of the two capabilities is the one that governs.
+  const owned: ResolvedEntry[] = [
+    { path: "a", type: "file", mode: 0o644, sizeBytes: 1, uid: 0, gid: 0 },
+    { path: "b", type: "file", mode: 0o644, sizeBytes: 1, uid: 501, gid: 20 },
+  ];
+  const error = await assertRejects(
+    () =>
+      planOf(
+        rootedRecipe([
+          { kind: "copyIn", id: "app", from: dir("./app"), to: "/opt/app" },
+        ]),
+        { "./esp": ESP_TREE, "./app": owned },
+      ),
+    UnrepresentableContentError,
+    "ustar transport",
+  );
+  assert(error.message.includes("posixOwnership"), error.message);
+});
+
+Deno.test("refuses an ext4 partition carrying a staging tree", async () => {
+  // The type has no `from`; this is the untyped-JavaScript escape hatch, and
+  // ignoring it would build an empty filesystem that mounts and fscks clean.
+  const smuggled = baseRecipe({
+    boot: { kind: "none" },
+    steps: [{
+      kind: "partition",
+      id: "table",
+      partitions: [{
+        label: "root",
+        type: "linux-root",
+        size: "rest",
+        contents: {
+          kind: "ext4",
+          label: "root",
+          from: dir("./app"),
+        } as unknown as Extract<Step, { kind: "partition" }>["partitions"][
+          number
+        ]["contents"],
+      }],
+    }],
+  });
+  await assertRejects(
+    () => planOf(smuggled, { "./app": [] }),
+    RecipePlanError,
+    "formats it and nothing else",
+  );
+});
+
+Deno.test("refuses laying a new partition table over an existing base image", async () => {
+  await assertRejects(
+    () =>
+      planOf(baseRecipe({
+        base: {
+          kind: "image",
+          from: file("./cloud.qcow2"),
+          format: "qcow2",
+          virtualSizeBytes: 4 * 1024 ** 3,
+          rootPartition: 1,
+        },
+      })),
+    RecipePlanError,
+    "discarding every partition in it",
+  );
+});
+
 // ──────────────────────────────────────────────────────── purity semantics ──
 
 Deno.test("a network step is uncacheable, and so is everything after it", async () => {
   const planned = await planOf(
-    baseRecipe({
-      boot: { kind: "none" },
-      steps: [
-        { kind: "run", id: "offline", script: "echo a" },
-        { kind: "run", id: "online", script: "apk add x", network: true },
-        { kind: "run", id: "after", script: "echo b" },
-      ],
-    }),
-    {},
+    rootedRecipe([
+      { kind: "run", id: "offline", script: "echo a" },
+      { kind: "run", id: "online", script: "apk add x", network: true },
+      { kind: "run", id: "after", script: "echo b" },
+    ]),
   );
   assertEquals(
     planned.steps.map((s) => [s.id, s.cacheable]),
     [
       ["base", true],
+      ["table", true],
+      ["table:mkfs", true],
       ["offline", true],
       // Declaring the network means the step is not a function of its declared
       // inputs — and neither is anything built on top of it.

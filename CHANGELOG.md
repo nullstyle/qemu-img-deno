@@ -83,8 +83,56 @@ an ESP gets built on a machine with no `mkfs.fat`.
   `../<parent>/image.qcow2`. Layers are `chmod 0444` and re-verified against
   their recorded digest on every cache hit.
 
+- **`./system`** — the guest tier, and the `build()` executor that dispatches
+  through it. `ApplianceGuestRunner` boots the pinned appliance with the layer's
+  own overlay attached, a framed payload carrying the step script, and a status
+  disk carrying the answer. `readApplianceIdentity()` records what a guest
+  layer's bytes actually depend on — the ABI, the kernel, the initramfs, the
+  `/init` digest, the lockfile digest and the qemu version — and re-verifies all
+  of it per build; that digest is folded into every guest layer's cache key, so
+  bumping Alpine cannot leave a stale layer looking like a hit. Disks are
+  addressed by **identity**, not position: roles ride the kernel cmdline as
+  serial tokens and the guest resolves them from `/sys/block/vd*/serial`.
+- **`buildTar` in `./fs`** — a ustar writer, because both host tars lose data
+  while exiting `0` (see the guest-tier hazard table). It throws where they
+  drop, and emits a GNU `'L'` record for names with no prefix/name split.
+- A declared `partition` step carrying an ext4 window now plans as **two**
+  layers: `<id>` on the host for the table and any FAT, `<id>:mkfs` in the guest
+  for the kernel filesystems. The boundary is a fact about the toolchain — the
+  appliance ships `e2fsprogs` and no partitioning tools at all — so a mixed
+  ESP-plus-root recipe was previously classified `guest` in its entirety and
+  could not be built. Every layer before the first guest one now builds and
+  caches without an appliance present.
+- Building from an existing base image (`base.kind: "image"`), which now
+  requires a declared `virtualSizeBytes` and `rootPartition`. The virtual size
+  is declared rather than probed because `plan()` runs no binary, and the only
+  size available to it is the _file's_ — which for a sparse qcow2 is nowhere
+  near the disk's. `build()` checks it against `qemu-img info` and refuses a
+  mismatch.
+- Plan-time refusals for the guest tier: a step id containing `:` (reserved for
+  generated layers), a `run`/`copyIn` step with no unambiguous root filesystem,
+  a non-absolute or non-normalized `copyIn` destination, a `copyIn` tree the
+  ustar transport would flatten, a file too large for a ustar size field, a
+  partition step laid over an existing base image, and a guest step planned with
+  no appliance identity.
+
 ### Fixed
 
+- **`LayerStore.publish()` could never re-publish a key.** `rename` onto a
+  non-empty directory is `ENOTEMPTY`, and an uncacheable layer skips the cache
+  lookup and so reaches `publish()` on _every_ run — meaning any recipe with a
+  `network: true` step failed on its second build with a raw Deno error.
+- **A layer manifest recorded an absolute path**, which broke the relocatability
+  the store's own module doc promises. A _moved_ store threw `ENOENT`; worse, a
+  **copied** store verified clean and handed back the original's bytes, because
+  both the digest and the path it checked still described the file left behind.
+  The manifest is now root-relative.
+- `plan()` derived an image base's disk size from the resolver's **file** size,
+  and `build()` hardcoded `0` for the same case — so a GPT over an image base
+  would have been laid out for the wrong disk, or for a zero-sector one.
+- `UnrepresentableContentError` never fired for `copyIn`: the check ran only
+  from `planLayout`, leaving the one step kind whose entire job is moving a host
+  tree into an image as the one kind with nothing verifying it arrived whole.
 - `timeoutMs` was not a wall-clock deadline. The abort raced the child's
   _captured output_, and a pipe stays readable while any grandchild holds its
   write end — so `sh -c 'echo x; sleep 5'` with a 500 ms timeout blocked for the

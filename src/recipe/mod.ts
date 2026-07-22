@@ -108,5 +108,8 @@ export {
   plan,
   type PlannedPartition,
   type PlannedStep,
+  type PlanOptions,
+  TAR_TRANSPORT_TRAITS,
+  totalSizeBytes,
   VVFAT_USABLE_BYTES,
 } from "./plan.ts";

@@ -21,13 +21,15 @@
  *
  * ## Three things that are non-obvious, and load-bearing
  *
- * 1. **The kernel builds virtio as modules.** `CONFIG_VIRTIO_BLK=m` and
- *    `CONFIG_VIRTIO_MMIO=m` (verified against the published
- *    `config-6.12.81-0-virt`). A custom initramfs with no modules therefore
- *    sees *no block devices at all* — and a step script that never loads then
- *    "succeeds" against an empty file. The appliance is layered over Alpine's
- *    own initramfs, which carries `virtio_blk.ko`, and the init loads it
- *    explicitly.
+ * 1. **The kernel builds virtio-blk AND ext4 as modules.** A custom initramfs
+ *    with no modules sees *no block devices at all*, and before `modprobe
+ *    ext4` runs, `/proc/filesystems` carries **zero** block filesystems — every
+ *    entry is `nodev`. `mount -t ext4` then fails on a perfect image while
+ *    `mke2fs`, being pure userspace, succeeds anyway, putting the failure one
+ *    step after its cause. The appliance is layered over Alpine's own
+ *    initramfs, which carries both modules, and `/init` loads them explicitly.
+ *    (`virtio_pci` is builtin — on `-M virt` the transport is virtio-PCI, not
+ *    mmio, so `virtio_mmio` in that list is harmless noise, not a fact.)
  * 2. **Concatenated cpio members: later wins.** The kernel unpacks each
  *    archive in order, so appending our overlay after Alpine's initramfs
  *    replaces its `/init` with ours while inheriting its modules.
@@ -37,6 +39,14 @@
  *
  * @module
  */
+
+import { sha256Hex } from "../src/digest.ts";
+import { APPLIANCE_ABI } from "../src/system/abi.ts";
+import { APPLIANCE_INIT, initDigest } from "../src/system/init.ts";
+import {
+  type ApplianceArch as SystemArch,
+  writeApplianceIdentity,
+} from "../src/system/identity.ts";
 
 /** One digest-pinned upstream artifact, as recorded in the lockfile. */
 export interface PinnedArtifact {
@@ -92,76 +102,6 @@ export async function readLock(path: string): Promise<ApplianceLock> {
 export function releaseUrl(lock: ApplianceLock, arch: string): string {
   return `${lock.alpine.mirror}/${lock.alpine.release}/releases/${arch}`;
 }
-
-/**
- * The appliance init. No getty, no login, no shell prompt: feeding a script
- * into a login prompt over serial races the getty and buffers its output, so
- * a build must not depend on prompt timing.
- *
- * Every exit path writes a framed status record, because qemu's own exit code
- * cannot carry the answer — a clean poweroff, a guest panic, and a failed
- * step all exit 0.
- */
-const INIT = `#!/bin/sh
-export PATH=/bin:/sbin:/usr/bin:/usr/sbin
-mount -t proc proc /proc 2>/dev/null
-mount -t sysfs sys /sys 2>/dev/null
-mount -t devtmpfs dev /dev 2>/dev/null
-
-# CONFIG_VIRTIO_BLK=m: with no driver loaded there are no block devices at
-# all, and an unloadable step script would look like a step that passed.
-KVER=$(uname -r)
-for m in virtio_mmio virtio_blk; do
-  modprobe "$m" 2>/dev/null || \\
-    insmod "/lib/modules/$KVER/kernel/drivers/block/$m.ko" 2>/dev/null || true
-done
-mdev -s 2>/dev/null || true
-
-PAYLOAD=""; STATUS=""
-for arg in $(cat /proc/cmdline); do
-  case "$arg" in
-    qi.payload=*) PAYLOAD="\${arg#qi.payload=}" ;;
-    qi.status=*)  STATUS="\${arg#qi.status=}" ;;
-  esac
-done
-
-# Called on every exit path, so the host can always distinguish "the step
-# failed" from "the guest never got that far". kernel_power_off() does not
-# sync, so the record is fsynced before the reboot syscall.
-finish() {
-  printf 'QIMG1\\n%s\\n%s\\n' "$1" "$2" > /status.bin
-  [ -n "$STATUS" ] && dd if=/status.bin of="$STATUS" conv=fsync 2>/dev/null
-  sync
-  echo "appliance: status rc=$1 ($2)"
-  poweroff -f
-}
-
-[ -n "$PAYLOAD" ] || finish 91 "no-payload-device"
-[ -n "$STATUS" ]  || { echo "appliance: no status device"; poweroff -f; }
-
-i=0
-while [ ! -b "$PAYLOAD" ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i+1)); done
-[ -b "$PAYLOAD" ] || finish 90 "payload-device-never-appeared:$PAYLOAD"
-
-# Sector-aligned framing, because block devices reject unaligned reads:
-# sector 0 is "QIMG1\\n<byte-length>\\n", the script starts at byte 512.
-HDR=$(dd if="$PAYLOAD" bs=512 count=1 2>/dev/null | tr -d '\\0')
-MAGIC=$(echo "$HDR" | sed -n 1p)
-LEN=$(echo "$HDR" | sed -n 2p)
-[ "$MAGIC" = "QIMG1" ] || finish 92 "bad-payload-magic:$MAGIC"
-case "$LEN" in ''|*[!0-9]*) finish 93 "bad-payload-length:$LEN" ;; esac
-[ "$LEN" -gt 0 ] || finish 94 "empty-step-script"
-
-dd if="$PAYLOAD" bs=512 skip=1 2>/dev/null | dd bs=1 count="$LEN" 2>/dev/null > /step.sh
-GOT=$(wc -c < /step.sh)
-[ "$GOT" = "$LEN" ] || finish 95 "short-read:$GOT-of-$LEN"
-echo "appliance: running $LEN-byte step script"
-
-sh /step.sh > /out.log 2>&1
-RC=$?
-cat /out.log
-finish "$RC" "$(sha256sum /out.log | cut -d' ' -f1)"
-`;
 
 const step = (label: string) => console.log(`▸ ${label}`);
 const pass = (label: string) => console.log(`✓ ${label}`);
@@ -278,6 +218,8 @@ if (import.meta.main) {
   // arch: the two architectures ship the same package set at versions that need
   // not match, and a hardcoded filename would break on the next point release.
   const isoEntries = (await run("bsdtar", ["-tf", iso])).split("\n");
+  /** Resolved package filenames — an identity field, not just a log line. */
+  const resolvedPackages: string[] = [];
   for (const name of lock.packages) {
     const pattern = new RegExp(`^apks/${ARCH}/(${name}-\\d[^/]*\\.apk)$`);
     const match = isoEntries.map((e) => pattern.exec(e.trim())).find((m) => m);
@@ -288,6 +230,7 @@ if (import.meta.main) {
       );
     }
     const member = `apks/${ARCH}/${match[1]}`;
+    resolvedPackages.push(match[1]);
     // Extract straight to disk. Routing the .apk through a string would decode
     // binary as UTF-8 and re-encode it, silently corrupting every package —
     // which presents as `mke2fs: not found` inside the guest, long after here.
@@ -304,7 +247,7 @@ if (import.meta.main) {
       ".PKGINFO",
     ]).catch(() => {});
   }
-  await Deno.writeTextFile(`${rootfs}/init`, INIT);
+  await Deno.writeTextFile(`${rootfs}/init`, APPLIANCE_INIT);
   await Deno.chmod(`${rootfs}/init`, 0o755);
 
   // Fail here rather than inside a guest twenty seconds later.
@@ -351,6 +294,41 @@ if (import.meta.main) {
   ]);
   const size = (await Deno.stat(`${WORK}/appliance.cpio.gz`)).size;
   pass(`${WORK}/appliance.cpio.gz (${(size / 1024 / 1024).toFixed(1)} MiB)`);
+
+  step("recording the appliance identity");
+  // The kernel release comes from Alpine's OWN initramfs member list rather
+  // than from `uname -r` in a guest: this runs on the host, and the release is
+  // what names the module directory the /init modprobes out of.
+  const initramfsEntries = (await run("bsdtar", [
+    "-tf",
+    `${WORK}/boot/initramfs-virt`,
+  ])).split("\n");
+  const release = initramfsEntries
+    .map((entry) => /^lib\/modules\/([^/]+)\//.exec(entry.trim())?.[1])
+    .find((found) => found !== undefined);
+  if (release === undefined) {
+    throw new Error(
+      `no lib/modules/<release>/ in ${WORK}/boot/initramfs-virt — the ` +
+        "appliance inherits its virtio and ext4 modules from Alpine's " +
+        "initramfs, so an initramfs without one boots to a guest that sees " +
+        "no block devices at all.",
+    );
+  }
+  // Nothing about the qemu that will BOOT this is recorded here: the boot host
+  // need not be the build host, and a stale copy of its version would defeat
+  // the check it exists for. readApplianceIdentity() probes it instead.
+  await writeApplianceIdentity(WORK, {
+    abi: APPLIANCE_ABI,
+    arch: ARCH as SystemArch,
+    kernelSha256: await sha256Of(`${WORK}/boot/vmlinuz-virt`),
+    initrdSha256: await sha256Of(`${WORK}/appliance.cpio.gz`),
+    initSha256: await initDigest(),
+    lockSha256: await sha256Hex(await Deno.readFile(LOCK_PATH)),
+    kernelRelease: release,
+    packages: resolvedPackages,
+    machine: target.machine,
+  });
+  pass(`${WORK}/appliance.json (kernel ${release}, ABI ${APPLIANCE_ABI})`);
 
   console.log(`
   ${ARCH} appliance ready:
