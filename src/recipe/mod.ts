@@ -10,8 +10,9 @@
  *
  * Steps run on one of three executors. `image` is a plain `qemu-img` verb.
  * `bytes` is host-side generation spliced into a partition window with
- * `convert -n --target-image-opts driver=raw,offset=,size=`, plus FAT
- * synthesized by qemu's `vvfat` driver — no VM, and no `mkfs.fat` on the host.
+ * `convert -n --target-image-opts driver=raw,offset=,size=` — GPT tables and
+ * FAT filesystems alike, written byte by byte in TypeScript. No VM, and no
+ * `mkfs.fat` on the host.
  * `guest` is the build appliance, needed for ext4 and for anything that
  * executes target-architecture ELF.
  *
@@ -33,7 +34,7 @@
  *     partitions: [{
  *       label: "EFI",
  *       type: "esp",
- *       size: 528450048,
+ *       size: 33 * 1024 * 1024,
  *       contents: { kind: "fat", fatType: 16, label: "EFI", from: dir("./esp") },
  *     }],
  *   }],
@@ -160,5 +161,4 @@ export {
   type PlanOptions,
   TAR_TRANSPORT_TRAITS,
   totalSizeBytes,
-  VVFAT_USABLE_BYTES,
 } from "./plan.ts";

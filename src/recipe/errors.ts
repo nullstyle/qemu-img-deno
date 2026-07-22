@@ -63,10 +63,33 @@ export type RecipePlanErrorCode =
   | "partition-past-last-usable-lba"
   /** A FAT volume label exceeds 11 bytes. */
   | "fat-label-too-long"
-  /** A FAT partition is smaller than vvfat's fixed geometry. */
+  /**
+   * A FAT partition cannot hold its staged tree. The message names the byte
+   * count that would.
+   *
+   * BREAKING in 0.3.0: this used to mean "not exactly vvfat's fixed size".
+   */
   | "fat-window-too-small"
-  /** A FAT partition is larger than vvfat's fixed geometry. */
-  | "fat-window-too-large"
+  /**
+   * No FAT geometry of the requested `fatType` exists for this window — it is
+   * past the cluster count that defines the type, or below the smallest volume
+   * the format can describe. The message names a type that would work.
+   *
+   * BREAKING in 0.3.0: replaces `fat-window-too-large`, which meant "larger
+   * than vvfat's fixed size" and could not happen for any other reason.
+   */
+  | "fat-window-not-formattable"
+  /**
+   * A FAT staging tree holds an entry the format cannot carry faithfully: a
+   * name with a reserved character, or two paths differing only in case, which
+   * FAT resolves to one file.
+   */
+  | "fat-unrepresentable-entry"
+  /**
+   * A FAT partition's staging tree resolved without an entry list, so nothing
+   * can be sized or checked against it.
+   */
+  | "fat-tree-unresolved"
   /** An ext4 partition declares a `from` staging tree it cannot carry. */
   | "ext4-staging-tree"
   /** A `copyIn` destination is not an absolute, normalized path. */

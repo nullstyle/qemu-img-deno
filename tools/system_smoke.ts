@@ -19,7 +19,6 @@ import {
   LocalInputResolver,
   plan,
   resolveRecipe,
-  VVFAT_USABLE_BYTES,
 } from "../src/recipe/mod.ts";
 import {
   ApplianceGuestRunner,
@@ -56,6 +55,15 @@ if (!(await Deno.stat(`.appliance/${ARCH}/appliance.json`).catch(() => null))) {
 
 const work = await Deno.makeTempDir({ prefix: "qemu-img-system-smoke-" });
 const DISK_BYTES = 2 * 1024 * 1024 * 1024;
+/**
+ * A 33 MiB ESP.
+ *
+ * Through 0.2.1 this had to be `VVFAT_USABLE_BYTES[16]` — 528450048 bytes,
+ * vvfat's fixed, content-independent FAT16 geometry — to hold a bootloader and
+ * a config file. The FAT is written by this package now, so the window is
+ * whatever the recipe says it is.
+ */
+const ESP_BYTES = 33 * 1024 * 1024;
 const FS_SEED = "smoke/system/v1";
 let failed = false;
 
@@ -123,7 +131,7 @@ try {
           {
             label: "EFI",
             type: "esp",
-            size: VVFAT_USABLE_BYTES[16],
+            size: ESP_BYTES,
             contents: {
               kind: "fat",
               fatType: 16,
@@ -406,10 +414,12 @@ try {
   // the most to rebuild.
   //
   // Note what this does NOT claim: that a store transfers between machines.
-  // It cannot yet, and not because of anything here — vvfat stamps the HOST's
-  // mtimes into the FAT directory entries, so re-staging the same ESP tree
-  // moves the `table` layer's content (measured: 6 bytes) and every key above
-  // it. Within one staging, as here, the chain is stable.
+  // The FAT half of that is closed as of 0.3.0 — the `table` layer's bytes are
+  // now a pure function of the recipe and the tree's content, where vvfat used
+  // to stamp the host's mtimes into every directory entry and move the layer's
+  // content by 6 bytes on a re-stage. What remains is the guest tier: an ext4
+  // layer's container bytes follow I/O completion order inside the VM, and
+  // cross-host `-cpu host` behaviour is unmeasured.
   assert(
     artifact.layers.map((l) => l.realizationKey).join(",") ===
       rebuilt.layers.map((l) => l.realizationKey).join(","),

@@ -6,8 +6,8 @@
  * `e2fsck` that makes its output checkable, the kernel that parses the GPT it
  * formats into, and the mount that populates it are not. Everything the host
  * *can* do stays host-side by construction: GPT tables come from
- * `src/fs/gpt.ts` as bytes, and FAT filesystems come from qemu's own `vvfat`
- * driver. Only kernel filesystems leave the host.
+ * `src/fs/gpt.ts` as bytes, and FAT filesystems from `src/fs/fat.ts` the same
+ * way. Only kernel filesystems leave the host.
  *
  * That boundary is a fact about the toolchain, not about the disk, which is
  * why a `partition` step carrying an ext4 window plans as two layers: the host

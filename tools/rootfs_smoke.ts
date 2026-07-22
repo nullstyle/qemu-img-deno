@@ -29,7 +29,6 @@ import {
   plan,
   RecipePlanError,
   resolveRecipe,
-  VVFAT_USABLE_BYTES,
 } from "../src/recipe/mod.ts";
 import {
   ApplianceGuestRunner,
@@ -68,6 +67,15 @@ if (!(await Deno.stat(ROOTFS).catch(() => null))) {
 
 const work = await Deno.makeTempDir({ prefix: "qemu-img-rootfs-smoke-" });
 const DISK_BYTES = 4 * 1024 * 1024 * 1024;
+/**
+ * A 33 MiB ESP.
+ *
+ * Through 0.2.1 this had to be `VVFAT_USABLE_BYTES[16]` — 528450048 bytes,
+ * vvfat's fixed, content-independent FAT16 geometry — to hold a bootloader and
+ * a config file. The FAT is written by this package now, so the window is
+ * whatever the recipe says it is.
+ */
+const ESP_BYTES = 33 * 1024 * 1024;
 const SEED = "smoke/rootfs/v1";
 let failed = false;
 
@@ -323,7 +331,7 @@ function rootfsRecipe(archive: string, withPackages = false) {
           {
             label: "EFI",
             type: "esp",
-            size: VVFAT_USABLE_BYTES[16],
+            size: ESP_BYTES,
             contents: {
               kind: "fat",
               fatType: 16,
