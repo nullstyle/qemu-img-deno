@@ -4,6 +4,10 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+  # publish.yml calls this workflow, so a release runs the same gate a PR does
+  # instead of a weaker one of its own.
+  workflow_call:
 
 permissions:
   contents: read
@@ -15,6 +19,7 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: denoland/setup-deno@v2
@@ -34,6 +39,7 @@ jobs:
         os: [ubuntu-24.04, macos-latest]
         deno: ["v2.9.x", "v2.x"]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: denoland/setup-deno@v2
@@ -41,5 +47,106 @@ jobs:
           deno-version: ${{ matrix.deno }}
       - run: deno task test
 
-  # The real-qemu-img smoke (deno task smoke) is NOT run here: GitHub's runners
-  # have no qemu installed. It is the manual pre-release gate.
+  # `deno task test` is FakeQemuImg end to end, so argv construction for 15
+  # subcommands, every output parser and the whole host-side builder were
+  # validated only by a manual run on one developer's Mac. They need a real
+  # binary, not a hypervisor: qemu-img is a userspace tool, and both runner
+  # images can install it in seconds. Measured locally, both tasks finish in
+  # about a second once it is there.
+  smoke:
+    name: smoke (real qemu-img, ${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      # Deliberately uncached. `qemu-utils` is a seconds-long install, and
+      # `brew install qemu` is dominated by the auto-update that
+      # HOMEBREW_NO_AUTO_UPDATE suppresses -- restoring a bottle cache that
+      # size would buy back less than it costs.
+      - name: Install qemu-img (Ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-utils
+      - name: Install qemu-img (macOS)
+        if: runner.os == 'macOS'
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_INSTALL_CLEANUP: "1"
+        run: brew install qemu
+
+      # Which build actually validated this run. The two legs straddle the
+      # range README claims to support: Ubuntu 24.04 ships qemu-img 8.2,
+      # Homebrew ships 11.x, and until now neither end was ever checked by
+      # anything but hand.
+      - name: Record the binary under test
+        run: qemu-img --version
+
+      - run: deno task smoke
+      # The macOS-only oracles in these two (fsck_msdos, hdiutil, diskutil)
+      # skip themselves rather than fail: verified by running both with all
+      # three unresolvable, exit 0, every qemu-img assertion still executed.
+      # That is also why the macOS leg is not redundant -- it is the only
+      # place the independent FAT and GPT parsers ever run.
+      - run: deno task smoke:recipe
+
+  # The guest tier boots a real VM, which is cheaper than "the runners have no
+  # KVM" suggests. The appliance is a kernel plus a 12 MiB initramfs started
+  # with -kernel/-initrd and no firmware, so one boot-and-step costs 0.3s
+  # native and 7.0s fully emulated (measured on an M-series Mac: aarch64 under
+  # hvf against x86_64 under tcg). smoke:system runs three guest steps, and
+  # rebuilding the appliance from its pinned artifacts costs 2s. Minutes, not
+  # tens of minutes -- affordable even under TCG.
+  #
+  # Manual-only all the same, because two things are unproven:
+  #   - tools/system_smoke.ts spawns `hdiutil` unguarded, so on any Linux host
+  #     it FAILS where it means to skip (verified: exit 1, "Failed to spawn
+  #     'hdiutil'"). Wrapping that one call in try/catch -- not `.catch()`,
+  #     Deno.Command#output() throws synchronously -- takes the whole smoke to
+  #     green with no macOS tools present, also verified. Until that lands,
+  #     this job is red by construction.
+  #   - no GitHub runner has been observed emulating aarch64 here at all.
+  # Give it a `schedule:` trigger once it has passed once for real.
+  smoke-guest:
+    name: guest-tier smoke (manual)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+      - name: Install qemu-img, qemu-system-aarch64 and bsdtar
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            qemu-utils qemu-system-arm libarchive-tools
+
+      # Worth caching where the smoke jobs above are not: this is ~70 MiB of
+      # Alpine release artifacts plus a 215 MiB cloud image. The key is the
+      # lockfiles' contents, which are exactly the sha256 pins the fetchers
+      # verify against, so a rotated pin rotates the key. Only the DOWNLOADS
+      # are cached -- the appliance itself is rebuilt every run, because a
+      # cached build is the staleness that StaleApplianceError exists to
+      # catch, and rebuilding it costs 2s.
+      - name: Cache the pinned downloads
+        uses: actions/cache@v4
+        with:
+          path: |
+            .appliance/aarch64/alpine-virt-*.iso
+            .appliance/aarch64/alpine-minirootfs-*.tar.gz
+            .appliance/cloud/*.qcow2
+          key: pinned-${{ hashFiles('appliance.lock.json', 'cloud.lock.json') }}
+
+      - run: deno task appliance --arch=aarch64
+      - run: deno task smoke:system
+      - run: deno task smoke:cloud
