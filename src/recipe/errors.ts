@@ -49,7 +49,7 @@ export type RecipePlanErrorCode =
   | "root-partition-out-of-range"
   /** A `partition` step would lay a new GPT over an existing base image. */
   | "partition-over-image-base"
-  /** A `run` or `copyIn` step has no single unambiguous root filesystem. */
+  /** A `run`, `copyIn` or `unpack` step has no unambiguous root filesystem. */
   | "ambiguous-root-filesystem"
   /** `firstPartitionOffset` is negative, fractional, or unaligned. */
   | "invalid-first-partition-offset"
@@ -73,6 +73,14 @@ export type RecipePlanErrorCode =
   | "copyin-destination"
   /** A `copyIn` payload holds a file larger than a ustar size field. */
   | "copyin-file-too-large"
+  /** An `unpack` destination is not an absolute, normalized path. */
+  | "unpack-destination"
+  /** An `unpack` `stripComponents` is negative or fractional. */
+  | "unpack-strip-components"
+  /** The resolver reported no compression for an `unpack` archive. */
+  | "unpack-compression-unknown"
+  /** The appliance cannot decompress an `unpack` archive. */
+  | "unpack-compression-unsupported"
   /** `boot` is `"uefi-removable"` but no partition has type `"esp"`. */
   | "missing-esp"
   /** The ESP holds something other than FAT. */

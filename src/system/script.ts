@@ -72,7 +72,103 @@ export interface RunScriptArgs {
   readonly rootPartitionNumber: number;
   /** The author's script, emitted verbatim. */
   readonly script: string;
+  /**
+   * Run the script inside the target root under `chroot`.
+   *
+   * Requires {@linkcode RunScriptArgs.arch} so the loader diagnosis can name
+   * the paths that actually matter for the target.
+   */
+  readonly chroot?: boolean;
+  /**
+   * Target architecture, for the chroot loader diagnosis. Required when
+   * `chroot` is set.
+   */
+  readonly arch?: GuestScriptArch;
+  /**
+   * The step declared `network: true`, so a resolver has to reach inside the
+   * chroot. Ignored unless `chroot` is set — a non-chrooted script already
+   * sees the appliance's own `/etc/resolv.conf`.
+   */
+  readonly network?: boolean;
 }
+
+/** Architectures the generated scripts know loader paths for. */
+export type GuestScriptArch = "aarch64" | "x86_64";
+
+/** Arguments to {@linkcode unpackScript}. */
+export interface UnpackScriptArgs {
+  /** 1-based GPT partition number holding the root filesystem. */
+  readonly rootPartitionNumber: number;
+  /** Destination inside the image: absolute, normalized, `/`-separated. */
+  readonly to: string;
+  /** Which decompressor busybox `tar` must be told to use. */
+  readonly compression: TarCompression;
+  /** `--strip-components`, or 0. */
+  readonly stripComponents?: number;
+}
+
+/** The compressions {@linkcode GUEST_TAR_FLAG} maps, plus the ones it does not. */
+export type TarCompression =
+  | "none"
+  | "gzip"
+  | "bzip2"
+  | "xz"
+  | "lzma"
+  | "zstd";
+
+/**
+ * busybox `tar`'s decompression flag per compression, and the whole basis for
+ * the `unpack` compression refusal. `undefined` means refused at plan time.
+ *
+ * Every entry is **measured end to end** in the appliance, extracting a real
+ * archive delivered the way `unpack` delivers one — as a raw block device,
+ * which qemu rounds up to a 512-byte multiple and zero-fills. That transport,
+ * not the applet list, is what decides this table:
+ *
+ * | compression | `tar` exit | files extracted |
+ * | ----------- | ---------- | --------------- |
+ * | none        | 0          | correct         |
+ * | gzip        | 0          | correct         |
+ * | bzip2       | 0          | correct         |
+ * | lzma        | 0          | correct         |
+ * | xz          | **1**      | correct         |
+ * | zstd        | no applet  | —               |
+ *
+ * `xz` is the entry worth explaining. busybox's xz reader does not stop at the
+ * stream's end, so it runs into the padding and `tar -J` prints `tar:
+ * corrupted data` and exits 1 — *after* extracting every member correctly.
+ * A build would fail loudly and blame the user's archive. It is a limit of the
+ * raw-device transport rather than of xz: reading exactly `sizeBytes` with a
+ * two-stage `dd` into a pipe made the identical archive extract at exit 0
+ * (measured), so the refusal is a decision not to ship a second transport, not
+ * an impossibility. Recompressing is one command.
+ *
+ * `-a` (decompress by extension) is unusable here for the same reason the
+ * table exists: a block device has no filename to read an extension from.
+ */
+export const GUEST_TAR_FLAG: Readonly<
+  Partial<Record<TarCompression, readonly string[]>>
+> = {
+  none: [],
+  gzip: ["-z"],
+  bzip2: ["-j"],
+  lzma: ["--lzma"],
+};
+
+/**
+ * Dynamic-loader paths a chroot into the target might need, per architecture.
+ *
+ * Used **only** to explain a chroot that already failed — never as a
+ * precondition. A statically linked `/bin/sh` needs none of these, and
+ * refusing that rootfs for lacking a loader would be exactly the kind of guess
+ * this package does not make.
+ */
+export const TARGET_LOADERS: Readonly<
+  Record<GuestScriptArch, readonly string[]>
+> = {
+  aarch64: ["/lib/ld-musl-aarch64.so.1", "/lib/ld-linux-aarch64.so.1"],
+  x86_64: ["/lib/ld-musl-x86_64.so.1", "/lib64/ld-linux-x86-64.so.2"],
+};
 
 /**
  * Format each partition. Never mounts; never populates.
@@ -168,9 +264,14 @@ export function copyInScript(args: CopyInScriptArgs): string {
     `echo "qi: a symlink in that path points outside the image; name the ` +
     `resolved destination instead."; exit 73 ;;`,
     `esac`,
-    // No -m (mtimes come from the archive, which the writer pins), no -o (the
-    // writer already emits uid/gid 0), and no --numeric-owner /
-    // --strip-components / --xattrs — busybox tar has none of them.
+    // No -m (mtimes come from the archive, which the writer pins) and no -o
+    // (the writer already emits uid/gid 0). No --numeric-owner either, and
+    // that is a decision rather than a limitation: busybox 1.37.0 does
+    // implement it (measured — see unpackScript), but `buildTar` writes every
+    // member as uid/gid 0 with `uname`/`gname` "root", and this appliance
+    // resolves "root" to 0, so both paths land 0:0. `unpack` needs the flag
+    // because its archive is the caller's; this one is ours. It has no
+    // --xattrs at any version.
     //
     // The `df` on failure is diagnosis, never a guard. Running out of room is
     // the likeliest way a copyIn into an EXISTING image fails — Alpine's
@@ -192,25 +293,136 @@ export function copyInScript(args: CopyInScriptArgs): string {
 }
 
 /**
- * Mount the root partition and run the author's script with `$QI_ROOT` set.
+ * Mount the root partition and extract the data disk's archive under `to`.
  *
- * The unmount is `/init`'s epilogue, so it runs even when the author's script
- * fails. This deliberately does **not** `chroot`: a chroot into a freshly
- * built root fails with `chroot: can't execute '/bin/busybox': No such file or
- * directory`, which names the binary rather than the missing
- * `/lib/ld-musl-<arch>.so.1` that actually caused it. That message will be
- * misdiagnosed as "busybox didn't copy" every single time.
+ * The archive is the caller's own file, byte for byte, attached as the data
+ * disk. The compression flag comes from {@linkcode GUEST_TAR_FLAG} rather than
+ * from busybox's `-a`, which reads an extension off a filename the guest never
+ * sees — the payload arrives as `/dev/vdX`.
+ *
+ * **Measured**: the raw device is the file rounded up to a 512-byte multiple
+ * (3850805 → 3851264 for the Alpine minirootfs), and busybox's gzip reader
+ * stops at the stream's own end rather than choking on the padding. The whole
+ * extraction took 0.05 s. That the padding is harmless is a property of the
+ * decompressor, not of the transport — see {@linkcode GUEST_TAR_FLAG}, where it
+ * is what rules xz out.
+ */
+export function unpackScript(args: UnpackScriptArgs): string {
+  const flag = GUEST_TAR_FLAG[args.compression];
+  if (flag === undefined) {
+    throw new Error(
+      `unpackScript was asked for ${args.compression}, which the appliance ` +
+        "cannot unpack correctly over this transport (see GUEST_TAR_FLAG for " +
+        "which of the two reasons applies). plan() refuses this, so reaching " +
+        "here means a caller bypassed the planner.",
+    );
+  }
+  const node = `"\${QI_TARGET}${args.rootPartitionNumber}"`;
+  const destination = args.to === "/" ? "/mnt/root" : `/mnt/root${args.to}`;
+  const strip = args.stripComponents ?? 0;
+  return [
+    "# --- generated by src/system/script.ts: unpack ---",
+    ...MOUNT_HELPER,
+    '[ -n "${QI_DATA:-}" ] || { echo "qi: unpack with no data disk attached"; ' +
+    "exit 67; }",
+    `qi_mount_root ${node} ${args.rootPartitionNumber}`,
+    `mkdir -p ${shellQuote(destination)}`,
+    // Each flag is its own argv word. Bundling them (`-x-z`) is a silent
+    // no-op-then-error, and `--lzma` cannot be bundled at all.
+    //
+    // No -m and no -o: the archive is the caller's, and its mtimes and its
+    // uid/gid are what they asked to install. This is the opposite choice from
+    // copyIn, whose archive this package writes and pins itself.
+    //
+    // `--numeric-owner` is load-bearing for exactly that reason. Without it
+    // busybox tar resolves each member's `uname`/`gname` against the
+    // APPLIANCE's /etc/passwd and /etc/group — the target's are not consulted
+    // and could not be, since the target is a mounted directory and not the
+    // running system — so a member's numeric uid/gid is discarded whenever its
+    // names happen to resolve here. Measured in this appliance (busybox
+    // 1.37.0, extracting as uid 0) with an archive whose members carry
+    // uid/gid 123/456 under `uname=root`/`gname=root`: without the flag both
+    // the file and the directory landed `0:0`, with it `123:456`. Position in
+    // the argv does not matter — after `-C` was measured identical to before
+    // `-f`. The flag is measured HONORED and not merely accepted, because
+    // `tar --help` in this applet advertises options it does not implement.
+    // A rootfs unpacked without it builds, mounts and boots, wrongly owned.
+    [
+      "tar",
+      "-x",
+      ...flag,
+      "-f",
+      '"$QI_DATA"',
+      "-C",
+      shellQuote(destination),
+      "--numeric-owner",
+      ...(strip > 0 ? ["--strip-components", String(strip)] : []),
+    ].join(" "),
+    "",
+  ].join("\n");
+}
+
+/**
+ * Mount the root partition and run the author's script — beside the target, or
+ * inside it.
+ *
+ * Without `chroot` the target is mounted at `$QI_ROOT` and the script runs on
+ * the appliance's busybox. With it, `/proc`, `/sys` and a bind of `/dev` go
+ * under the root and the script runs as `chroot "$QI_ROOT" /bin/sh -eu -c`.
+ *
+ * The unmount is `/init`'s epilogue, so it runs even when the script fails.
+ *
+ * The chroot's interesting part is the failure path. A chroot into a root
+ * without its dynamic loader fails with `chroot: can't execute '/bin/sh': No
+ * such file or directory` — `execve()` reports `ENOENT` for the missing
+ * *interpreter*, so the message names the binary that is right there. Measured
+ * 3/3 by hiding `/lib/ld-musl-aarch64.so.1` in an otherwise complete Alpine
+ * minirootfs: rc 127, and the same message for `/bin/busybox`, `/bin/sh` and
+ * `/sbin/apk` alike. The generated script therefore probes with `sh -c :`
+ * first and, only on failure, says which of the two causes it actually was.
  */
 export function runScript(args: RunScriptArgs): string {
   const node = `"\${QI_TARGET}${args.rootPartitionNumber}"`;
+  if (args.chroot !== true) {
+    return [
+      "# --- generated by src/system/script.ts: run ---",
+      ...MOUNT_HELPER,
+      `qi_mount_root ${node} ${args.rootPartitionNumber}`,
+      "QI_ROOT=/mnt/root",
+      "export QI_ROOT",
+      'cd "$QI_ROOT"',
+      args.script.replace(/\n+$/, ""),
+      "",
+    ].join("\n");
+  }
+  if (args.arch === undefined) {
+    throw new Error(
+      "runScript({ chroot: true }) needs `arch`. The diagnosis for a failed " +
+        "chroot names the loader the target was missing, and there is exactly " +
+        "one message worth printing per architecture — a generic one would " +
+        "reproduce the misdiagnosis this guard exists to prevent.",
+    );
+  }
+  const network = args.network === true;
   return [
-    "# --- generated by src/system/script.ts: run ---",
+    "# --- generated by src/system/script.ts: run (chroot) ---",
     ...MOUNT_HELPER,
+    ...chrootHelper(args.arch),
+    ...(network ? RESOLV_HELPER : []),
     `qi_mount_root ${node} ${args.rootPartitionNumber}`,
     "QI_ROOT=/mnt/root",
     "export QI_ROOT",
-    'cd "$QI_ROOT"',
-    args.script.replace(/\n+$/, ""),
+    'qi_chroot_enter "$QI_ROOT"',
+    ...(network ? ['qi_resolv_install "$QI_ROOT"'] : []),
+    "QI_RC=0",
+    // `|| QI_RC=$?` rather than `; QI_RC=$?`: /init imposes `set -e`, under
+    // which the second spelling never reaches the assignment.
+    `chroot "$QI_ROOT" /bin/sh -eu -c ${
+      shellQuote(args.script.replace(/\n+$/, ""))
+    } || QI_RC=$?`,
+    ...(network ? ['qi_resolv_restore "$QI_ROOT"'] : []),
+    'qi_chroot_leave "$QI_ROOT"',
+    '[ "$QI_RC" = 0 ] || exit "$QI_RC"',
     "",
   ].join("\n");
 }
@@ -320,6 +532,132 @@ const MOUNT_HELPER: readonly string[] = [
   "  mountpoint -q /mnt/root && return 0",
   '  grep -qx "$1" /qi/fsck-devs || echo "$1" >> /qi/fsck-devs',
   '  mount -t ext4 "$1" /mnt/root',
+  "}",
+];
+
+/**
+ * Enter, diagnose and leave a chroot into the mounted target.
+ *
+ * The three mounts are not interchangeable in importance. `/dev` is
+ * **measured** load-bearing: `apk add nginx` inside a chroot without it exits
+ * `0`, prints `OK: 9 MiB in 17 packages`, and leaves a 0-byte **regular file**
+ * at `/dev/null` (mode 0644) that a post-install script's `> /dev/null`
+ * created — after which every redirect in the shipped image appends to a file
+ * instead of discarding. `/proc` and `/sys` are mounted because maintainer
+ * scripts read them; no package in the measured set *failed* without them,
+ * so that half is prudence, not measurement.
+ *
+ * All three are unmounted before the step returns. `/init`'s epilogue would
+ * catch them anyway (it unmounts every `/mnt` path in reverse order), but a
+ * mount that outlives its step should be this step's failure, not a number in
+ * the next one's status frame.
+ */
+function chrootHelper(arch: GuestScriptArch): readonly string[] {
+  const loaders = TARGET_LOADERS[arch];
+  return [
+    "qi_chroot_enter() {",
+    '  mkdir -p "$1/proc" "$1/sys" "$1/dev"',
+    '  mountpoint -q "$1/proc" || mount -t proc none "$1/proc"',
+    '  mountpoint -q "$1/sys" || mount -t sysfs none "$1/sys"',
+    '  mountpoint -q "$1/dev" || mount -o bind /dev "$1/dev"',
+    // The probe, not a precondition: a statically linked /bin/sh passes it
+    // with no loader present at all.
+    '  chroot "$1" /bin/sh -c : 2>/dev/null && return 0',
+    '  qi_chroot_diagnose "$1"',
+    "}",
+    "qi_chroot_diagnose() {",
+    '  [ -e "$1/bin/sh" ] || {',
+    '    echo "qi: chroot: the target has no /bin/sh (a dangling symlink ' +
+    "counts). An unpack or copyIn step has to put a rootfs in the image " +
+    'before a chroot step can run inside it."',
+    "    exit 70; }",
+    "  _found=",
+    ...loaders.map((loader) =>
+      `  [ -e "$1${loader}" ] && _found="$_found ${loader}"`
+    ),
+    '  [ -n "$_found" ] && {',
+    '    echo "qi: chroot into the target failed even though /bin/sh and a ' +
+    "loader ($_found) are present. Neither of the two usual causes applies; " +
+    "the target's /bin/sh is there and so is its interpreter.\"",
+    "    exit 72; }",
+    '  echo "qi: chroot into the target failed: /bin/sh exists but the ' +
+    `dynamic loader it needs does not. None of${
+      loaders.map((l) => ` ${l}`).join("")
+    } ` +
+    "is in the target. chroot's own message names the BINARY (\\\"can't " +
+    "execute '/bin/sh': No such file or directory\\\") because execve() " +
+    "reports ENOENT for a missing INTERPRETER, not for the file it was " +
+    "handed — which is why that message is misread as a missing shell every " +
+    'time. Unpack a complete rootfs, or copy the loader in."',
+    "  exit 71",
+    "}",
+    "qi_chroot_leave() {",
+    // Failures are swallowed here and left to the epilogue, which retries
+    // every /mnt mount and reports the result as umountRc in the status frame.
+    // Swallowing them locally would hide nothing: it just moves the signal.
+    '  umount "$1/dev" 2>/dev/null || true',
+    '  umount "$1/sys" 2>/dev/null || true',
+    '  umount "$1/proc" 2>/dev/null || true',
+    "}",
+  ];
+}
+
+/**
+ * Lend the appliance's resolver to the chroot for the length of one step.
+ *
+ * `/init` writes `/etc/resolv.conf` in the *initramfs* when `qi.dns=` is
+ * passed; a chrooted `apk` reads the *target's*. Copying it in is the only way
+ * the two meet — and removing it again is the only way the build host's
+ * resolver does not ship inside the image. Alpine's minirootfs has no
+ * `/etc/resolv.conf` at all (measured), so for that case the restore is a
+ * delete.
+ *
+ * The existence test is `-e` **or** `-L`, and the copies are `cp -P`. Three
+ * measurements in this appliance force that shape, all against
+ * `/etc/resolv.conf -> ../run/systemd/resolve/stub-resolv.conf` — a DANGLING
+ * symlink, which is what every Debian and Ubuntu cloud image ships, since the
+ * target does not exist until `systemd-resolved` runs:
+ *
+ * - `[ -e ]` is **false** for it and `[ -L ]` true. With `-e` alone the save
+ *   never happens, and the restore then deletes the image's own symlink — a
+ *   networked step in one of those images ships an artifact whose resolver
+ *   configuration this build removed.
+ * - plain `cp` of it fails, `cp: can't stat …: No such file or directory`,
+ *   rc 1 — which `/init`'s `set -e` turns into a dead step. So widening the
+ *   test without `-P` trades a silent wrong artifact for a broken build.
+ * - `cp -P` copies the LINK, rc 0, target preserved.
+ *
+ * Also measured: busybox `cp` REPLACES a symlink destination rather than
+ * writing through it, so installing over the image's link cannot leak the
+ * host's resolver to wherever that link pointed.
+ */
+const RESOLV_HELPER: readonly string[] = [
+  "QI_RESOLV_SAVED=0",
+  // Whether install actually WROTE. Restore undoes only what install did:
+  // install returns early when the APPLIANCE has no resolver of its own, and
+  // an unconditional delete in restore would then remove the image's own
+  // /etc/resolv.conf — one install never touched. That ships an image which
+  // builds, boots, and silently cannot resolve anything.
+  "QI_RESOLV_WROTE=0",
+  "qi_resolv_install() {",
+  "  [ -f /etc/resolv.conf ] || return 0",
+  '  mkdir -p "$1/etc"',
+  '  if [ -e "$1/etc/resolv.conf" ] || [ -L "$1/etc/resolv.conf" ]; then',
+  '    cp -P "$1/etc/resolv.conf" /qi/resolv.saved; QI_RESOLV_SAVED=1',
+  "  fi",
+  '  cp /etc/resolv.conf "$1/etc/resolv.conf"',
+  "  QI_RESOLV_WROTE=1",
+  "}",
+  "qi_resolv_restore() {",
+  '  [ "$QI_RESOLV_WROTE" = 1 ] || return 0',
+  // Before the restore, and reached only when install wrote: what install
+  // left behind is the BUILD HOST's resolver, and it must not ship inside the
+  // image whether or not there was something to put back. `rm -f` then
+  // `cp -P` is the measured pair — restore was measured putting a dangling
+  '  rm -f "$1/etc/resolv.conf"',
+  '  if [ "$QI_RESOLV_SAVED" = 1 ]; then',
+  '    cp -P /qi/resolv.saved "$1/etc/resolv.conf"',
+  "  fi",
   "}",
 ];
 
