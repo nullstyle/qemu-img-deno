@@ -305,6 +305,58 @@ Deno.test("copyInScript and runScript mount by identity and by type", () => {
   assert(!run.includes("chroot"));
 });
 
+Deno.test("the root mount is preflighted before the filesystem is touched", () => {
+  const copy = copyInScript({ rootPartitionNumber: 2, to: "/opt/app" });
+  const run = runScript({ rootPartitionNumber: 2, script: "apk info\n" });
+  for (const script of [copy, run]) {
+    // Both checks exist for `base.kind: "image"`, where the table came with
+    // the image and there is no planned geometry to compare it against.
+    assertStringIncludes(script, "exit 68"); // node never appeared
+    assertStringIncludes(script, "exit 69"); // no filesystem at all
+    assertStringIncludes(script, "exit 70"); // some other filesystem
+    // The declared number reaches the message, so a wrong `rootPartition`
+    // reads as a recipe mistake rather than as a mount(2) errno.
+    assertStringIncludes(script, 'qi_mount_root "${QI_TARGET}2" 2');
+    assertStringIncludes(script, "base.rootPartition");
+
+    // busybox blkid takes `[BLOCKDEV]...` and NOTHING else: it accepts
+    // `-s TYPE -o value` silently and prints the whole line anyway, so the
+    // util-linux spelling would compare a full `dev: LABEL=… TYPE="ext4"`
+    // line against `ext4` and reject a perfectly good root.
+    assert(!script.includes("-s TYPE"), "no util-linux blkid flags");
+    assert(!script.includes("-o value"), "no util-linux blkid flags");
+    assertStringIncludes(script, 'blkid "$1"');
+
+    // Ordering is the whole point of the check: registering the device for
+    // /init's `e2fsck -fn` epilogue before knowing it is ext also ran the
+    // checker over a FAT partition, burying the real cause under twelve lines
+    // of superblock recovery advice.
+    const typeCheck = script.indexOf('case "$_t" in');
+    const register = script.indexOf("/qi/fsck-devs");
+    const mount = script.indexOf('mount -t ext4 "$1"');
+    assert(typeCheck >= 0 && register >= 0 && mount >= 0);
+    assert(typeCheck < register, "blkid runs before fsck-devs is appended");
+    assert(register < mount, "and both run before the mount");
+  }
+  // ext2 and ext3 are accepted because the ext4 driver mounts them — measured
+  // in the appliance, both at rc 0, both showing as `ext4` in /proc/mounts.
+  assertStringIncludes(copy, "ext2|ext3|ext4)");
+});
+
+Deno.test("a failed copyIn extraction reports the filesystem's fullness", () => {
+  const copy = copyInScript({ rootPartitionNumber: 2, to: "/opt/app" });
+  // busybox tar says only `tar: write error: No space left on device`, which
+  // names neither the filesystem nor how full it was. Alpine's aarch64 cloud
+  // image ships its root 89% full, so this is the likeliest copyIn failure
+  // against an existing base.
+  assertStringIncludes(copy, "df -k /mnt/root");
+  assertStringIncludes(copy, "exit 71");
+  // Diagnosis, never a guard: the archive's byte count is not the space it
+  // occupies once ext4 rounds each file up to a block, so a size precheck
+  // would refuse builds that fit.
+  assert(!copy.includes("QI_TAR_BYTES"), "no size precheck");
+});
+
 Deno.test("APPLIANCE_INIT carries the three wire tripwires", async () => {
   // A newer host meeting an older /init is exactly the skew that otherwise
   // builds a wrong image, so an unknown qi.* argument must be fatal.

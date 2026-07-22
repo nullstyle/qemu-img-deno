@@ -50,6 +50,7 @@
  */
 
 export {
+  BaseImageSizeMismatchError,
   type CapabilityTrait,
   GuestExecutorUnavailableError,
   RecipePlanError,

@@ -3,9 +3,11 @@ import {
   assertEquals,
   assertRejects,
   assertStrictEquals,
+  assertStringIncludes,
   assertThrows,
 } from "@std/assert";
 import {
+  BaseImageSizeMismatchError,
   canonicalJson,
   defineRecipe,
   dir,
@@ -928,4 +930,98 @@ Deno.test("a guest failure names every signal that fired, not just the first", (
       `all four signals are reported, missing "${signal}":\n${error.message}`,
     );
   }
+});
+
+Deno.test("declaring a bigger base image reads as a grow, and says so", () => {
+  // A recipe has no other way to ask for a grow, so this direction is the
+  // request rather than a typo — and the message has to name what actually
+  // stops it, which is the GPT and not qemu.
+  const error = new BaseImageSizeMismatchError(
+    "./alpine.qcow2",
+    2 * 1024 ** 3,
+    257_949_696,
+  );
+  assertStringIncludes(error.message, "asks to GROW");
+  // `resize()` alone leaves the primary header naming the old final sector,
+  // so the space it adds is outside every partitioner's usable range.
+  assertStringIncludes(error.message, "repairGpt");
+  assertStringIncludes(error.message, "LastUsableLBA");
+  assertEquals(error.name, "BaseImageSizeMismatchError");
+  assertEquals(error.declaredBytes, 2 * 1024 ** 3);
+  assertEquals(error.actualBytes, 257_949_696);
+});
+
+Deno.test("declaring a smaller base image is a plain misreading", () => {
+  const error = new BaseImageSizeMismatchError(
+    "./alpine.qcow2",
+    134_217_728,
+    257_949_696,
+  );
+  // The other direction must NOT talk about growing, or the fix it names is
+  // the wrong one.
+  assert(!error.message.includes("GROW"));
+  assertStringIncludes(error.message, "qemu-img info");
+  // An image base is copied in whole and a partition step over one is
+  // refused, so this number lays nothing out; it is purely the assertion.
+  assertStringIncludes(error.message, "does not resize anything");
+});
+
+Deno.test("an image base carries no layout of its own", async () => {
+  const recipe = defineRecipe({
+    name: "cloud",
+    platform: { arch: "aarch64", machine: "virt-11.0" },
+    base: {
+      kind: "image",
+      from: file("./alpine.qcow2"),
+      format: "qcow2",
+      virtualSizeBytes: 257_949_696,
+      rootPartition: 2,
+    },
+    boot: { kind: "none" },
+    determinism: { sourceDateEpoch: 1, guidSeed: "g", fsSeed: "f" },
+    steps: [{ kind: "copyIn", id: "app", from: dir("./app"), to: "/opt/app" }],
+  });
+  const resolved = await resolveRecipe(recipe, {
+    resolver: new StubResolver({ "./app": [] }),
+  });
+  const planned = await plan(resolved, { appliance: { digest: "appliance" } });
+  assertEquals(planned.layout, undefined);
+  assertEquals(planned.steps.map((s) => s.id), ["base", "app"]);
+  assert(planned.requiresAppliance);
+});
+
+Deno.test("a partition step over an image base is refused", async () => {
+  const recipe = defineRecipe({
+    name: "cloud",
+    platform: { arch: "aarch64", machine: "virt-11.0" },
+    base: {
+      kind: "image",
+      from: file("./alpine.qcow2"),
+      format: "qcow2",
+      virtualSizeBytes: 257_949_696,
+      rootPartition: 2,
+    },
+    boot: { kind: "none" },
+    determinism: { sourceDateEpoch: 1, guidSeed: "g", fsSeed: "f" },
+    steps: [{
+      kind: "partition",
+      id: "table",
+      partitions: [{
+        label: "root",
+        type: "linux-root",
+        size: "rest",
+        contents: { kind: "ext4", label: "root" },
+      }],
+    }],
+  });
+  const resolved = await resolveRecipe(recipe, {
+    resolver: new StubResolver(),
+  });
+  const error = await assertRejects(
+    () => plan(resolved, { appliance: { digest: "appliance" } }),
+    RecipePlanError,
+  );
+  // Laying a new GPT over the image's own would discard every partition in
+  // it — including the one `rootPartition` names.
+  assertStringIncludes(error.message, "discarding every partition");
 });

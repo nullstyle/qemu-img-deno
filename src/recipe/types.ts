@@ -217,9 +217,17 @@ export type BaseSpec =
      *
      * Declared rather than measured, because `plan()` runs no binary — and the
      * only size the resolver can see is the FILE's, which for a sparse or
-     * compressed qcow2 is nowhere near the disk's. `build()` checks this
-     * against `qemu-img info` and refuses a mismatch, so a wrong number costs
-     * a clear error rather than a table laid out for the wrong disk.
+     * compressed qcow2 is nowhere near the disk's. Alpine's aarch64 cloud
+     * image measures 225378304 bytes on disk and 257949696 virtual: a 12.6%
+     * shortfall, close enough to look right.
+     *
+     * An image base is copied in whole and a `partition` step over one is
+     * refused, so this number lays out nothing. Its whole job is the assertion
+     * `build()` makes against `qemu-img info` — that the file on disk is still
+     * the one the recipe was written against. Declaring MORE than the image
+     * holds is how a grow is spelled, and is refused with
+     * {@linkcode BaseImageSizeMismatchError}; see that error for why `resize()`
+     * alone does not grow a partitioned image.
      */
     readonly virtualSizeBytes: number;
     /**
@@ -228,7 +236,13 @@ export type BaseSpec =
      *
      * There is no declared layout to infer it from — the table came with the
      * image — and guessing produces something that mounts, populates, and is
-     * the wrong partition.
+     * the wrong partition. Read it off the image: on Alpine's aarch64 cloud
+     * image it is `2`, with `1` being a 512 KiB FAT ESP.
+     *
+     * The guest checks it before mounting rather than trusting it, since a
+     * plan has no geometry of its own to compare an existing table against: a
+     * number with no partition and a number naming a non-ext filesystem are
+     * both refused by `blkid`, each naming this field.
      */
     readonly rootPartition: number;
   };
