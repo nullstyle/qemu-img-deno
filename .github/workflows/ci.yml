@@ -41,5 +41,5 @@ jobs:
           deno-version: ${{ matrix.deno }}
       - run: deno task test
 
-  # The real-limactl smoke (deno task smoke) is NOT run here: GitHub's macOS
-  # runners cannot host vz VMs. It is the manual pre-release gate.
+  # The real-qemu-img smoke (deno task smoke) is NOT run here: GitHub's runners
+  # have no qemu installed. It is the manual pre-release gate.
