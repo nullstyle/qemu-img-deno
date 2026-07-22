@@ -135,3 +135,46 @@ Deno.test("a pre-aborted signal rejects before spawning", async () => {
     CommandAbortedError,
   );
 });
+
+Deno.test("stdin larger than the pipe buffer does not deadlock", async () => {
+  // The pipe buffer is ~64 KiB. Writing stdin to completion BEFORE draining
+  // stdout deadlocks here: `cat` fills its stdout buffer, blocks writing, so
+  // it stops reading stdin, so the parent blocks writing stdin — and no
+  // timeout can rescue it, because the deadline races `child.status`, which
+  // in that state never settles. 256 KiB is comfortably past the buffer.
+  const runner = new DenoCommandRunner();
+  // Past the ~64 KiB pipe buffer, but under the runner's capture cap so the
+  // assertion below is about the deadlock and not about truncation.
+  const payload = "x".repeat(256 * 1024);
+  const started = Date.now();
+  const result = await runner.run("cat", [], {
+    stdin: payload,
+    timeoutMs: 20_000,
+    uncapped: true,
+  });
+  assertEquals(result.code, 0);
+  assertEquals(result.stdout.length, payload.length, "all of stdin came back");
+  assert(
+    Date.now() - started < 15_000,
+    "completed promptly rather than riding the deadline",
+  );
+});
+
+Deno.test("a lingering grandchild cannot hang the call past its deadline", async () => {
+  // The child exits at once, but the backgrounded `sleep` inherits its stdout
+  // and holds the pipe open. Collection used to be unbounded, so `run()` hung
+  // on a process that had already been reaped — while `timeoutMs` is
+  // documented as a deadline for the whole call.
+  const runner = new DenoCommandRunner();
+  const started = Date.now();
+  await assertRejects(
+    () =>
+      runner.run("sh", ["-c", "sleep 30 & echo done"], { timeoutMs: 1_500 }),
+    CommandAbortedError,
+  );
+  const elapsed = Date.now() - started;
+  assert(
+    elapsed < 10_000,
+    `honored the deadline rather than waiting for the grandchild (${elapsed}ms)`,
+  );
+});

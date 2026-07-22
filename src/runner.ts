@@ -213,23 +213,31 @@ export class DenoCommandRunner implements CommandRunner {
       stderr: stderrMode,
     });
     const child = command.spawn();
-    if (options.stdin !== undefined) {
-      const writer = child.stdin.getWriter();
-      try {
-        await writer.write(new TextEncoder().encode(options.stdin));
-        await writer.close();
-      } catch {
-        // The child exited (or was aborted) mid-write — e.g. a broken pipe.
-        // Never rethrow here: the exit status below is authoritative, and
-        // bailing out would leak a live child.
-      }
-    }
+    // The drains start FIRST, and the stdin write runs concurrently with them.
+    // Writing stdin to completion before draining deadlocks any command whose
+    // input exceeds the pipe buffer (~64 KiB on macOS): the child fills its
+    // stdout buffer, blocks writing, therefore stops reading stdin, and we
+    // block writing stdin forever. `timeoutMs` could not save it either — the
+    // deadline races `child.status`, which in that state never settles.
     const outSink = stdoutMode === "piped"
       ? drain(child.stdout, limit)
       : undefined;
     const errSink = stderrMode === "piped"
       ? drain(child.stderr, limit)
       : undefined;
+    const stdinWritten: Promise<void> = options.stdin === undefined
+      ? Promise.resolve()
+      : (async () => {
+        const writer = child.stdin.getWriter();
+        try {
+          await writer.write(new TextEncoder().encode(options.stdin));
+          await writer.close();
+        } catch {
+          // The child exited (or was aborted) mid-write — e.g. a broken pipe.
+          // Never rethrow here: the exit status below is authoritative, and
+          // bailing out would leak a live child.
+        }
+      })();
 
     const status = signal === undefined
       ? await child.status
@@ -253,8 +261,35 @@ export class DenoCommandRunner implements CommandRunner {
       );
     }
 
-    const stdout = await (outSink?.collected() ?? Promise.resolve(""));
-    const stderr = await (errSink?.collected() ?? Promise.resolve(""));
+    // Collection is bounded by the same deadline. A grandchild holding the
+    // write end keeps the pipe readable after the child itself is reaped, so
+    // an unbounded await here hangs a call whose process has already exited —
+    // and `timeoutMs` is documented as a deadline for the whole call, not for
+    // the spawn alone. `sh -c 'sleep 5 & echo done'` is the shape.
+    const collecting = Promise.all([
+      outSink?.collected() ?? Promise.resolve(""),
+      errSink?.collected() ?? Promise.resolve(""),
+    ]);
+    const collected = signal === undefined
+      ? await collecting
+      : await Promise.race([collecting, abortSignalled(signal)]);
+    if (collected === ABORTED) {
+      const [captured, capturedErr] = await Promise.all([
+        outSink?.cancel() ?? Promise.resolve(""),
+        errSink?.cancel() ?? Promise.resolve(""),
+      ]);
+      throw new CommandAbortedError(
+        bin,
+        args,
+        signal?.reason,
+        captured,
+        capturedErr,
+      );
+    }
+    // Awaited so a rejection cannot surface as an unhandled rejection after
+    // the call returns; the write itself already swallows its own errors.
+    await stdinWritten;
+    const [stdout, stderr] = collected;
     return { success: status.success, code: status.code, stdout, stderr };
   }
 
