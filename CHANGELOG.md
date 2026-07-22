@@ -107,6 +107,55 @@ oracles agree on the type for all four.
 
 ### Added
 
+- **`./block`** — reading a GPT back off a disk, saying what a `resize` broke,
+  and repairing it in place. `src/fs/gpt.ts` only ever wrote a table; this is
+  the other direction.
+
+  `parseGpt` validates both headers and both entry-array CRCs and reports damage
+  as data rather than throwing; `diagnoseGpt` turns that into typed
+  `GptProblem`s, each naming its own fix; `repairGpt`/`repairGptImage` rewrite
+  the backup header, the entry arrays and both headers' CRCs. Everything is pure
+  byte arithmetic over a `DiskView`, so the image-level entry points read and
+  write only two ~256 KiB windows at either end — a 40 GiB qcow2 is repaired
+  without materializing any of it, through the same `driver=raw,offset=,size=`
+  mechanism `./recipe` uses to splice a table in.
+
+  The refusals are the point:
+
+  - A partition extending past the new last usable LBA after a shrink is
+    **refused**, and the error names the exact byte size to grow back to — a
+    number the unit tests and the smoke both take literally and repair from.
+    `acknowledgeDataLoss` drops the entry whole; it never shortens one, because
+    a clamped entry leaves a filesystem whose superblock still claims blocks the
+    disk no longer has.
+  - Two intact headers that **disagree** are refused with no way to opt back in.
+    Nothing on the disk says which one is right.
+  - `NumberOfPartitionEntries × SizeOfPartitionEntry` is bounded at 4 MiB before
+    anything is allocated for it, and only after the header's own CRC verifies.
+
+  Also `resizeAndRepairGpt()`, the paired operation. A guard inside `resize()`
+  itself was considered and **not** added: `resize()` never opens the image, and
+  "is this GPT-bearing" needs a read of LBA 0–1, so a guard would put I/O in the
+  path of every resize — including the majority of images that carry no
+  partition table. That trade is now a README row rather than a silent choice.
+
+- README: the `resize(…, { shrink: true })` row no longer prescribes
+  `sgdisk -e`. There is no sgdisk, gdisk or parted on this package's own target
+  host, so the documented fix was unactionable — worse than no fix, because it
+  read as solved. It now names `repairGptImage()`. A `resize()`-that-grows row
+  was added alongside it, plus a partition-table sharp-edges table.
+
+- Measured, in `deno task smoke:block`, against oracles with no shared code:
+  after a grow, `diskutil list` parses the damaged disk and names every
+  partition **without any complaint**, and `gpt -r show` exits `0`, prints no
+  warning, and simply omits its `Sec GPT table` / `Sec GPT header` rows — that
+  omission is the only visible tell. After the repair both rows are back, with
+  the header in the disk's actual last sector. `diskutil verifyDisk` is not a
+  usable oracle at these sizes; it refuses with
+  `The target disk is too small for this operation (-69771)` either way.
+  Separately measured and now relied on: `convert -n` into a `raw` window from
+  an all-zero source **writes** the zeros rather than eliding them.
+
 - `BlockNodeSpec` / `ImageRef` / `renderBlockNode` — block-driver option graphs,
   accepted by `convert`, `info`, `infoChain`, `map`, `measure` and `compare` in
   place of a path, and rendered to qemu's `key=value,child.key=value` form with
