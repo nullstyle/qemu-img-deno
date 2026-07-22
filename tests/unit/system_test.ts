@@ -10,23 +10,38 @@ import {
 import {
   APPLIANCE_ABI,
   APPLIANCE_INIT,
+  ApplianceGuestRunner,
+  type ApplianceIdentity,
   type ApplianceIdentityRecord,
   copyInScript,
   DISK_SERIALS,
   diskArgs,
   framePayload,
+  fsckVerdict,
+  GuestBootError,
+  GuestStatusError,
+  GuestStepFailedError,
+  GuestTimeoutError,
   initDigest,
+  InvalidGuestDnsError,
   mkfsScript,
   parseStatus,
+  PayloadFrameError,
   readApplianceIdentity,
   runScript,
   SECTOR,
   SERIAL_MAX_BYTES,
   StaleApplianceError,
   stepNonce,
+  type StepOutcome,
   writeApplianceIdentity,
 } from "../../src/system/mod.ts";
-import type { CommandResult, CommandRunner } from "../../src/runner.ts";
+import {
+  CommandAbortedError,
+  type CommandResult,
+  type CommandRunner,
+  type RunOptions,
+} from "../../src/runner.ts";
 import { sha256Hex } from "../../src/digest.ts";
 
 const NONCE = "0123456789abcdef0123456789abcdef";
@@ -84,10 +99,39 @@ Deno.test("framePayload refuses a nonce that cannot survive the wire", () => {
   // it to a kernel cmdline token. Neither survives a space.
   assertThrows(
     () => framePayload("x", { nonce: "has space" }),
-    Error,
+    PayloadFrameError,
     "whitespace",
   );
-  assertThrows(() => framePayload("x", { nonce: "" }), Error, "empty");
+  assertThrows(
+    () => framePayload("x", { nonce: "" }),
+    PayloadFrameError,
+    "empty",
+  );
+  // A glob metacharacter is refused for a second reason: /init parses the
+  // cmdline with `for arg in $(cat /proc/cmdline)`, an unquoted expansion, so
+  // the token is matched against the guest's root before it is ever compared.
+  for (const nonce of ["ab*", "a?b", "a[bc]"]) {
+    const error = assertThrows(
+      () => framePayload("x", { nonce }),
+      PayloadFrameError,
+    );
+    assertEquals(error.fault, "nonce");
+  }
+});
+
+Deno.test("payload framing faults are typed, not just worded", () => {
+  // `instanceof` is the only honest way to tell a framing refusal — raised
+  // before anything boots — from a guest that ran and failed.
+  const tooBig = assertThrows(
+    () => framePayload("x".repeat(600), { nonce: NONCE, sizeBytes: SECTOR }),
+    PayloadFrameError,
+  );
+  assertEquals(tooBig.fault, "script");
+  const wideNonce = assertThrows(
+    () => framePayload("x", { nonce: "n".repeat(SECTOR) }),
+    PayloadFrameError,
+  );
+  assertEquals(wideNonce.fault, "header");
 });
 
 Deno.test("parseStatus names the rebuild for a QIMG1 record", () => {
@@ -166,6 +210,98 @@ Deno.test("parseStatus keeps an unchecked filesystem distinct from a clean one",
   );
   assertEquals(outcome.fsckRc, undefined);
   assertEquals(outcome.outputDigest, "");
+});
+
+/** A clean, fully-populated outcome to vary one field at a time. */
+const CLEAN: StepOutcome = {
+  code: 0,
+  stage: "step",
+  outputDigest: "ab12",
+  umountRc: 0,
+  fsckRc: 0,
+  dmesgErrors: 0,
+  detail: "ok",
+};
+
+Deno.test("fsckVerdict gives the unchecked case its own answer", () => {
+  // The parse has always been right — `fsckRc` is `undefined` for `fsck=-`.
+  // It is the CONSUMPTION that failed open: `(outcome.fsckRc ?? 0) !== 0`
+  // reads "nobody looked" as "looked and it was clean", so a guest that
+  // registered no device publishes as verified. Routing the decision through
+  // a three-valued verdict is what makes that unspellable by accident.
+  assertEquals(fsckVerdict(CLEAN), "clean");
+  assertEquals(fsckVerdict({ ...CLEAN, fsckRc: 4 }), "failed");
+  const { fsckRc: _dropped, ...unchecked } = CLEAN;
+  assertEquals(fsckVerdict(unchecked), "unchecked");
+  // Measured, not hypothetical: a trivial `run` step that never mounts the
+  // target comes back `fsck=-` from the real appliance.
+  assertEquals(
+    fsckVerdict(
+      parseStatus(
+        statusRecord(["QIMG2", NONCE, "0", "step", "-", "0", "-", "0", "ok"]),
+        { nonce: NONCE },
+      ),
+    ),
+    "unchecked",
+  );
+});
+
+Deno.test("GuestStepFailedError names an unchecked filesystem as its own fault", () => {
+  const { fsckRc: _dropped, ...unchecked } = CLEAN;
+  const error = new GuestStepFailedError("app", unchecked, "console text");
+  // Never "e2fsck -fn returned 0" — that claims a check that never ran.
+  assert(!error.message.includes("e2fsck -fn returned"));
+  assertStringIncludes(error.message, "no filesystem was ever checked");
+  assertStringIncludes(error.message, "console text");
+  // And a real failure still reads exactly as it did before.
+  const failed = new GuestStepFailedError("app", { ...CLEAN, fsckRc: 4 }, "");
+  assertStringIncludes(failed.message, "e2fsck -fn returned 4");
+  assert(!failed.message.includes("no filesystem was ever checked"));
+});
+
+Deno.test("every parseStatus refusal is typed and carries the console", () => {
+  // The console is the ONLY diagnostic when the record says nothing — and one
+  // of these faults cannot produce a record at all, since an /init that
+  // resolves its status role to zero disks has nowhere to write one.
+  const consoleText = "appliance: status role 'qimg-status' resolved to zero";
+  const cases: readonly [string, readonly string[]][] = [
+    ["legacy", ["QIMG1", "0", "abc"]],
+    ["absent", ["nothing here"]],
+    ["nonce", ["QIMG2", "deadbeef", "0", "step", "-", "0", "-", "0", "ok"]],
+    ["code", ["QIMG2", NONCE, "oops", "step", "-", "0", "-", "0", "ok"]],
+    ["stage", ["QIMG2", NONCE, "0", "nowhere", "-", "0", "-", "0", "ok"]],
+    ["field", ["QIMG2", NONCE, "0", "step", "-", "x", "-", "0", "ok"]],
+  ];
+  for (const [fault, lines] of cases) {
+    const error = assertThrows(
+      () =>
+        parseStatus(statusRecord(lines), {
+          nonce: NONCE,
+          console: consoleText,
+          consolePath: "/kept/console.log",
+        }),
+      GuestStatusError,
+    );
+    assertEquals(error.fault, fault);
+    // Attached, not discarded: this is the whole point.
+    assertEquals(error.console, consoleText);
+    assertStringIncludes(error.message, consoleText);
+    assertStringIncludes(error.message, "/kept/console.log");
+    // `reason` is the message WITHOUT the console, so a caller that only
+    // obtains the console after catching can rebuild rather than wrap.
+    assert(!error.reason.includes(consoleText));
+  }
+  const field = assertThrows(
+    () =>
+      parseStatus(
+        statusRecord(["QIMG2", NONCE, "0", "step", "-", "0", "-", "z", "ok"]),
+        { nonce: NONCE },
+      ),
+    GuestStatusError,
+  );
+  assertEquals(field.field, "dmesgErrors");
+  // Absent console must not leave a dangling header.
+  assert(!field.message.includes("console below"));
 });
 
 Deno.test("stepNonce is deterministic and per (key, step)", async () => {
@@ -373,6 +509,393 @@ Deno.test("APPLIANCE_INIT carries the three wire tripwires", async () => {
   // failed `set -o badopt` exits the shell and `|| :` does not save it.
   assert(!APPLIANCE_INIT.includes("pipefail"));
   assertEquals(await initDigest(), await sha256Hex(APPLIANCE_INIT));
+});
+
+Deno.test("only the step script reports stage 'step', so its codes stay its own", () => {
+  // The 90–101 band is documented as colliding with a user script's own exit
+  // codes and being disambiguated by `stage`. That claim is only true while
+  // `finish "$RC" step` is the ONLY call reporting that stage — assert the
+  // property rather than trusting the comment that describes it.
+  const calls = [
+    ...APPLIANCE_INIT.matchAll(/^\s*.*?finish ("\$RC"|\d+) (\w+)/gm),
+  ]
+    .map((m) => ({ code: m[1], stage: m[2] }));
+  assert(calls.length >= 11, `found ${calls.length} finish calls`);
+  const atStep = calls.filter((c) => c.stage === "step");
+  assertEquals(atStep.length, 1, "exactly one call reports stage 'step'");
+  assertEquals(atStep[0].code, '"$RC"', "and it carries the script's own rc");
+  for (const call of calls) {
+    if (call.code === '"$RC"') continue;
+    const code = Number(call.code);
+    assert(code >= 91 && code <= 101, `${code} is inside the reserved band`);
+    assert(
+      call.stage !== "step",
+      `finish ${code} must not report stage step, or it collides`,
+    );
+  }
+  // 90 was documented as "payload device never appeared" and never emitted;
+  // that case is 98 roles, like every other role that will not bind.
+  assert(!calls.some((c) => c.code === "90"), "90 is not emitted");
+  assertStringIncludes(APPLIANCE_INIT, "payload-unresolved:");
+});
+
+Deno.test("APPLIANCE_INIT does not fail open on the two unchecked writes", () => {
+  // Both were reachable and silent. A step that runs unplugged, or one whose
+  // script never reached the shell, exited 0 and published a layer.
+  //
+  // The network is a role the HOST declared, so a failure to bind it is fatal
+  // at the same stage as a disk role — nothing here runs under `set -e`.
+  for (const fatal of ["link-up", "addr-add", "route-add", "resolv-conf"]) {
+    assertStringIncludes(
+      APPLIANCE_INIT,
+      `finish 91 roles - "network-unconfigured:${fatal}"`,
+    );
+  }
+  // Bound before the payload read, so the reported stage never goes backwards.
+  assert(
+    APPLIANCE_INIT.indexOf("network-unconfigured") <
+      APPLIANCE_INIT.indexOf("bad-payload-magic"),
+    "the network role binds with the other roles",
+  );
+  // /qi/run.sh is length-checked the same way the payload read is: a tmpfs
+  // that is full makes the redirection fail, and a truncated run.sh runs,
+  // exits 0, and publishes a layer for a step that never executed.
+  assertStringIncludes(APPLIANCE_INIT, "run-script-truncated:");
+  assertStringIncludes(APPLIANCE_INIT, "WANT=$((PRE + LEN))");
+  // Derived from the prefix on disk, never a hardcoded 8, so editing
+  // `set -eu` cannot leave the check silently comparing the wrong number.
+  assertStringIncludes(APPLIANCE_INIT, "PRE=$(wc -c < /qi/prefix.sh)");
+});
+
+/**
+ * Whether this process may boot a real x86_64 guest.
+ *
+ * `deno task test` grants `--allow-run=echo,cat,false,sleep,sh` and reads only
+ * `tests`, so these skip there and run under `deno test -A`, which is how the
+ * cross-arch appliance gets exercised at all — it has no smoke of its own.
+ */
+const CAN_BOOT_X86 = await (async () => {
+  const run = await Deno.permissions.query({
+    name: "run",
+    command: "qemu-system-x86_64",
+  });
+  const read = await Deno.permissions.query({ name: "read", path: "." });
+  const write = await Deno.permissions.query({ name: "write", path: "." });
+  if (run.state !== "granted" || read.state !== "granted") return false;
+  if (write.state !== "granted") return false;
+  return await Deno.stat(".appliance/x86_64/appliance.json")
+    .then(() => true).catch(() => false);
+})();
+
+Deno.test({
+  name: "the x86_64 appliance boots and answers on the same wire",
+  ignore: !CAN_BOOT_X86,
+  fn: async () => {
+    // The cross-arch appliance had no automated coverage at all. It runs under
+    // TCG — measured 2.7s for a trivial step against 254ms on aarch64, about
+    // 10x — so one boot is affordable and nothing more is attempted here.
+    const identity = await readApplianceIdentity({ arch: "x86_64" });
+    assertEquals(identity.arch, "x86_64");
+    // q35, not virt: the console device differs with it, and a wrong console
+    // yields an empty log rather than a failure.
+    assertEquals(identity.machine, "q35");
+    const dir = await scratchDir();
+    try {
+      const guest = new ApplianceGuestRunner({
+        identity,
+        consoleDir: `${dir}/kept`,
+      });
+      const image = `${dir}/image.qcow2`;
+      await new Deno.Command("qemu-img", {
+        args: ["create", "-f", "qcow2", image, "64M"],
+        stdout: "null",
+        stderr: "null",
+      }).output();
+      const result = await guest.run({
+        stepId: "x86-smoke",
+        imagePath: image,
+        script: 'echo "MARK $(uname -m)"\ntest -b "$QI_TARGET"\n',
+        nonce: await stepNonce("x86-smoke", "trivial"),
+        scratchDir: dir,
+      });
+      assertEquals(result.outcome.code, 0, result.console);
+      assertEquals(result.outcome.stage, "step");
+      // The target resolved by SERIAL on a machine whose disk enumeration is
+      // nothing like virt's — the property the whole devices.ts design exists
+      // for, and it had never been exercised on q35.
+      assertStringIncludes(result.console, "MARK x86_64");
+      assertEquals(result.outcome.umountRc, 0);
+      assertEquals(result.outcome.dmesgErrors, 0);
+      // A step that mounts nothing registers no device, so it is genuinely
+      // unchecked rather than checked-and-clean.
+      assertEquals(fsckVerdict(result.outcome), "unchecked");
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
+
+/** An identity good enough to construct a runner; nothing here boots it. */
+const FAKE_IDENTITY: ApplianceIdentity = {
+  abi: APPLIANCE_ABI,
+  arch: "aarch64",
+  kernelSha256: "0".repeat(64),
+  initrdSha256: "0".repeat(64),
+  initSha256: "0".repeat(64),
+  lockSha256: "0".repeat(64),
+  kernelRelease: "6.12.81-0-virt",
+  packages: [],
+  machine: "virt",
+  qemuSystemVersion: "QEMU emulator version 11.0.2",
+  digest: "0".repeat(64),
+};
+
+/** The `-serial file:PATH` the runner emitted, so a fake can write to it. */
+function serialPath(args: readonly string[]): string {
+  const at = args.indexOf("-serial");
+  return args[at + 1]?.replace(/^file:/, "") ?? "";
+}
+
+Deno.test("a guest step's deadline is settable per step", async () => {
+  // A 200ms mkfs and an apk install over slirp cannot share one number: set
+  // it for the slow step and a hung fast one burns the whole deadline first.
+  const seen: number[] = [];
+  const runner: CommandRunner = {
+    run(_bin, args, options?: RunOptions): Promise<CommandResult> {
+      seen.push(options?.timeoutMs ?? -1);
+      return Promise.reject(new CommandAbortedError("qemu", args));
+    },
+  };
+  const dir = await scratchDir();
+  const guest = new ApplianceGuestRunner({
+    identity: FAKE_IDENTITY,
+    runner,
+    timeoutMs: 111,
+    consoleDir: `${dir}/kept`,
+  });
+  try {
+    const request = {
+      stepId: "table:mkfs",
+      imagePath: `${dir}/image.qcow2`,
+      script: "echo hi\n",
+      nonce: NONCE,
+      scratchDir: dir,
+    };
+    await assertRejects(() => guest.run(request), GuestTimeoutError);
+    await assertRejects(
+      () => guest.run({ ...request, timeoutMs: 999 }),
+      GuestTimeoutError,
+    );
+    assertEquals(seen, [111, 999]);
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test("the deadline message states what is known, and no more", async () => {
+  const runner: CommandRunner = {
+    run(_bin, args): Promise<CommandResult> {
+      return Promise.reject(new CommandAbortedError("qemu", args));
+    },
+  };
+  const dir = await scratchDir();
+  try {
+    const guest = new ApplianceGuestRunner({
+      identity: FAKE_IDENTITY,
+      runner,
+      timeoutMs: 250,
+      consoleDir: `${dir}/kept`,
+    });
+    const error = await assertRejects(
+      () =>
+        guest.run({
+          stepId: "slow",
+          imagePath: `${dir}/image.qcow2`,
+          script: "echo hi\n",
+          nonce: NONCE,
+          scratchDir: dir,
+        }),
+      GuestTimeoutError,
+    );
+    assertEquals(error.timeoutMs, 250);
+    assertStringIncludes(error.message, "did not power off within 250ms");
+    // It asserted "it hung" before, which the host cannot possibly know: a
+    // panic before the epilogue and work that was merely slow look identical.
+    assert(!error.message.includes("it hung"));
+    assertStringIncludes(error.message, "a hang, a panic");
+    assertStringIncludes(error.message, "timeoutMs");
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test("the console outlives the scratch dir the error used to point into", async () => {
+  // appliance.ts wrote the console into the layer's `.partial`, and `build()`
+  // calls `store.abandon()` on failure — which removes that directory. So the
+  // error named a file that was already gone by the time anyone read it.
+  const dir = await scratchDir();
+  try {
+    const scratch = `${dir}/partial`;
+    await Deno.mkdir(scratch);
+    const runner: CommandRunner = {
+      async run(_bin, args): Promise<CommandResult> {
+        await Deno.writeTextFile(
+          serialPath(args),
+          "appliance: running 8-byte step script\nBUG: kernel NULL deref\n",
+        );
+        throw new CommandAbortedError("qemu", args);
+      },
+    };
+    const guest = new ApplianceGuestRunner({
+      identity: FAKE_IDENTITY,
+      runner,
+      timeoutMs: 10,
+      consoleDir: `${dir}/kept`,
+    });
+    const error = await assertRejects(
+      () =>
+        guest.run({
+          stepId: "table:mkfs",
+          imagePath: `${scratch}/image.qcow2`,
+          script: "echo hi\n",
+          nonce: NONCE,
+          scratchDir: scratch,
+        }),
+      GuestTimeoutError,
+    );
+    // What build() does next, and the whole reason this test exists.
+    await Deno.remove(scratch, { recursive: true });
+
+    assert(error.consolePath !== undefined, "a copy was kept");
+    assertStringIncludes(error.message, error.consolePath);
+    assertEquals(
+      await Deno.readTextFile(error.consolePath),
+      "appliance: running 8-byte step script\nBUG: kernel NULL deref\n",
+    );
+    // The `:` in a step id has to survive reaching a filename.
+    assertStringIncludes(error.consolePath, "table_mkfs");
+    // And the text is in the message too, so a log with no filesystem still
+    // carries the diagnosis.
+    assertStringIncludes(error.message, "BUG: kernel NULL deref");
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test("a status-record failure keeps the console it used to discard", async () => {
+  // The console was read one line before parseStatus and then dropped exactly
+  // where it was the only account of the boot — an /init that cannot resolve
+  // its status disk writes no record at all and says why here and nowhere else.
+  const dir = await scratchDir();
+  try {
+    const scratch = `${dir}/partial`;
+    await Deno.mkdir(scratch);
+    const runner: CommandRunner = {
+      async run(_bin, args): Promise<CommandResult> {
+        await Deno.writeTextFile(
+          serialPath(args),
+          "appliance: status role 'qimg-status' resolved to zero or many disks\n",
+        );
+        return { success: true, code: 0, stdout: "", stderr: "" };
+      },
+    };
+    const guest = new ApplianceGuestRunner({
+      identity: FAKE_IDENTITY,
+      runner,
+      consoleDir: `${dir}/kept`,
+    });
+    const error = await assertRejects(
+      () =>
+        guest.run({
+          stepId: "app",
+          imagePath: `${scratch}/image.qcow2`,
+          script: "echo hi\n",
+          nonce: NONCE,
+          scratchDir: scratch,
+        }),
+      GuestStatusError,
+    );
+    await Deno.remove(scratch, { recursive: true });
+    assertEquals(error.fault, "absent");
+    assertStringIncludes(error.message, "the guest wrote no status record");
+    assertStringIncludes(error.message, "resolved to zero or many disks");
+    assert(error.consolePath !== undefined, "a copy was kept");
+    assertStringIncludes(
+      await Deno.readTextFile(error.consolePath),
+      "resolved to zero or many disks",
+    );
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test("a qemu that never booted is its own typed failure", async () => {
+  const dir = await scratchDir();
+  try {
+    const runner: CommandRunner = {
+      run(): Promise<CommandResult> {
+        return Promise.resolve({
+          success: false,
+          code: 1,
+          stdout: "",
+          stderr: "qemu-system-aarch64: -M virt-99: unsupported machine type",
+        });
+      },
+    };
+    const guest = new ApplianceGuestRunner({ identity: FAKE_IDENTITY, runner });
+    const error = await assertRejects(
+      () =>
+        guest.run({
+          stepId: "app",
+          imagePath: `${dir}/image.qcow2`,
+          script: "echo hi\n",
+          nonce: NONCE,
+          scratchDir: dir,
+        }),
+      GuestBootError,
+    );
+    assertEquals(error.code, 1);
+    // Not a step failure, and not a hang: the one case where qemu's own exit
+    // code IS the answer, and its stderr is the only place that says why.
+    assertStringIncludes(error.message, "the VM never started");
+    assertStringIncludes(error.message, "unsupported machine type");
+    assertStringIncludes(error.stderr, "unsupported machine type");
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test("network.dns is validated before it can reach a cmdline", () => {
+  // It rides the kernel cmdline beside the nonce, which has always been
+  // validated. A value with a space does not fail — it silently changes the
+  // arguments the guest parses.
+  for (
+    const dns of [
+      "8.8.8.8 qi.abi=99",
+      "",
+      "not-an-ip",
+      "8.8.8",
+      "8.8.8.8.8",
+      "256.1.1.1",
+      "010.1.1.1",
+      "2001:4860:4860::8888",
+      "8.8.8.8\n",
+    ]
+  ) {
+    const error = assertThrows(
+      () =>
+        new ApplianceGuestRunner({
+          identity: FAKE_IDENTITY,
+          network: { dns },
+        }),
+      InvalidGuestDnsError,
+    );
+    assertEquals(error.dns, dns);
+  }
+  // And the shapes that do reach a guest are accepted.
+  for (const dns of ["8.8.8.8", "1.1.1.1", "10.0.2.3", "0.0.0.0"]) {
+    new ApplianceGuestRunner({ identity: FAKE_IDENTITY, network: { dns } });
+  }
 });
 
 /** A runner that answers `--version` and nothing else. */

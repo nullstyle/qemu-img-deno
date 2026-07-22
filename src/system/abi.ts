@@ -16,6 +16,11 @@
  */
 
 import { sha256Hex } from "../digest.ts";
+import {
+  GuestStatusError,
+  type GuestStatusFault,
+  PayloadFrameError,
+} from "./errors.ts";
 
 /** Appliance wire ABI. Bumping this invalidates every appliance identity. */
 export const APPLIANCE_ABI = 2;
@@ -54,7 +59,13 @@ export interface StepOutcome {
   readonly outputDigest: string;
   /** Nonzero when any unmount under `/mnt` failed — a writeback error. */
   readonly umountRc: number;
-  /** `e2fsck -fn` exit code over every filesystem the step declared, or `undefined`. */
+  /**
+   * `e2fsck -fn` exit code over every filesystem the step declared.
+   *
+   * `undefined` means **no device was ever declared to check**, which is not
+   * rc 0 and must not be read as it. Classify with {@linkcode fsckVerdict}
+   * rather than with `?? 0`.
+   */
   readonly fsckRc?: number;
   /** Count of `EXT4-fs error` / `I/O error` lines in the guest's dmesg. */
   readonly dmesgErrors: number;
@@ -74,7 +85,26 @@ export interface FramePayloadOptions {
 export interface ParseStatusExpectation {
   /** The nonce this boot was launched with. */
   readonly nonce: string;
+  /**
+   * The guest console, attached to any {@linkcode GuestStatusError} raised.
+   *
+   * Diagnostics only — nothing is validated against it. It is here because
+   * every throw below is a case where the record says nothing, so the console
+   * is the only evidence left, and the caller has already read it.
+   */
+  readonly console?: string;
+  /** A copy of the console that outlives a failed build, if one was kept. */
+  readonly consolePath?: string;
 }
+
+/**
+ * How a step's filesystem check came out.
+ *
+ * `"unchecked"` is a third answer, not a synonym for `"clean"`: the guest
+ * writes `fsck=-` when the step registered no device at all, and collapsing
+ * that into rc 0 reports a filesystem nobody looked at as one that passed.
+ */
+export type FsckVerdict = "clean" | "failed" | "unchecked";
 
 /**
  * Frame a step script onto the payload disk. Pure.
@@ -90,12 +120,20 @@ export function framePayload(
   options: FramePayloadOptions,
 ): Uint8Array {
   const nonce = options.nonce;
-  if (nonce.length === 0 || /[\s\0]/.test(nonce)) {
-    throw new Error(
-      `payload nonce ${JSON.stringify(nonce)} is empty or holds whitespace. ` +
-        "The guest parses it as a whole line of a header sector and compares " +
-        "it to a kernel cmdline token, and neither survives a space. Derive " +
-        "it with stepNonce().",
+  // Whitespace and NUL split the two channels the nonce crosses. The glob
+  // metacharacters are here because `/init` parses the cmdline with
+  // `for arg in $(cat /proc/cmdline)`, an unquoted expansion that undergoes
+  // PATHNAME expansion as well as word splitting — so a nonce carrying `*`
+  // is matched against the guest's root directory before it is ever compared.
+  if (nonce.length === 0 || /[\s\0*?[\]]/.test(nonce)) {
+    throw new PayloadFrameError(
+      "nonce",
+      `payload nonce ${JSON.stringify(nonce)} is empty or holds whitespace ` +
+        "or a glob metacharacter. The guest parses it as a whole line of a " +
+        "header sector and compares it to a kernel cmdline token, and " +
+        "neither survives a space — while the cmdline is parsed by an " +
+        "unquoted expansion, so `*` is expanded against the guest's root " +
+        "before the comparison. Derive it with stepNonce().",
     );
   }
   const body = new TextEncoder().encode(script);
@@ -103,7 +141,8 @@ export function framePayload(
     `${FRAME_MAGIC}\n${body.byteLength}\n${nonce}\n`,
   );
   if (header.byteLength > SECTOR) {
-    throw new Error(
+    throw new PayloadFrameError(
+      "header",
       `payload header is ${header.byteLength} bytes and sector 0 holds ` +
         `${SECTOR}`,
     );
@@ -113,7 +152,8 @@ export function framePayload(
   const sizeBytes = options.sizeBytes ??
     SECTOR + Math.ceil(body.byteLength / SECTOR) * SECTOR;
   if (SECTOR + body.byteLength > sizeBytes) {
-    throw new Error(
+    throw new PayloadFrameError(
+      "script",
       `step script is ${body.byteLength} bytes, too large for a ` +
         `${sizeBytes}-byte payload disk`,
     );
@@ -137,11 +177,25 @@ export function parseStatus(
   bytes: Uint8Array,
   expect: ParseStatusExpectation,
 ): StepOutcome {
+  // Every throw below hands the console to the error. It is the only evidence
+  // that survives a record which says nothing — and in the worst case here,
+  // an `/init` that could not resolve its status disk, it is the ONLY
+  // evidence there ever was: that path cannot write a record at all.
+  const fail = (fault: GuestStatusFault, message: string, field?: string) =>
+    new GuestStatusError(fault, message, {
+      ...(field === undefined ? {} : { field }),
+      ...(expect.console === undefined ? {} : { console: expect.console }),
+      ...(expect.consolePath === undefined
+        ? {}
+        : { consolePath: expect.consolePath }),
+    });
+
   const text = new TextDecoder().decode(bytes).replace(/\0+$/, "");
   const lines = text.split("\n");
   const magic = lines[0];
   if (magic === LEGACY_FRAME_MAGIC) {
-    throw new Error(
+    throw fail(
+      "legacy",
       "the guest wrote a QIMG1 status record, but this host speaks QIMG2. " +
         "The appliance on disk was built by an older source tree, so its " +
         "/init does not know about the roles, nonce or filesystem checks " +
@@ -151,7 +205,8 @@ export function parseStatus(
     );
   }
   if (magic !== FRAME_MAGIC) {
-    throw new Error(
+    throw fail(
+      "absent",
       "the guest wrote no status record (found " +
         `${JSON.stringify(text.slice(0, 40))}). It panicked, hung, or was ` +
         "killed before its epilogue — qemu's own exit code cannot tell you " +
@@ -160,7 +215,8 @@ export function parseStatus(
   }
   const [, nonce, code, stage, digest, umount, fsck, dmesg, ...rest] = lines;
   if (nonce !== expect.nonce) {
-    throw new Error(
+    throw fail(
+      "nonce",
       `status record is for nonce ${JSON.stringify(nonce ?? "")}, not ` +
         `${JSON.stringify(expect.nonce)}. This is a PREVIOUS step's answer ` +
         "left on a reused status disk — its shape is perfectly valid, which " +
@@ -168,10 +224,11 @@ export function parseStatus(
     );
   }
   if (!/^\d+$/.test(code ?? "")) {
-    throw new Error(`status record has a malformed exit code: ${code}`);
+    throw fail("code", `status record has a malformed exit code: ${code}`);
   }
   if (!GUEST_STAGES.includes(stage as GuestStage)) {
-    throw new Error(
+    throw fail(
+      "stage",
       `status record names an unknown stage ${JSON.stringify(stage ?? "")}; ` +
         `this host knows ${GUEST_STAGES.join(", ")}. Rebuild the appliance.`,
     );
@@ -180,12 +237,12 @@ export function parseStatus(
     code: Number(code),
     stage: stage as GuestStage,
     outputDigest: digest === "-" ? "" : digest ?? "",
-    umountRc: strictField(umount, "umountRc"),
+    umountRc: strictField(umount, "umountRc", fail),
     // `-` is "no filesystem was declared", which is not the same as rc 0 and
     // must not be flattened into it: a step that never named a device to
     // check is unchecked, not checked-and-clean.
-    ...(fsck === "-" ? {} : { fsckRc: strictField(fsck, "fsckRc") }),
-    dmesgErrors: strictField(dmesg, "dmesgErrors"),
+    ...(fsck === "-" ? {} : { fsckRc: strictField(fsck, "fsckRc", fail) }),
+    dmesgErrors: strictField(dmesg, "dmesgErrors", fail),
     detail: (rest[0] ?? "").trim(),
   };
 }
@@ -201,16 +258,42 @@ export function parseStatus(
  * would publish the layer for every descendant to cache against. `rc` and
  * `stage` are already strict; there is no reason for these to be laxer.
  */
-function strictField(field: string | undefined, name: string): number {
+function strictField(
+  field: string | undefined,
+  name: string,
+  fail: (
+    fault: GuestStatusFault,
+    message: string,
+    field?: string,
+  ) => GuestStatusError,
+): number {
   if (!/^\d+$/.test(field ?? "")) {
-    throw new Error(
+    throw fail(
+      "field",
       `status record has a malformed ${name}: ${JSON.stringify(field ?? "")}` +
         ". The record is incomplete or corrupt, which is not the same as a " +
         "step that ran and reported clean — and must never be read as one. " +
         "The guest was cut off mid-epilogue; check the console log.",
+      name,
     );
   }
   return Number(field);
+}
+
+/**
+ * Classify a step's filesystem check into its three real answers.
+ *
+ * Exists so the `-` spelling cannot be flattened by accident. `outcome.fsckRc`
+ * is `undefined` for "no device was ever declared to check", and the natural
+ * reading of that — `(outcome.fsckRc ?? 0) !== 0` — treats it as a clean
+ * check, which fails **open** in exactly the case the field was added to
+ * catch: a guest that never registered a filesystem publishes as verified.
+ * Route the decision through here instead, and the third answer has to be
+ * handled to compile.
+ */
+export function fsckVerdict(outcome: StepOutcome): FsckVerdict {
+  if (outcome.fsckRc === undefined) return "unchecked";
+  return outcome.fsckRc === 0 ? "clean" : "failed";
 }
 
 /**

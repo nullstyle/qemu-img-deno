@@ -26,12 +26,22 @@ import { sha256Hex } from "../digest.ts";
  * the appliance, so this is POSIX `ash`: no arrays, no `[[ ]]`, no process
  * substitution.
  *
- * Guest exit codes, all reported through the status frame's `stage` so they
- * cannot be confused with a step script's own code: `90` payload device never
- * appeared, `92` bad magic, `93` bad length, `94` empty script, `95` short
- * read, `96` unknown `qi.*` argument, `97` ABI mismatch, `98` role
- * unresolved, `99` nonce mismatch, `100` ext4 unregistered, `101` roles
- * inverted.
+ * Guest exit codes, and why they can share the 90–101 band with a step
+ * script's own: **`stage` disambiguates them, and that is checked rather than
+ * assumed.** `finish "$RC" step` is the only call in the whole script that
+ * reports stage `"step"`, so a `90`–`101` arriving at any other stage is this
+ * script's and a code arriving at `"step"` is the author's — verified against
+ * the emitted text, not against this comment.
+ *
+ * `91` network role unconfigured, `92` bad magic, `93` bad length, `94` empty
+ * script, `95` step script did not reach the shell intact (short read from the
+ * payload disk, or a truncated `/qi/run.sh`), `96` unknown `qi.*` argument,
+ * `97` ABI mismatch, `98` role unresolved, `99` nonce mismatch, `100` ext4
+ * unregistered, `101` roles inverted.
+ *
+ * `90` is deliberately absent. It was documented here as "payload device never
+ * appeared" and never emitted — that case is `98 roles`
+ * (`payload-unresolved:…`), like every other role that will not bind.
  *
  * No `set -o pipefail`: busybox ash treats `set` as a special builtin, so a
  * failed `set -o badopt` exits a non-interactive shell and `|| :` does not
@@ -130,6 +140,26 @@ if [ -n "$QI_DATA" ]; then
   QI_DATADEV=$(qi_resolve "$QI_DATA") || finish 98 roles - "data-unresolved:$QI_DATA"
 fi
 
+if [ -n "$QI_DNS" ]; then
+  # The network is a role the host DECLARED, so it is bound here beside the
+  # disks and reported at the same stage. Every command is fatal: none of this
+  # runs under \`set -e\`, and an unchecked failure here leaves the step running
+  # unplugged — which produces an artifact that looks built and is missing
+  # everything it was supposed to fetch, the exact outcome
+  # GuestNetworkUnavailableError refuses on the host side.
+  #
+  # DHCP is impossible here: there is no af_packet module anywhere in the
+  # initramfs, so udhcpc dies in under a second with "Address family not
+  # supported by protocol". slirp's own resolver at 10.0.2.3 never answers on
+  # qemu 11.0.2/macOS, so the resolver is supplied by the host.
+  modprobe virtio_net 2>/dev/null || true
+  mdev -s 2>/dev/null || true
+  ip link set eth0 up || finish 91 roles - "network-unconfigured:link-up"
+  ip addr add 10.0.2.15/24 dev eth0 || finish 91 roles - "network-unconfigured:addr-add"
+  ip route add default via 10.0.2.2 || finish 91 roles - "network-unconfigured:route-add"
+  echo "nameserver $QI_DNS" > /etc/resolv.conf || finish 91 roles - "network-unconfigured:resolv-conf"
+fi
+
 # A target carrying the payload magic means the roles inverted.
 if dd if="$QI_TARGET" bs=512 count=1 2>/dev/null | tr -d '\\0' | grep -q '^QIMG2$'; then
   finish 101 roles - "target-carries-payload-magic"
@@ -147,25 +177,25 @@ dd if="$QI_PAYLOADDEV" bs=512 skip=1 2>/dev/null | dd bs=1 count="$LEN" 2>/dev/n
 GOT=$(wc -c < /qi/step.sh)
 [ "$GOT" = "$LEN" ] || finish 95 payload - "short-read:$GOT-of-$LEN"
 
-if [ -n "$QI_DNS" ]; then
-  # DHCP is impossible here: there is no af_packet module anywhere in the
-  # initramfs, so udhcpc dies in under a second with "Address family not
-  # supported by protocol". slirp's own resolver at 10.0.2.3 never answers on
-  # qemu 11.0.2/macOS, so the resolver is supplied by the host.
-  modprobe virtio_net 2>/dev/null || true
-  mdev -s 2>/dev/null || true
-  ip link set eth0 up
-  ip addr add 10.0.2.15/24 dev eth0
-  ip route add default via 10.0.2.2
-  echo "nameserver $QI_DNS" > /etc/resolv.conf
-fi
-
 # \`set -e\` is imposed here, not trusted to the generator: without it RC is the
 # LAST command's status, so \`mke2fs … ; sync\` reports sync's 0 over a failed
 # mkfs. Note this does NOT cover pipelines — see the hazard table.
 export QI_TARGET
 export QI_DATA="$QI_DATADEV"
-{ echo 'set -eu'; cat /qi/step.sh; } > /qi/run.sh
+# The assembled script is LENGTH-CHECKED for the same reason the payload read
+# above is: this is a write to a tmpfs that can be full, and a redirection
+# that fails leaves a truncated or empty /qi/run.sh which then runs, exits 0,
+# and publishes a layer for a step that never executed. Verify the artifact,
+# never the redirection's status.
+printf 'set -eu\\n' > /qi/prefix.sh
+PRE=$(wc -c < /qi/prefix.sh)
+# An empty PRE would be read as 0 by the arithmetic below, and the length
+# check would then pass over a run.sh carrying no \`set -eu\` at all.
+case "$PRE" in ''|0|*[!0-9]*) finish 95 payload - "run-prefix-unwritable:$PRE" ;; esac
+cat /qi/prefix.sh /qi/step.sh > /qi/run.sh
+WANT=$((PRE + LEN))
+RUNLEN=$(wc -c < /qi/run.sh)
+[ "$RUNLEN" = "$WANT" ] || finish 95 payload - "run-script-truncated:$RUNLEN-of-$WANT"
 echo "appliance: running $LEN-byte step script"
 sh /qi/run.sh > /qi/out.log 2>&1
 RC=$?
