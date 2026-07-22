@@ -85,6 +85,71 @@ Deno.test("GPT geometry: usable range, backup placement, signatures", () => {
   );
 });
 
+Deno.test("GPT geometry at a 4096-byte sector: 4 array sectors, not 32", () => {
+  // The entry array is 16 KiB whatever the sector size, so 4096-byte sectors
+  // need 4 of them where 512-byte sectors need 32. Sizing the array against a
+  // hardcoded 512 overshoots by 8x and overflows the head it splices into.
+  const sectorSize = 4096;
+  const diskSizeBytes = 16 * 1024 * 1024;
+  const gpt = buildGpt({
+    diskSizeBytes,
+    sectorSize,
+    diskGuid: "12345678-1234-4234-8234-123456789ABC",
+    partitions: [{
+      typeGuid: PARTITION_TYPE_GUIDS.esp,
+      uniqueGuid: "AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE",
+      firstLba: 6,
+      lastLba: 1023,
+      name: "EFI",
+    }],
+  });
+  const totalSectors = diskSizeBytes / sectorSize;
+  assertEquals(gpt.firstUsableLba, 6, "MBR + header + 4 array sectors");
+  assertEquals(gpt.lastUsableLba, totalSectors - 6);
+  assertEquals(gpt.primary.byteLength, 6 * sectorSize);
+  assertEquals(gpt.backup.byteLength, 5 * sectorSize);
+  // The backup starts 5 sectors from the end and runs to the final byte.
+  assertEquals(gpt.backupOffsetBytes, (totalSectors - 5) * sectorSize);
+  assertEquals(gpt.backupOffsetBytes + gpt.backup.byteLength, diskSizeBytes);
+
+  // The header's own CRC over the array is what proves the array is sized and
+  // placed as the header advertises, rather than merely fitting the buffer.
+  const arrayAt = 2 * sectorSize;
+  const primaryHeader = new DataView(
+    gpt.primary.buffer,
+    sectorSize,
+    sectorSize,
+  );
+  assertEquals(
+    new TextDecoder().decode(gpt.primary.subarray(sectorSize, sectorSize + 8)),
+    "EFI PART",
+  );
+  assertEquals(
+    crc32(gpt.primary.subarray(arrayAt, arrayAt + ENTRY_BYTES * 128)),
+    primaryHeader.getUint32(88, true),
+    "entry-array CRC covers the array as written",
+  );
+  assertEquals(
+    bytesToGuid(gpt.primary.subarray(arrayAt, arrayAt + 16)),
+    PARTITION_TYPE_GUIDS.esp,
+  );
+
+  const backupHeader = new DataView(
+    gpt.backup.buffer,
+    4 * sectorSize,
+    sectorSize,
+  );
+  assertEquals(backupHeader.getBigUint64(24, true), BigInt(totalSectors - 1));
+  assertEquals(
+    backupHeader.getBigUint64(72, true),
+    BigInt(totalSectors - 5),
+    "backup entry array LBA",
+  );
+  // The protective MBR's signature sits at byte 510 whatever the sector size.
+  assertEquals(gpt.primary[510], 0x55);
+  assertEquals(gpt.primary[511], 0xaa);
+});
+
 Deno.test("the backup header is not a copy: LBAs swapped, CRC recomputed", () => {
   const gpt = buildGpt({
     diskSizeBytes: 1024 ** 3,
