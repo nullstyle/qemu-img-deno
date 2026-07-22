@@ -31,7 +31,6 @@ import {
   type Step,
   traitsOf,
   UnrepresentableContentError,
-  VVFAT_USABLE_BYTES,
 } from "../../src/recipe/mod.ts";
 // Imported under a second name so the test can assert the two public subpaths
 // hand back the same class, rather than two that merely agree on `.name`.
@@ -57,6 +56,19 @@ class StubResolver implements InputResolver {
     });
   }
 }
+
+/**
+ * The ESP window every recipe here declares.
+ *
+ * Through 0.2.1 this had to be `VVFAT_USABLE_BYTES[16]` — 528450048 bytes,
+ * vvfat's fixed geometry — whatever the tree held, and `plan()` refused every
+ * other value in both directions. 0.3.0 writes the FAT itself, so this is an
+ * ordinary size chosen because it comfortably holds ESP_TREE.
+ */
+const ESP_BYTES = 33 * 1024 * 1024;
+
+/** The size vvfat forced on every FAT16 ESP through 0.2.1. */
+const OLD_VVFAT_FAT16_BYTES = 528_450_048;
 
 const ESP_TREE: ResolvedEntry[] = [
   { path: "EFI", type: "dir", mode: 0o755, sizeBytes: 0 },
@@ -87,7 +99,7 @@ function baseRecipe(overrides: Partial<Recipe> = {}): Recipe {
       partitions: [{
         label: "EFI",
         type: "esp",
-        size: VVFAT_USABLE_BYTES[16],
+        size: ESP_BYTES,
         contents: {
           kind: "fat",
           fatType: 16,
@@ -143,7 +155,7 @@ Deno.test("plan geometry: 1 MiB alignment, GPT tail reserved", async () => {
   const esp = planned.layout?.[0];
   assertEquals(esp?.firstLba, 2048, "1 MiB / 512 = LBA 2048, never LBA 63");
   assertEquals(esp?.offsetBytes, 1048576);
-  assertEquals(esp?.lengthBytes, VVFAT_USABLE_BYTES[16]);
+  assertEquals(esp?.lengthBytes, ESP_BYTES);
   // A GPT's backup header lives in the last 33 sectors; nothing may reach it.
   const lastUsable = 1024 ** 3 / 512 - 33 - 1;
   assert((esp?.lastLba ?? 0) <= lastUsable);
@@ -217,7 +229,7 @@ Deno.test("a mixed ESP + ext4 table splits the partitions between the layers", a
         {
           label: "EFI",
           type: "esp",
-          size: VVFAT_USABLE_BYTES[16],
+          size: ESP_BYTES,
           contents: {
             kind: "fat",
             fatType: 16,
@@ -375,7 +387,7 @@ const MUTATIONS: Array<
         partitions: [{
           label: "ESP2",
           type: "esp",
-          size: VVFAT_USABLE_BYTES[16],
+          size: ESP_BYTES,
           contents: {
             kind: "fat",
             fatType: 16,
@@ -396,7 +408,7 @@ const MUTATIONS: Array<
         partitions: [{
           label: "EFI",
           type: "esp",
-          size: VVFAT_USABLE_BYTES[16],
+          size: ESP_BYTES,
           contents: {
             kind: "fat",
             fatType: 16,
@@ -483,7 +495,7 @@ Deno.test("key stability: the keys themselves are pinned to these literals", asy
   // be the right call, but it has to be a decision rather than a side effect.
   assertEquals(
     (await planOf(baseRecipe())).outputRecipeKey,
-    "0a90c7bfe639f2c0c334fa04e7619cc188092ca034bf21217f39bec602b834c5",
+    "088b706fe401fa93d1acc8e1b91b6a571d234dad14771f0faa6d07be954ede05",
     "FAT16 ESP over a blank base",
   );
   // Includes the generated `table:mkfs` layer, whose key folds the appliance
@@ -513,7 +525,7 @@ Deno.test("key stability: irrelevant changes do not move the key", async () => {
           fatType: 16,
           kind: "fat",
         },
-        size: VVFAT_USABLE_BYTES[16],
+        size: ESP_BYTES,
         type: "esp",
         label: "EFI",
       }],
@@ -566,38 +578,16 @@ Deno.test("realization keys chain through the parent's ACTUAL content", async ()
 
 // ─────────────────────────────────────────────────────────────── refusals ──
 
-Deno.test("refuses a FAT partition below vvfat's fixed geometry", async () => {
-  const error = await assertRejects(
-    () =>
-      planOf(baseRecipe({
-        steps: [{
-          kind: "partition",
-          id: "table",
-          partitions: [{
-            label: "EFI",
-            type: "esp",
-            size: 64 * 1024 * 1024,
-            contents: {
-              kind: "fat",
-              fatType: 16,
-              label: "EFI",
-              from: dir("./esp"),
-            },
-          }],
-        }],
-      })),
-    RecipePlanError,
-  );
-  // The message must carry the exact figure, since it is not negotiable.
-  assert(error.message.includes(String(VVFAT_USABLE_BYTES[16])));
-  assert(error.message.includes("Grow the partition"), "name the fix");
-  assertEquals(error.code, "fat-window-too-small");
-});
-
-/** A one-partition FAT recipe, for exercising the vvfat window's two edges. */
-function fatRecipe(size: number | "rest", fatType: 12 | 16 = 16): Recipe {
+/** A one-partition FAT recipe, for exercising the window's two edges. */
+function fatRecipe(
+  size: number | "rest",
+  fatType: 12 | 16 | 32 = 16,
+  diskBytes = 4 * 1024 ** 3,
+  boot: Recipe["boot"] = { kind: "uefi-removable" },
+): Recipe {
   return baseRecipe({
-    base: { kind: "blank", sizeBytes: 4 * 1024 ** 3 },
+    base: { kind: "blank", sizeBytes: diskBytes },
+    boot,
     steps: [{
       kind: "partition",
       id: "table",
@@ -611,47 +601,174 @@ function fatRecipe(size: number | "rest", fatType: 12 | 16 = 16): Recipe {
   });
 }
 
-Deno.test("refuses a FAT partition ABOVE vvfat's fixed geometry too", async () => {
-  // The too-small side was refused from the start; this side reached build()
-  // and came back as qemu-img's own words about a `raw` node it could not
-  // open — "The sum of offset (32256) and size (…) has to be smaller or equal
-  // to the actual size of the containing file (…)" — three numbers, none of
-  // them the partition the recipe declared.
+/**
+ * `count` files of `sizeBytes` each, on top of the EFI fallback tree.
+ *
+ * The fallback has to be there: `boot: "uefi-removable"` refuses an ESP
+ * without it, and that refusal fires before the geometry is ever checked.
+ */
+function bigTree(count: number, sizeBytes: number): ResolvedEntry[] {
+  return [
+    ...ESP_TREE,
+    { path: "payload", type: "dir", mode: 0o755, sizeBytes: 0 },
+    ...Array.from({ length: count }, (_, index) => ({
+      path: `payload/blob-${index}.bin`,
+      type: "file" as const,
+      mode: 0o644,
+      sizeBytes,
+      sha256: String(index).padStart(64, "0"),
+    })),
+  ];
+}
+
+Deno.test("a FAT partition is sized by its CONTENT, not by a fixed geometry", async () => {
+  // The headline of 0.3.0. Every one of these was refused through 0.2.1,
+  // because vvfat's FAT16 window was fixed at 528450048 bytes whatever it
+  // held — so a recipe wanting a 33 MiB ESP could not have one.
+  for (const size of [8 * 1024 * 1024, ESP_BYTES, 100 * 1024 * 1024]) {
+    const planned = await planOf(fatRecipe(size));
+    assertEquals(planned.layout?.[0].lengthBytes, size);
+  }
+  // Including the size vvfat used to force, which is now unremarkable.
+  assertEquals(
+    (await planOf(fatRecipe(OLD_VVFAT_FAT16_BYTES))).layout?.[0].lengthBytes,
+    OLD_VVFAT_FAT16_BYTES,
+  );
+  // And `"rest"`, the usual way a recipe landed on the too-large refusal by
+  // accident: it takes everything left on the disk, which was never vvfat's
+  // fixed window. On a 64 MiB disk that is ~63 MiB, an ordinary FAT16 volume.
+  const rest = await planOf(fatRecipe("rest", 16, 64 * 1024 * 1024));
+  assert((rest.layout?.[0].lengthBytes ?? 0) > 0);
+});
+
+Deno.test("FAT32 plans, where vvfat's output was refused outright", async () => {
+  // vvfat's FAT32 is a FAT16-shaped BPB with a doubled allocation table, so
+  // the type was rejected at the type level rather than emitted.
+  const planned = await planOf(fatRecipe(64 * 1024 * 1024, 32));
+  assertEquals(planned.layout?.[0].lengthBytes, 64 * 1024 * 1024);
+  assertEquals(planned.requiresAppliance, false);
+});
+
+Deno.test("refuses a FAT partition too small for its tree, with the size that fits", async () => {
+  // 40 files of 1 MiB in a 16 MiB window. The refusal has to carry a number,
+  // because "make it bigger" is not a fix anyone can act on.
   const error = await assertRejects(
-    () => planOf(fatRecipe(VVFAT_USABLE_BYTES[16] + 1024 * 1024)),
+    () =>
+      planOf(fatRecipe(16 * 1024 * 1024), {
+        "./esp": bigTree(40, 1024 * 1024),
+      }),
     RecipePlanError,
   );
-  assertEquals(error.code, "fat-window-too-large");
-  assert(
-    error.message.includes(String(VVFAT_USABLE_BYTES[16])),
-    `names the only size that works:\n${error.message}`,
+  assertEquals(error.code, "fat-window-too-small");
+  assertStringIncludes(error.message, "Grow the partition to at least");
+  // And the number it names actually plans.
+  const required = Number(
+    /at least (\d+) bytes/.exec(error.message)?.[1] ?? "0",
   );
-  assertStringIncludes(error.message, "Shrink the partition to exactly");
-  // "rest" is the usual way to land here by accident: it takes everything left
-  // on the disk, which is never vvfat's fixed window.
-  const rest = await assertRejects(
-    () => planOf(fatRecipe("rest")),
+  assert(required > 16 * 1024 * 1024, `a real byte count, got ${required}`);
+  const planned = await planOf(fatRecipe(required), {
+    "./esp": bigTree(40, 1024 * 1024),
+  });
+  assertEquals(planned.layout?.[0].lengthBytes, required);
+  // One sector below it does not.
+  await assertRejects(
+    () =>
+      planOf(fatRecipe(required - 512), { "./esp": bigTree(40, 1024 * 1024) }),
     RecipePlanError,
   );
-  assertEquals(rest.code, "fat-window-too-large");
 });
 
-Deno.test("vvfat's FAT12 window is the size qemu will actually open", async () => {
-  // Measured on qemu-img 11.0.2: the vvfat device is 33030144 bytes and its
-  // MBR entry puts the filesystem at LBA 63 for 64449 sectors, so the window
-  // build() opens at offset 32256 is 32997888 bytes. Through 0.2.1 this
-  // constant was 33005568 — 7680 bytes too many — so a recipe sized with the
-  // package's own constant planned clean and then failed in build().
-  assertEquals(VVFAT_USABLE_BYTES[12], 32_997_888);
-  assertEquals(VVFAT_USABLE_BYTES[16], 528_450_048);
-  const planned = await planOf(fatRecipe(VVFAT_USABLE_BYTES[12], 12));
-  assertEquals(planned.layout?.[0].lengthBytes, VVFAT_USABLE_BYTES[12]);
+Deno.test("refuses a window below the format's own floor", async () => {
+  // Nothing to do with the content: a boot sector, two FATs, a 512-entry root
+  // directory and one cluster do not fit in 2 KiB, and would not fit if the
+  // tree were empty. A partition too small for the FORMAT is still a refusal.
+  // `boot: "none"`, so the empty tree is not refused for the EFI fallback
+  // before the geometry is looked at.
+  const error = await assertRejects(
+    () =>
+      planOf(fatRecipe(2048, 16, 4 * 1024 ** 3, { kind: "none" }), {
+        "./esp": [],
+      }),
+    RecipePlanError,
+  );
+  assertEquals(error.code, "fat-window-not-formattable");
+  assertStringIncludes(error.message, "No FAT type fits this window");
 });
 
-Deno.test("refuses vvfat FAT on a 4096-byte-sector disk, and says why", async () => {
-  // Neither vvfat window is a multiple of 4096, so no `size` can land on one:
-  // the partition is always rounded up past it. Before this refusal the
-  // recipe planned, keyed and then died in build().
+Deno.test("refuses a window no cluster size can make the requested type", async () => {
+  // FAT12 caps at 4084 clusters, and the largest cluster this writer chooses
+  // is 32 KiB — so a 1 GiB FAT12 volume does not exist at any cluster size.
+  // Getting this wrong emits a volume whose type every driver disagrees about.
+  const error = await assertRejects(
+    () => planOf(fatRecipe(1024 ** 3, 12)),
+    RecipePlanError,
+  );
+  assertEquals(error.code, "fat-window-not-formattable");
+  assertStringIncludes(error.message, "cannot be formatted FAT12");
+  assertStringIncludes(error.message, "fatType: 16");
+});
+
+Deno.test("refuses a FAT tree whose paths differ only in case", async () => {
+  // FAT resolves names case-insensitively, so both entries would be written
+  // and one file would be unreachable under a name answering with the other's
+  // contents. Refused at plan time, before a layer is keyed.
+  const error = await assertRejects(
+    () =>
+      planOf(fatRecipe(ESP_BYTES), {
+        "./esp": [
+          { path: "EFI", type: "dir", mode: 0o755, sizeBytes: 0 },
+          { path: "EFI/BOOT", type: "dir", mode: 0o755, sizeBytes: 0 },
+          {
+            path: "EFI/BOOT/BOOTAA64.EFI",
+            type: "file",
+            mode: 0o644,
+            sizeBytes: 10,
+            sha256: "a".repeat(64),
+          },
+          {
+            path: "EFI/BOOT/bootaa64.efi",
+            type: "file",
+            mode: 0o644,
+            sizeBytes: 10,
+            sha256: "b".repeat(64),
+          },
+        ],
+      }),
+    RecipePlanError,
+  );
+  assertEquals(error.code, "fat-unrepresentable-entry");
+  assertStringIncludes(error.message, "case-insensitively");
+});
+
+Deno.test("refuses a FAT tree the resolver did not enumerate", async () => {
+  // Nothing to size the partition against. Reporting a fit that was never
+  // checked is the same as not checking.
+  class BlindResolver implements InputResolver {
+    resolve(input: Input): Promise<ResolvedInput> {
+      return Promise.resolve({ input, sha256: "blind", sizeBytes: 0 });
+    }
+  }
+  const error = await assertRejects(
+    async () =>
+      await plan(
+        await resolveRecipe(
+          fatRecipe(ESP_BYTES, 16, 4 * 1024 ** 3, { kind: "none" }),
+          { resolver: new BlindResolver() },
+        ),
+        { appliance: STUB_APPLIANCE },
+      ),
+    RecipePlanError,
+  );
+  assertEquals(error.code, "fat-tree-unresolved");
+});
+
+Deno.test("refuses FAT on a disk whose sector size is not 512, and says why", async () => {
+  // Not a size problem any more — through 0.2.1 this was refused because
+  // neither vvfat window was a multiple of 4096, so no `size` could land on
+  // one. Now the writer emits 512-byte sectors and nothing has measured it at
+  // any other value, so a volume claiming 512 inside a partition on a 4Kn disk
+  // is refused rather than written for a reader to address at a block size the
+  // device cannot do.
   const error = await assertRejects(
     () =>
       planOf(
@@ -664,7 +781,7 @@ Deno.test("refuses vvfat FAT on a 4096-byte-sector disk, and says why", async ()
             partitions: [{
               label: "EFI",
               type: "esp",
-              size: VVFAT_USABLE_BYTES[16],
+              size: ESP_BYTES,
               contents: {
                 kind: "fat",
                 fatType: 16,
@@ -677,14 +794,14 @@ Deno.test("refuses vvfat FAT on a 4096-byte-sector disk, and says why", async ()
       ),
     RecipePlanError,
   );
-  assertEquals(error.code, "fat-window-too-large");
-  // Telling this caller to "shrink to 528450048" would be advice they cannot
-  // take, so the message has to name the sector size as the actual cause.
+  assertEquals(error.code, "fat-window-not-formattable");
+  // Telling this caller to grow or shrink the partition would be advice they
+  // cannot take, so the message names the sector size as the actual cause.
   assert(
-    !error.message.includes("Shrink the partition to exactly"),
+    !error.message.includes("Grow the partition"),
     `must not name an unreachable fix:\n${error.message}`,
   );
-  assertStringIncludes(error.message, "not a multiple");
+  assertStringIncludes(error.message, "512-byte sectors only");
   assertStringIncludes(error.message, "`sectorSize: 512`");
 });
 
@@ -830,7 +947,7 @@ Deno.test("refuses an over-long FAT label", async () => {
           partitions: [{
             label: "EFI",
             type: "esp",
-            size: VVFAT_USABLE_BYTES[16],
+            size: ESP_BYTES,
             contents: {
               kind: "fat",
               fatType: 16,
@@ -1167,7 +1284,7 @@ Deno.test("every refusal carries a code a caller can branch on", async () => {
           partitions: [{
             label: "EFI",
             type: "esp",
-            size: VVFAT_USABLE_BYTES[16],
+            size: ESP_BYTES,
             contents: {
               kind: "fat",
               fatType: 16,

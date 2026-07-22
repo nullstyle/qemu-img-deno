@@ -12,9 +12,98 @@ changes ride a minor bump.
 Groundwork for building disk images from scratch. The mechanism that makes it
 possible on a host with no Linux image tooling: qemu's own block drivers. A
 `raw` node with `offset`/`size` is a **window** onto a larger image, so bytes
-can be written into one partition without touching its neighbours, and the
-`vvfat` driver synthesizes a FAT filesystem from a host directory — which is how
-an ESP gets built on a machine with no `mkfs.fat`.
+can be written into one partition without touching its neighbours — and the
+filesystems that go into those windows are written here, in TypeScript, so an
+ESP gets built on a machine with no `mkfs.fat` and no root.
+
+### A native FAT12/16/32 writer replaces qemu's `vvfat`
+
+`src/fs/fat.ts` is a conformant FAT writer, and it removes three constraints
+that were not really about FAT at all — they were about `vvfat`, whose geometry
+is **fixed and content-independent**.
+
+- **An ESP is now whatever size you ask for.** `vvfat` yielded exactly 528450048
+  usable bytes at FAT16 and 32997888 at FAT12 whatever it held, so `plan()`
+  refused every other size in both directions and a recipe wanting a 33 MiB ESP
+  could not have one. The geometry now follows the content: measured, the
+  smallest FAT12 window holding a 300 KB payload is **330240 bytes**, and a
+  realistic ESP tree fits a **2124800-byte** FAT16 volume.
+- **FAT32 builds.** It was refused outright, because `vvfat`'s FAT32 output is a
+  FAT16-shaped BPB with a doubled allocation table that conformant drivers
+  misread.
+- **The timestamp workaround is gone, both halves of it.** `vvfat` stamped the
+  host's clock into every directory entry and took no time option, so 0.2.1
+  copied the whole staging tree to pin mtime and atime, and then rewrote the
+  creation fields in the finished filesystem because `st_ctime` cannot be pinned
+  from userspace at all. `stageFatTree()`, `normalizeFatTimestamps()` and the
+  sparse-raw round-trip that existed to give the normalizer something seekable
+  are all deleted. Every timestamp now comes from `determinism.sourceDateEpoch`
+  by construction, and two **cold** builds of one recipe produce byte-identical
+  ESP bytes — asserted in `smoke:recipe` by content digest.
+
+Validated against implementations sharing no code with this one: `fsck_msdos`
+exits 0, the Darwin `msdos` driver mounts every volume and hands back each file
+byte-identical with its long name intact, `diskutil` independently agrees on the
+FAT type, and `qemu-img` round-trips through qcow2 with `compare` identical.
+Volumes were built landing on exactly **4084, 4085, 65524 and 65525** clusters —
+both sides of both thresholds that _define_ the three types — and all three
+oracles agree on the type for all four.
+
+#### BREAKING
+
+- `VVFAT_USABLE_BYTES` is **removed** from `./recipe`. It named a constraint
+  that no longer exists, and a deprecated-but-exported constant is the shape
+  that would keep recipes pinned to 504 MiB ESPs forever. Replace
+  `size: VVFAT_USABLE_BYTES[16]` with the size you actually want; `plan()` now
+  refuses only a window that genuinely cannot hold the tree, and names the byte
+  count that would.
+- `FilesystemSpec`'s `fat` arm accepts `fatType: 32`.
+- `RecipePlanErrorCode`: `fat-window-too-large` is replaced by
+  `fat-window-not-formattable` (no geometry of the requested type exists for
+  this window), and `fat-window-too-small` now means "cannot hold the staged
+  tree" rather than "is not exactly vvfat's fixed size". Two codes are added:
+  `fat-unrepresentable-entry` and `fat-tree-unresolved`.
+- `./fs` no longer exports `normalizeFatTimestamps`, `FatLayoutError`,
+  `FatTimestampOptions` or `FatTimestampReport`. The normalizer repaired
+  `vvfat`'s output and has no caller left; keeping it would ship a second FAT
+  layout parser with its own assumptions and no path through the build that
+  exercises it. `DIR_ENTRY_BYTES` survives unchanged. New: `buildFat`,
+  `describeFat`, `fatGeometryFor`, `minimumFatSizeBytes`, `fatEntryShapes`,
+  `SECTOR_BYTES`, `CLUSTER_COUNT_THRESHOLDS`, `FatEntry`, `FatEntryShape`,
+  `FatOptions`, `FatGeometry`, `FatEntryError`, `FatGeometryError`.
+
+#### Refusals this writer adds
+
+- **Two paths differing only in case.** FAT lookup is case-insensitive, so both
+  entries get written and both names resolve to whichever came first. Measured
+  on macOS 26.5.2: such a volume passes `fsck_msdos -n`, mounts, lists both
+  names in `readdir`, and returns the FIRST entry's bytes for either name. A
+  valid image holding less than was staged, with nothing anywhere reporting a
+  problem.
+- **A `BPB_HiddSec` that is not a uint32.** It was written through
+  `DataView.setUint32` unvalidated, so `2**32` landed as `0`, `-1` as
+  `0xFFFFFFFF` and `1.5` as `1` — a wrong start LBA rather than a refusal.
+- **A geometry whose cluster count does not match the type asked for.** The FAT
+  type is `CountofClusters`, never the `FAT16` string in the BPB; a volume one
+  cluster the wrong side of a threshold is one whose type every driver disagrees
+  about.
+
+#### Also corrected here
+
+- `BPB_RsvdSecCnt` is now the spec's own value — 1 on FAT12/16, 32 on FAT32 —
+  with no padding added to align the data region. The spec says "For FAT12 and
+  FAT16 volumes, this value should never be anything other than 1", where a
+  comment in the writer had claimed the reverse; Apple's `newfs_msdos` agrees,
+  emitting `res=1` for a 40 MiB FAT16 volume (first data sector 193, not
+  cluster-aligned) and `res=32` for a 400 MiB FAT32 one.
+- An explicit `fatType: 32` is no longer refused by the FAT12/16 root-entry
+  ceiling, which does not apply to it — the refusal used to tell the caller to
+  pass `fatType: 32`.
+- Short-name `~N` generation was quadratic: 1000 names 3 ms, 2000 186 ms, 4000
+  1642 ms, 8000 9827 ms, because truncation collapses many long names onto one
+  six-character stem. `plan()` calls this to size a partition, so it was a pure
+  function hanging on a large staging tree. With a per-directory counter the
+  same four sizes are 3, 7, 12 and 26 ms.
 
 ### Added
 
@@ -41,7 +130,10 @@ an ESP gets built on a machine with no `mkfs.fat`.
   smoke was previously backing-less, leaving the argv path a backing chain
   depends on unexercised), for option-graph window writes, and for building a
   FAT filesystem via `vvfat` — validated against `/sbin/fsck_msdos`, an
-  implementation with no shared code with qemu.
+  implementation with no shared code with qemu. (The `vvfat` demo stays in
+  `smoke:qemu-img`, where it exercises the driver; the recipe tier no longer
+  uses it. `smoke:fat` is the new one, putting this package's own writer in
+  front of `fsck_msdos`, the Darwin driver and `qemu-img`.)
 
 - **`./recipe`** — the recipe vocabulary and a deterministic `plan()`.
   `resolveRecipe` replaces every declared input with its digest (the only I/O
@@ -62,13 +154,13 @@ an ESP gets built on a machine with no `mkfs.fat`.
   cached child can be silently wrong about — and container bytes move on their
   own (see _Fixed_).
 
-  Plan-time refusals, each naming its fix: a FAT partition below vvfat's fixed
-  geometry (528450048 bytes at FAT16, regardless of content), an over-long FAT
-  label, `uefi-removable` with no `BOOTAA64.EFI`/`BOOTX64.EFI` in the ESP tree,
-  an unversioned machine alias, a partition running into the GPT's backup
-  header, and staging content a chosen filesystem would silently drop.
-  Capability traits are DERIVED from the walked tree, so a symlink nobody
-  noticed still refuses a FAT partition.
+  Plan-time refusals, each naming its fix: a FAT partition too small for the
+  tree staged into it (naming the byte count that fits), an over-long FAT label,
+  `uefi-removable` with no `BOOTAA64.EFI`/`BOOTX64.EFI` in the ESP tree, an
+  unversioned machine alias, a partition running into the GPT's backup header,
+  and staging content a chosen filesystem would silently drop. Capability traits
+  are DERIVED from the walked tree, so a symlink nobody noticed still refuses a
+  FAT partition.
 
 - **`./fs`** — a GPT writer: protective MBR, header, entry array and the backup
   at the tail, with CRC-32 and mixed-endian GUID serialization. Two details are

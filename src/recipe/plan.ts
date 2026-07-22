@@ -16,6 +16,13 @@ import {
   UnrepresentableContentError,
 } from "./errors.ts";
 import { resolvedDir, resolvedFile } from "./resolve.ts";
+import {
+  FatEntryError,
+  type FatEntryShape,
+  FatGeometryError,
+  fatGeometryFor,
+  SECTOR_BYTES,
+} from "../fs/fat.ts";
 import { USTAR_MAX_SIZE_BYTES } from "../fs/tar.ts";
 import { GUEST_TAR_FLAG } from "../system/script.ts";
 import type {
@@ -30,41 +37,6 @@ import type {
 
 /** Where a step's bytes come from. */
 export type Executor = "image" | "bytes" | "guest";
-
-/**
- * vvfat's usable byte count per FAT type — the size a FAT partition must be,
- * exactly.
- *
- * The geometry is fixed and content-independent: a tree of one 4-byte file and
- * a tree of 200 64 KiB files both yield the same numbers, measured on qemu-img
- * 11.0.2. vvfat presents a whole disk with its own MBR, and `build()` splices
- * the window past it (LBA 63, 32256 bytes), so these are the device size less
- * that offset — and they are also exactly what the synthesized BPB's
- * `totalSectors` claims:
- *
- * | fatType | vvfat device | MBR partition entry     | BPB totalSectors |
- * | ------- | ------------ | ----------------------- | ---------------- |
- * | 12      | 33030144     | LBA 63, 64449 sectors   | 64449            |
- * | 16      | 528482304    | LBA 63, 1032129 sectors | 1032129          |
- *
- * BOTH directions are refused, and the reasons differ. A SMALLER partition
- * truncates a filesystem whose BPB claims the full size. A LARGER one does not
- * merely waste the tail: `build()` opens the source as
- * `raw,offset=32256,size=<partition length>` over the vvfat node, and qemu-img
- * refuses to open that at all — "The sum of offset (32256) and size (…) has to
- * be smaller or equal to the actual size of the containing file (…)".
- *
- * BREAKING: `12` was `33005568` through 0.2.1, which is the device size less
- * 24576 rather than less 32256 — 7680 bytes too many. A recipe that sized a
- * FAT12 partition with this very constant therefore passed `plan()` and then
- * failed in `build()` with that raw qemu error, which is the failure this
- * refusal exists to prevent. No working cache entry moves: every recipe the old
- * value admitted and the new one rejects was unbuildable.
- */
-export const VVFAT_USABLE_BYTES: Readonly<Record<12 | 16, number>> = {
-  12: 32_997_888,
-  16: 528_450_048,
-};
 
 /**
  * Why a guest step cannot be planned without an appliance identity.
@@ -406,40 +378,94 @@ function validateContents(
           "volume-label field in a FAT boot sector. Shorten it to 11 bytes.",
       );
     }
-    const required = VVFAT_USABLE_BYTES[contents.fatType];
-    const fixed = `vvfat's FAT${contents.fatType} geometry is fixed at ` +
-      `${required} bytes regardless of content`;
-    if (lengthBytes < required) {
+    if (sectorSize !== SECTOR_BYTES) {
+      // Not a size problem, and not fixable by changing the size. The BPB has
+      // a BPB_BytsPerSec field and the spec allows 1024, 2048 and 4096, but
+      // neither oracle this writer is validated against — `fsck_msdos` and the
+      // Darwin `msdos` driver — was exercised at any of them, so they are
+      // unmeasured and the writer does not emit them. Laying a volume that
+      // claims 512-byte sectors into a partition on a disk whose logical block
+      // is larger gives a reader LBAs the device cannot address at that
+      // granularity, so it is refused rather than written.
       throw new RecipePlanError(
         stepId,
-        "fat-window-too-small",
-        `partition "${partition.label}" is ${lengthBytes} bytes, but ${fixed}. ` +
-          "A smaller window truncates a filesystem whose BPB claims the full " +
-          `size. Grow the partition to exactly ${required} bytes.`,
+        "fat-window-not-formattable",
+        `partition "${partition.label}" declares FAT contents on a ` +
+          `${sectorSize}-byte-sector disk, and this package writes FAT with ` +
+          `${SECTOR_BYTES}-byte sectors only. A volume whose BPB claims ` +
+          `${SECTOR_BYTES} inside a partition on a ${sectorSize}-byte-sector ` +
+          "disk is one a reader addresses at a block size the device cannot " +
+          "do. Use `sectorSize: 512`, or build this partition's filesystem " +
+          "some other way.",
       );
     }
-    if (lengthBytes > required) {
-      // The other side was never a refusal, so it landed in build() as
-      // qemu-img's own words about a `raw` node it could not open: "The sum of
-      // offset (32256) and size (…) has to be smaller or equal to the actual
-      // size of the containing file (…)" — three numbers, none of them the
-      // partition the recipe declared.
-      const sectorNote = required % sectorSize === 0
-        ? `Shrink the partition to exactly ${required} bytes.`
-        : `And ${required} is not a multiple of this recipe's ` +
-          `${sectorSize}-byte sector size, so no \`size\` can land on it: a ` +
-          `vvfat FAT${contents.fatType} filesystem cannot be laid out on a ` +
-          `${sectorSize}-byte-sector disk at all. Use \`sectorSize: 512\`, or ` +
-          "build this partition's filesystem some other way.";
+    const input = resolvedDir(resolved, contents.from);
+    // Traits first: a symlink is not a sizing question, and refusing it here
+    // means the shapes below describe a tree FAT can actually hold.
+    refuseUnrepresentable(
+      stepId,
+      contents.kind,
+      input,
+      FILESYSTEM_TRAITS[contents.kind] ?? [],
+    );
+    if (input.entries === undefined) {
       throw new RecipePlanError(
         stepId,
-        "fat-window-too-large",
-        `partition "${partition.label}" is ${lengthBytes} bytes, ` +
-          `${lengthBytes - required} more than ${fixed}. build() splices the ` +
-          "filesystem through a `raw` window of exactly the partition's " +
-          "length over the vvfat node, and qemu-img refuses to open a window " +
-          `past the end of what vvfat synthesized. ${sectorNote}`,
+        "fat-tree-unresolved",
+        `partition "${partition.label}" declares FAT contents from ` +
+          `${contents.from.path}, but the resolver recorded no entries for ` +
+          "it — so there is nothing to size the partition against, and " +
+          "reporting a fit that was never checked is the same as not " +
+          "checking. Resolve directory inputs with LocalInputResolver, or " +
+          "have the custom resolver populate ResolvedInput.entries.",
       );
+    }
+    // Asked of the writer itself, not of a second implementation of its
+    // arithmetic. The failure this avoids is a plan that says yes and a build
+    // that then says no: `fatGeometryFor()` is `buildFat()`'s own resolution
+    // step with the writing left out, so the two cannot disagree.
+    //
+    // Sized from the resolver's manifest — paths, types and lengths — because
+    // that is all the layout depends on. No file is read here, and `plan()`
+    // stays a pure function of the resolved recipe.
+    const shapes: FatEntryShape[] = input.entries.map((entry) => ({
+      path: entry.path,
+      type: entry.type === "dir" ? "dir" : "file",
+      sizeBytes: entry.type === "file" ? entry.sizeBytes : 0,
+    }));
+    try {
+      fatGeometryFor(shapes, {
+        sizeBytes: lengthBytes,
+        fatType: contents.fatType,
+      });
+    } catch (error) {
+      if (error instanceof FatGeometryError) {
+        const sectorNote = error.requiredBytes === undefined
+          ? ""
+          : error.requiredBytes % sectorSize === 0
+          ? ""
+          : ` That is not a multiple of this recipe's ${sectorSize}-byte ` +
+            "sector size, so round it up to the next one.";
+        throw new RecipePlanError(
+          stepId,
+          error.requiredBytes === undefined
+            ? "fat-window-not-formattable"
+            : "fat-window-too-small",
+          `partition "${partition.label}" is ${lengthBytes} bytes: ` +
+            `${error.message}${sectorNote}`,
+        );
+      }
+      if (error instanceof FatEntryError) {
+        // A name FAT cannot hold, or two that differ only in case. Not a
+        // geometry problem, and refusing it here means the recipe never
+        // reaches build() to fail there with the tree half written.
+        throw new RecipePlanError(
+          stepId,
+          "fat-unrepresentable-entry",
+          `partition "${partition.label}" cannot be written: ${error.message}`,
+        );
+      }
+      throw error;
     }
   }
   if (contents.kind === "ext4") {
@@ -459,16 +485,6 @@ function validateContents(
     }
     return;
   }
-  // Traits are derived from the data, so this catches a tree whose author
-  // never noticed it had a symlink in it.
-  if (contents.kind !== "fat") return;
-  const input = resolvedDir(resolved, contents.from);
-  refuseUnrepresentable(
-    stepId,
-    contents.kind,
-    input,
-    FILESYSTEM_TRAITS[contents.kind] ?? [],
-  );
 }
 
 /**

@@ -108,24 +108,30 @@ export type PartitionType = "esp" | "linux-root" | "linux-generic";
 export type FilesystemSpec =
   | {
     /**
-     * FAT synthesized by qemu's `vvfat` driver from a host directory.
+     * FAT, written byte by byte by this package from a host directory.
      *
-     * vvfat's geometry is FIXED and content-independent: `fatType: 16` yields
-     * exactly 528450048 usable bytes, `fatType: 12` yields 32997888. The
-     * partition must be that size EXACTLY, and both directions are refused at
-     * plan time with the figures — a smaller window truncates a filesystem
-     * whose BPB claims the full size, and a larger one is a window qemu-img
-     * refuses to open at all. `fatType: 32` is refused outright — qemu's vvfat
-     * FAT32 output is a FAT16-shaped BPB with a doubled allocation table,
-     * which conformant drivers misread.
+     * The geometry follows the CONTENT: the partition is whatever size the
+     * recipe declares, and `plan()` refuses only a window that genuinely
+     * cannot hold the staged tree — naming, in the refusal, the byte count
+     * that would. A 33 MiB ESP is an ordinary thing to ask for.
      *
-     * A consequence worth stating: neither figure is a multiple of 4096, so a
-     * FAT partition cannot be laid out on a `sectorSize: 4096` disk at all.
+     * BREAKING in 0.3.0. Through 0.2.1 this arm was qemu's `vvfat` driver,
+     * whose geometry was fixed and content-independent, so every FAT partition
+     * had to be exactly 528450048 bytes at `fatType: 16` or 32997888 at
+     * `fatType: 12` — 504 MiB of ESP to hold a 300 KiB bootloader — and
+     * `fatType: 32` was refused outright because vvfat emits a FAT16-shaped
+     * BPB for it. All three of those are gone: any size fits, `fatType: 32`
+     * builds, and `VVFAT_USABLE_BYTES` no longer exists.
+     *
+     * `fatType` stays required rather than inferred. The FAT type is decided
+     * by the volume's cluster count, so leaving it to the writer would make it
+     * a function of the partition size — and a recipe that grew its ESP would
+     * silently change filesystem type under an unchanged declaration.
      */
     readonly kind: "fat";
     readonly from: DirInput;
-    readonly fatType: 12 | 16;
-    /** Volume label, at most 11 bytes. */
+    readonly fatType: 12 | 16 | 32;
+    /** Volume label, at most 11 bytes. Uppercase ASCII; FAT labels are. */
     readonly label: string;
   }
   | {

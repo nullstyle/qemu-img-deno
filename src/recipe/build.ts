@@ -8,14 +8,14 @@
  * Two mechanisms do all the work. `image` and `bytes` layers use `qemu-img`
  * alone: a `raw` node with `offset`/`size` is a *window* onto the layer, so a
  * partition table or a filesystem is spliced in without touching its
- * neighbours, and FAT comes from qemu's `vvfat` driver reading a host
- * directory. `guest` layers boot the build appliance.
+ * neighbours, and both the GPT and the FAT filesystems inside it are bytes
+ * this package generates. `guest` layers boot the build appliance.
  *
  * @module
  */
 
 import { QemuImg } from "../qemu_img.ts";
-import { normalizeFatTimestamps } from "../fs/fat.ts";
+import { buildFat, type FatEntry, SECTOR_BYTES } from "../fs/fat.ts";
 import { buildGpt, deriveGuid, PARTITION_TYPE_GUIDS } from "../fs/gpt.ts";
 import { buildTar, type TarEntry } from "../fs/tar.ts";
 import {
@@ -45,10 +45,6 @@ import {
 } from "./errors.ts";
 import { resolvedDir, resolvedFile } from "./resolve.ts";
 import type { DirInput, ResolvedInput, ResolvedRecipe, Step } from "./types.ts";
-
-/** vvfat's own MBR occupies the first 32256 bytes; a window past it is the
- * bare filesystem. */
-const VVFAT_MBR_BYTES = 32256;
 
 /** Options for {@linkcode build}. */
 export interface BuildOptions {
@@ -110,38 +106,6 @@ function typeGuidFor(type: string, arch: string): string {
   return PARTITION_TYPE_GUIDS["linux-generic"];
 }
 
-/**
- * The epoch whose LOCAL rendering equals `epoch`'s UTC calendar time.
- *
- * qemu's vvfat renders every timestamp through `localtime_r` before packing it
- * into a FAT directory entry, and FAT stores local time with no offset field —
- * so the same `sourceDateEpoch` lands as a different calendar time, and
- * different bytes, on every host whose clock is not set to UTC. Measured on
- * qemu 11.0.2: the same pinned tree converted under `TZ=UTC` and
- * `TZ=Asia/Tokyo` differs in 75 bytes.
- *
- * Pre-shifting the host mtime by the host's own UTC offset cancels that, so
- * the entry records `sourceDateEpoch` read as UTC wherever it is built. The
- * one instant this cannot express is a local time inside a spring-forward gap,
- * which does not exist and which the `Date` constructor normalizes forward by
- * the gap's width; a recipe pinned there records an hour later on hosts in
- * that zone. That is strictly narrower than the every-zone-differs it
- * replaces, so it is documented rather than refused.
- */
-function vvfatLocalEpoch(epoch: number): number {
-  const utc = new Date(epoch * 1000);
-  const local = new Date(
-    utc.getUTCFullYear(),
-    utc.getUTCMonth(),
-    utc.getUTCDate(),
-    utc.getUTCHours(),
-    utc.getUTCMinutes(),
-    utc.getUTCSeconds(),
-    0,
-  );
-  return Math.floor(local.getTime() / 1000);
-}
-
 /** One live entry of a staging tree, with the path it is recorded under. */
 interface LiveEntry {
   /** Path relative to the tree root, `/`-separated. */
@@ -174,63 +138,47 @@ async function* liveEntries(
 }
 
 /**
- * Copy a FAT staging tree into `scratch`, verified against the digest the
- * resolver recorded, with every timestamp pinned.
+ * Read a FAT staging tree into memory as {@linkcode FatEntry} values, verified
+ * against the manifest the resolver recorded.
  *
- * One copy fixes two defects, and both are cache-poisoning rather than
- * cosmetic.
+ * **The tree written must be the tree the key names.** The layer's realization
+ * key was computed from the digest `resolveRecipe()` took earlier; editing the
+ * tree in between would publish the new bytes under the old tree's key —
+ * permanently, because a later hit serves that layer without re-reading
+ * anything. So every entry is re-hashed here, and a path that appeared, was
+ * removed, changed type, changed mode or changed content is a refusal rather
+ * than a build. This is the re-hash {@linkcode tarOf} already does for
+ * `copyIn`, extended to the tree's SHAPE.
  *
- * **The tree vvfat reads must be the tree the key names.** `qemu-img` opens
- * the staging directory at BUILD time, but the layer's realization key was
- * computed from the digest `resolveRecipe()` took earlier. Editing the tree
- * in between published the new bytes under the old tree's key — permanently,
- * because a later hit serves that layer without ever re-reading the tree.
- * Copying first and hashing the COPY closes the window rather than narrowing
- * it: vvfat reads bytes this function already checked against the manifest,
- * and nothing outside can reach them afterwards. This is the re-hash
- * {@linkcode tarOf} already does for `copyIn`, extended to the tree's SHAPE —
- * a tree that gained a file would otherwise be published without it, which is
- * the same silent shortfall from the other direction.
+ * BREAKING with 0.2.1's shape, and the reason the copy is gone: qemu's `vvfat`
+ * read the staging DIRECTORY at build time, so closing that window meant
+ * copying the whole tree into scratch first and pointing qemu at the copy —
+ * and then pinning mtime and atime on every node of it, because vvfat stamped
+ * the host clock into each directory entry and took no time option. Neither is
+ * needed now. The bytes go into {@linkcode buildFat} straight from this
+ * function, so there is nothing outside to race with, and every timestamp in
+ * the volume comes from `determinism.sourceDateEpoch` by construction. The
+ * `st_ctime` half that no userspace call could pin — the one that left 8
+ * differing bytes at offset 14 of a directory entry under a single realization
+ * key, and needed `normalizeFatTimestamps()` to scrub after the fact — does
+ * not arise: nothing here ever reads a host timestamp.
  *
- * **vvfat stamps the host's timestamps into every directory entry.** It reads
- * `st_mtime`, `st_atime` and `st_ctime` off each file and packs them into the
- * entry's write, access and creation fields; it takes no time option, so
- * `determinism.sourceDateEpoch` never reaches it. Measured against qemu
- * 11.0.2 on macOS-aarch64, over a two-file tree: re-staging identical content
- * moved 30 bytes, and moving the mtimes alone, the atimes alone, a
- * subdirectory's own mtime, or the root directory's own mtime each moved the
- * image on its own (28–33 bytes). Pinning mtime and atime on the copy — every
- * file, every directory, and the root — settles the write-time and
- * access-date fields for good.
- *
- * It does NOT settle `st_ctime`, and that limit is the kernel's rather than
- * this code's: no userspace call sets it, and `utimes()` bumps it to now as a
- * side effect of pinning the other two. Measured end to end, two builds of one
- * recipe from separately staged trees six seconds apart: 16 differing bytes
- * before this function existed, 8 after — and all 8 sit at offset 14 of a
- * 32-byte directory entry, which is `DIR_CrtTime`. So a FAT layer is still not
- * byte-reproducible across two builds far enough apart in wall clock. Closing
- * that means rewriting the creation fields after the convert, which needs a
- * FAT directory walker — it belongs beside the other format writers in
- * `src/fs/`, not here.
- *
- * A hardlink farm is not an option for the copy: mtime is inode metadata, so
- * `Deno.utime()` through a link moves the ORIGINAL's mtime too — measured, and
- * it would mutate the caller's staging tree. Symlinks never reach here, since
- * `plan()` refuses a FAT tree that has one; one appearing after `resolve()` is
- * refused below with the rest of the drift.
+ * The whole tree is held in memory at once, which is what {@linkcode buildFat}
+ * needs. An ESP is the sort of thing this carries; a multi-gigabyte FAT tree
+ * would want a streaming writer, and there is not one.
  */
-async function stageFatTree(
-  scratch: string,
+async function fatEntriesOf(
   stepId: string,
   from: DirInput,
   recorded: ResolvedInput,
   epoch: number,
-): Promise<string> {
+): Promise<FatEntry[]> {
   // An entry-less resolution is not a pass. The digest in the key was taken
   // over a walk this build cannot reconstruct, so there is nothing to check
   // the tree against — and treating "unverifiable" as "matches" is the
-  // silent-acceptance shape refused for the base image's size above.
+  // silent-acceptance shape refused for the base image's size above. plan()
+  // refuses this first; repeated here because build() may be handed a plan it
+  // did not make.
   if (recorded.entries === undefined) {
     throw new Error(
       `${stepId}: the resolver recorded no entries for ${from.path}, so the ` +
@@ -239,7 +187,6 @@ async function stageFatTree(
         "the custom resolver populate ResolvedInput.entries.",
     );
   }
-  const root = await Deno.makeTempDir({ dir: scratch, prefix: "vvfat-" });
   const expected = new Map(
     recorded.entries.map((entry) => [entry.path, entry]),
   );
@@ -252,6 +199,7 @@ async function stageFatTree(
         "resolveRecipe() after changing a staging tree.",
     );
 
+  const out: FatEntry[] = [];
   for await (const entry of liveEntries(from.path)) {
     const want = expected.get(entry.path);
     if (want === undefined) throw drifted(entry.path, "appeared");
@@ -275,16 +223,18 @@ async function stageFatTree(
           `${(entry.info.mode ?? 0).toString(8)}`,
       );
     }
-    const target = `${root}/${entry.path}`;
     if (type === "dir") {
-      await Deno.mkdir(target, { recursive: true });
+      // No `mode`: FAT holds one permission bit, the read-only flag, and a
+      // directory that arrived 0755 would come back marked read-only on a
+      // tree staged from a checkout with a restrictive umask.
+      out.push({ path: entry.path, type: "dir", mtime: epoch });
       continue;
     }
     if (type === "symlink") {
       // Unreachable through plan(), which refuses a FAT tree carrying one —
-      // FAT has no symlinks, so vvfat would follow it and copy the target's
-      // bytes in under the link's name. Refused here too rather than copied,
-      // because reaching this line means the plan and the tree disagree.
+      // FAT has no symlinks, and following it would put the target's bytes in
+      // under the link's name. Refused here too rather than followed, because
+      // reaching this line means the plan and the tree disagree.
       throw new Error(
         `${stepId}: ${entry.path} is a symlink, and FAT cannot represent one. ` +
           "plan() refuses a FAT staging tree containing symlinks, so this " +
@@ -292,10 +242,10 @@ async function stageFatTree(
           "plan(), or replace the link with the file it points at.",
       );
     }
-    await Deno.copyFile(entry.full, target);
-    // The COPY, not the source: this is the byte sequence vvfat will read, so
-    // it is the one whose digest has to match the key.
-    const actual = await sha256Hex(await Deno.readFile(target));
+    const body = await Deno.readFile(entry.full);
+    // The bytes actually about to be written, not a second read of the file:
+    // this is the sequence whose digest has to match the key.
+    const actual = await sha256Hex(body);
     if (want.sha256 !== undefined && actual !== want.sha256) {
       throw drifted(
         entry.path,
@@ -303,22 +253,12 @@ async function stageFatTree(
           `${actual.slice(0, 12)})`,
       );
     }
+    out.push({ path: entry.path, type: "file", mtime: epoch, body });
   }
   for (const path of expected.keys()) {
     if (!seen.has(path)) throw drifted(path, "was removed");
   }
-
-  // Deepest first, and the root last. Order is not load-bearing for mtime —
-  // changing a child's timestamps does not touch its parent's — but creating
-  // an entry inside a directory DOES, so every directory has to be pinned
-  // after the last thing written into it.
-  const pinned = vvfatLocalEpoch(epoch);
-  const paths = [...expected.keys()].sort((a, b) =>
-    b.split("/").length - a.split("/").length
-  );
-  for (const path of paths) await Deno.utime(`${root}/${path}`, pinned, pinned);
-  await Deno.utime(root, pinned, pinned);
-  return root;
+  return out;
 }
 
 /** A `raw` window onto a qcow2 layer, for splicing bytes into one partition. */
@@ -394,69 +334,56 @@ async function runBytesLayer(
     if (!own.includes(index)) continue;
     const contents = step.partitions[index].contents;
     if (contents.kind !== "fat") continue;
-    // Never `contents.from.path`: qemu would read the staging tree live, at
-    // build time, under a key computed from the digest the resolver took
-    // earlier. See stageFatTree().
-    const staged = await stageFatTree(
-      scratch,
+    // Read here rather than pointed at: the layer's key names the tree the
+    // resolver walked, so the bytes written have to be the bytes checked
+    // against that manifest. See fatEntriesOf().
+    const entries = await fatEntriesOf(
       step.id,
       contents.from,
       resolvedDir(resolved, contents.from),
       recipe.determinism.sourceDateEpoch,
     );
-    // A unique name, like the staging copy above: `scratch` defaults to one
-    // directory per STORE, not per build, so a fixed name would collide
-    // between two concurrent builds whose recipes share a step id.
+    // Every timestamp in the volume is `sourceDateEpoch`, and the volume id is
+    // derived from `fsSeed` rather than drawn — so two builds of one recipe
+    // produce identical bytes with no post-hoc normalization at all.
+    const volumeGuid = await deriveGuid(
+      recipe.determinism.fsSeed,
+      `fat:${partition.label}`,
+    );
+    const fat = buildFat(entries, {
+      sizeBytes: partition.lengthBytes,
+      fatType: contents.fatType,
+      label: contents.label,
+      // The first 8 hex digits of the derived GUID, as a uint32. BS_VolID has
+      // 32 bits and the seed has 128, so this narrows rather than invents.
+      volumeId: Number.parseInt(volumeGuid.slice(0, 8), 16),
+      sourceDateEpoch: recipe.determinism.sourceDateEpoch,
+      // BPB_HiddSec counts sectors of the FAT VOLUME's own size, not of the
+      // disk's — the two are the same here only because plan() refuses FAT on
+      // a disk whose sector size is not this one. Nothing on the UEFI path
+      // reads the field; it costs four bytes and it is not a lie.
+      hiddenSectors: partition.offsetBytes / SECTOR_BYTES,
+    });
+    // A unique name: `scratch` defaults to one directory per STORE, not per
+    // build, so a fixed name would collide between two concurrent builds whose
+    // recipes share a step id.
     const fatRaw = await Deno.makeTempFile({
       dir: scratch,
       prefix: "fat-",
       suffix: ".raw",
     });
     try {
-      // vvfat synthesizes the filesystem from the host directory; the `raw`
-      // window at 32256 strips vvfat's own MBR, so the partition type byte is
-      // ours rather than vvfat's 0x06.
-      //
-      // Landed in a raw file rather than straight into the image window,
-      // because the creation timestamps below have to be rewritten before the
-      // layer is published and a qcow2 is not seekable from here. The file is
-      // sparse: measured at 304 KiB written for a 504 MiB FAT16 ESP, so the
-      // detour costs the directory bytes rather than the partition size.
-      await qemu.convert(
-        {
-          imageOpts: {
-            driver: "raw",
-            offset: VVFAT_MBR_BYTES,
-            size: partition.lengthBytes,
-            file: {
-              driver: "vvfat",
-              dir: staged,
-              "fat-type": contents.fatType,
-              label: contents.label,
-            },
-          },
-        },
-        fatRaw,
-        { format: "raw", parallel: 1 },
-      );
-      // stageFatTree() pinned mtime and atime, which settles DIR_WrtTime and
-      // DIR_LstAccDate. No userspace call sets a BIRTH time, so DIR_CrtTime
-      // still held the wall clock of the staging copy: measured over the
-      // system smoke's recipe, two cold builds seconds apart published 8
-      // differing bytes under ONE realization key, every one at offset 14 of a
-      // 32-byte directory entry. That is cache poisoning, and this closes it.
-      await normalizeFatTimestamps(fatRaw, {
-        epochSeconds: recipe.determinism.sourceDateEpoch,
-      });
+      // A file, because qemu-img converts from a path and not from a buffer.
+      // It is the whole partition, unlike the GPT blobs above, since every
+      // byte of the window is written explicitly — on a qcow2 overlay an
+      // unwritten cluster reads THROUGH to the backing file.
+      await Deno.writeFile(fatRaw, fat);
       await qemu.convert(
         fatRaw,
         window(imagePath, partition.offsetBytes, partition.lengthBytes),
         { sourceFormat: "raw", noCreate: true, parallel: 1 },
       );
     } finally {
-      // A snapshot is a full copy of the ESP tree, so leaving it behind would
-      // grow the store's scratch by one ESP per built layer.
-      await Deno.remove(staged, { recursive: true }).catch(() => {});
       await Deno.remove(fatRaw).catch(() => {});
     }
   }

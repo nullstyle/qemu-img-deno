@@ -6,13 +6,9 @@ import {
   assertStringIncludes,
 } from "@std/assert";
 import { QemuImg } from "../../src/qemu_img.ts";
-import { FakeQemuImg, ok } from "../../testing/mod.ts";
+import { FakeQemuImg } from "../../testing/mod.ts";
 import { build } from "../../src/recipe/build.ts";
-import {
-  plan,
-  type PlanAppliance,
-  VVFAT_USABLE_BYTES,
-} from "../../src/recipe/plan.ts";
+import { plan, type PlanAppliance } from "../../src/recipe/plan.ts";
 import { LayerStore } from "../../src/recipe/store.ts";
 import { LocalInputResolver } from "../../src/recipe/resolve.ts";
 import {
@@ -34,6 +30,7 @@ import type {
   Step,
 } from "../../src/recipe/types.ts";
 import { sha256Hex } from "../../src/digest.ts";
+import { describeFat } from "../../src/fs/mod.ts";
 
 /**
  * A scratch directory under the repo, since `deno task test` grants write
@@ -46,18 +43,17 @@ async function scratchDir(): Promise<string> {
   return await Deno.makeTempDir({ dir: "tests/.tmp" });
 }
 
-/** Big enough for vvfat's fixed FAT12 geometry plus a root partition. */
+/** Room for an ESP plus a root partition. */
 const DISK_BYTES = 64 * 1024 ** 2;
-/** vvfat's FAT12 usable size — fixed, content-independent, checked by plan(). */
 /**
- * vvfat's fixed FAT12 geometry, from the package's own constant.
+ * The ESP window these tests declare.
  *
- * It used to be a literal 33_005_568 here, which was wrong by 7680 bytes and
- * which nothing caught because no smoke builds FAT12. Measured against the
- * real binary: `qemu-img info driver=vvfat,fat-type=12` reports 33030144, and
- * the filesystem starts 32256 bytes in past vvfat's own MBR.
+ * Any size that holds the tree will do, which is the point of 0.3.0: through
+ * 0.2.1 this had to be exactly `VVFAT_USABLE_BYTES[12]` (32997888), vvfat's
+ * fixed FAT12 geometry, and `plan()` refused every other value in both
+ * directions.
  */
-const FAT12_BYTES = VVFAT_USABLE_BYTES[12];
+const FAT12_BYTES = 8 * 1024 ** 2;
 const DETERMINISM = {
   sourceDateEpoch: 1_700_000_000,
   guidSeed: "guid-seed",
@@ -165,52 +161,6 @@ interface Rig {
 }
 
 /**
- * A minimal but VALID FAT12 image: 512-byte sectors, 1 sector per cluster,
- * 1 reserved sector, 2 FATs of 1 sector, a 16-entry root directory, 100 data
- * clusters — and one 8.3 entry carrying a deliberately stale creation stamp.
- *
- * The fake models no image content, so a `vvfat -> raw` convert would leave a
- * zero-byte file and `normalizeFatTimestamps` would correctly refuse it. This
- * gives the normalizer a real filesystem to rewrite, which is what lets a unit
- * test prove `build()` calls it at all.
- */
-function minimalFat(): Uint8Array {
-  const SECTOR = 512, ROOT_ENTRIES = 16, DATA_CLUSTERS = 100;
-  const totalSectors = 1 + 2 + 1 + DATA_CLUSTERS;
-  const image = new Uint8Array(totalSectors * SECTOR);
-  const view = new DataView(image.buffer);
-  const ascii = (at: number, text: string) => {
-    for (let i = 0; i < text.length; i++) image[at + i] = text.charCodeAt(i);
-  };
-  image[0] = 0xeb, image[1] = 0x3c, image[2] = 0x90;
-  ascii(3, "MSWIN4.1");
-  view.setUint16(11, SECTOR, true); // BytsPerSec
-  image[13] = 1; //                    SecPerClus
-  view.setUint16(14, 1, true); //      RsvdSecCnt
-  image[16] = 2; //                    NumFATs
-  view.setUint16(17, ROOT_ENTRIES, true);
-  view.setUint16(19, totalSectors, true);
-  image[21] = 0xf8; //                 Media
-  view.setUint16(22, 1, true); //      FATSz16
-  image[38] = 0x29; //                 BootSig
-  ascii(43, "NO NAME    ");
-  ascii(54, "FAT12   ");
-  image[510] = 0x55, image[511] = 0xaa;
-  // Both FATs: media byte + end-of-chain for the reserved entries.
-  for (const fat of [1, 2]) {
-    const at = fat * SECTOR;
-    image[at] = 0xf8, image[at + 1] = 0xff, image[at + 2] = 0xff;
-  }
-  // One root entry, with a creation stamp that is NOT the pinned epoch.
-  const root = 3 * SECTOR;
-  ascii(root, "BOOTAA64EFI");
-  image[root + 11] = 0x20; //          attr: archive
-  view.setUint16(root + 14, 0x1234, true); // CrtTime, stale on purpose
-  view.setUint16(root + 16, 0x5cf6, true); // CrtDate, stale on purpose
-  return image;
-}
-
-/**
  * A fake wired the way `build()` needs: it writes the images it creates,
  * because the store hashes a container file and `contentDigest()` opens a raw
  * one — and it refuses to invent what any of them hold.
@@ -219,19 +169,11 @@ function rigOn(root: string, store = `${root}/store`): Rig {
   const fake = new FakeQemuImg();
   fake.materialize = true;
   fake.refuseContentOracles = true;
-  // build() now reads vvfat into a raw scratch file, normalizes its FAT
-  // creation timestamps, then splices THAT into the window. Returning ok() is
-  // load-bearing: falling through lets the fake register the graph convert's
-  // content as empty and truncate the file back to zero bytes.
-  fake.onConvert = (convert) => {
-    if (
-      convert.sourceIsGraph === true && convert.destIsGraph !== true &&
-      convert.format === "raw"
-    ) {
-      Deno.writeFileSync(convert.dest, minimalFat());
-      return ok();
-    }
-  };
+  // No hook for the FAT any more. Through 0.2.1 the filesystem came out of an
+  // option-graph `vvfat` source the fake could not synthesize, so the rig had
+  // to hand-write a minimal FAT12 image into the scratch file. build() now
+  // produces the volume itself, in TypeScript, from a real staging tree — so
+  // the bytes under test are the package's own.
   return {
     fake,
     qemu: new QemuImg({ runner: fake }),
@@ -365,9 +307,7 @@ Deno.test("the GPT and each FAT window are spliced without touching their neighb
     // The backup header goes at the tail the planner derived, not at offset 0
     // and not off the front of a zero-sector disk.
     const partition = (planned.layout ?? [])[0];
-    // The LAST `offset=` in each argv is the destination graph's: sources are
-    // spliced in before the destination, and the vvfat source carries an
-    // offset of its own.
+    // The LAST `offset=` in each argv is the destination graph's.
     const offsets = windows.map((write) =>
       [...write.raw.args.join(" ").matchAll(/offset=(\d+)/g)].at(-1)?.[1]
     );
@@ -377,21 +317,26 @@ Deno.test("the GPT and each FAT window are spliced without touching their neighb
       Number(offsets[1]) > 0 && Number(offsets[1]) < DISK_BYTES,
       `backup GPT offset ${offsets[1]} is not inside the disk`,
     );
-    // vvfat's own MBR is stripped by a window at 32256, so the partition type
-    // byte is the GPT's rather than vvfat's 0x06.
-    // The vvfat MBR strip moved OFF the window write: build() now reads vvfat
-    // into a raw scratch file (so the FAT creation timestamps can be pinned
-    // before publication), then splices that file into the window.
-    const fatRead = rig.fake.converts.find((c) =>
-      c.sourceIsGraph === true && c.destIsGraph !== true
+    // Nothing reads an option graph any more: through 0.2.1 the FAT came from
+    // a `vvfat` source node opened at `offset=32256` to strip vvfat's own MBR,
+    // landed in a scratch raw so its timestamps could be rewritten, and only
+    // then reached the window. Now the only converts are the base image and
+    // three window writes.
+    assert(
+      rig.fake.converts.every((c) =>
+        c.sourceIsGraph !== true || c.destIsGraph === true
+      ),
+      "no convert reads an option graph: the FAT is bytes, not a driver",
     );
-    assert(fatRead !== undefined, "vvfat is read into a raw scratch file");
-    assertStringIncludes(fatRead.raw.args.join(" "), "offset=32256");
-    assertStringIncludes(fatRead.raw.args.join(" "), "driver=vvfat");
-    assertEquals(
-      windows[2].sources,
-      [fatRead.dest],
-      "the FAT window is spliced from the normalized raw, not from vvfat",
+    assert(
+      !rig.fake.converts.some((c) => c.raw.args.join(" ").includes("vvfat")),
+      "qemu is never asked for vvfat",
+    );
+    const fatSource = windows[2].sources[0];
+    assert(
+      typeof fatSource === "string" && fatSource.startsWith(rig.scratch),
+      `the FAT window is spliced from a file this package wrote into its own ` +
+        `scratch directory (got ${JSON.stringify(fatSource)})`,
     );
   } finally {
     await Deno.remove(root, { recursive: true });
@@ -951,7 +896,13 @@ Deno.test("layers before an unavailable guest step still build, publish and cach
     // nothing.
     const stored = await rig.store.list();
     assertEquals(stored.length, 2);
-    assertEquals(stored[0].parentRealizationKey, undefined);
+    // By predicate, not by index: `list()` walks the store's own directory
+    // order, which follows the keys and moves whenever a layer's bytes do.
+    assertEquals(
+      stored.filter((layer) => layer.parentRealizationKey === undefined).length,
+      1,
+      "exactly one of the two is the base, and the other backs onto it",
+    );
   } finally {
     await Deno.remove(root, { recursive: true });
   }
@@ -1143,20 +1094,22 @@ Deno.test("copyIn refuses a tree edited between resolving and building", async (
   }
 });
 
-Deno.test("the FAT spliced into the window has pinned creation timestamps", async () => {
+Deno.test("the FAT spliced into the window is a real volume, timestamps pinned", async () => {
   const root = await scratchDir();
   try {
     const rig = rigOn(root);
-    // Snapshot the raw at the moment build() splices it into the window —
-    // after normalizeFatTimestamps has run, before the scratch file is
-    // removed. Nothing else proves build() calls the normalizer at all.
+    // Snapshot the file at the moment build() splices it into the window,
+    // before the scratch file is removed.
     let spliced: Uint8Array | undefined;
-    const inner = rig.fake.onConvert!;
     rig.fake.onConvert = (convert) => {
       if (convert.destIsGraph === true && convert.sourceIsGraph !== true) {
-        spliced = Deno.readFileSync(convert.sources[0]);
+        const source = convert.sources[0];
+        const bytes = Deno.readFileSync(source);
+        // The GPT halves go through the same call; the FAT one is the only
+        // source the size of the partition.
+        if (bytes.byteLength === FAT12_BYTES) spliced = bytes;
       }
-      return inner(convert);
+      return undefined;
     };
     const resolved = resolveOf(blankRecipe([partitionStep(false)]));
     await build(await plan(resolved, { appliance: APPLIANCE }), resolved, {
@@ -1167,15 +1120,42 @@ Deno.test("the FAT spliced into the window has pinned creation timestamps", asyn
     });
 
     assert(spliced !== undefined, "the FAT window was spliced from a file");
-    const entry = 3 * 512; // the single root-directory entry
+    // The WHOLE window, because on a qcow2 overlay an unwritten cluster reads
+    // through to the backing file.
+    assertEquals(spliced.byteLength, FAT12_BYTES);
+    const geometry = describeFat(spliced);
+    assertEquals(geometry.fatType, 12, "the type the BPB actually implies");
+    assertEquals(geometry.reservedSectors, 1, "the spec's BPB_RsvdSecCnt");
+
+    // Walk the root directory and find the staged file, by the name it was
+    // staged under rather than by a fixed offset.
+    const rootAt = (geometry.reservedSectors +
+      geometry.numFats * geometry.fatSectors) * 512;
     const view = new DataView(spliced.buffer, spliced.byteOffset);
-    // sourceDateEpoch 1700000000 in FAT's packed form. These are the same
-    // values vvfat writes for DIR_WrtTime/DIR_WrtDate from a pinned mtime, so
-    // created and written times agree rather than merely both being stable.
-    assertEquals(view.getUint16(entry + 14, true), 0xb1aa, "DIR_CrtTime");
-    assertEquals(view.getUint16(entry + 16, true), 0x576e, "DIR_CrtDate");
-    assertEquals(view.getUint16(entry + 18, true), 0x576e, "DIR_LstAccDate");
-    assertEquals(spliced[entry + 13], 0, "DIR_CrtTimeTenth");
+    const decoder = new TextDecoder();
+    let efi: number | undefined;
+    for (
+      let at = rootAt;
+      at < rootAt + geometry.rootEntryCount * 32;
+      at += 32
+    ) {
+      if (decoder.decode(spliced.subarray(at, at + 11)) === "EFI        ") {
+        efi = at;
+        break;
+      }
+    }
+    assert(efi !== undefined, "the EFI directory is in the root");
+    // sourceDateEpoch 1700000000 in FAT's packed form, in every time field.
+    // Through 0.2.1 the created and written times came from two different
+    // places — vvfat read the host's `st_ctime` for one of them, which no
+    // userspace call can pin — and closing the gap took a staging copy plus a
+    // post-hoc rewrite of the finished filesystem.
+    assertEquals(view.getUint16(efi + 14, true), 0xb1aa, "DIR_CrtTime");
+    assertEquals(view.getUint16(efi + 16, true), 0x576e, "DIR_CrtDate");
+    assertEquals(view.getUint16(efi + 18, true), 0x576e, "DIR_LstAccDate");
+    assertEquals(view.getUint16(efi + 22, true), 0xb1aa, "DIR_WrtTime");
+    assertEquals(view.getUint16(efi + 24, true), 0x576e, "DIR_WrtDate");
+    assertEquals(spliced[efi + 13], 0, "DIR_CrtTimeTenth");
   } finally {
     await Deno.remove(root, { recursive: true });
   }

@@ -30,7 +30,6 @@ import {
   type ResolvedInput,
   resolveRecipe,
   type Step,
-  VVFAT_USABLE_BYTES,
 } from "../../src/recipe/mod.ts";
 import {
   copyInScript,
@@ -111,7 +110,7 @@ function recipeWith(...steps: Step[]): Recipe {
           {
             label: "EFI",
             type: "esp",
-            size: VVFAT_USABLE_BYTES[16],
+            size: 33 * 1024 * 1024,
             contents: {
               kind: "fat",
               fatType: 16,

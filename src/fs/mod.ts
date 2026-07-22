@@ -9,11 +9,20 @@
  */
 
 export {
+  buildFat,
+  CLUSTER_COUNT_THRESHOLDS,
+  describeFat,
   DIR_ENTRY_BYTES,
-  FatLayoutError,
-  type FatTimestampOptions,
-  type FatTimestampReport,
-  normalizeFatTimestamps,
+  type FatEntry,
+  FatEntryError,
+  type FatEntryShape,
+  fatEntryShapes,
+  type FatGeometry,
+  FatGeometryError,
+  fatGeometryFor,
+  type FatOptions,
+  minimumFatSizeBytes,
+  SECTOR_BYTES,
 } from "./fat.ts";
 
 export {

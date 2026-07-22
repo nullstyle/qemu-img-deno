@@ -13,8 +13,8 @@
  *
  * The host this package targets has the whole qemu suite and *no* Linux image
  * tooling — no `mke2fs`, no `sgdisk`, no loop devices, no root. Partition
- * tables and FAT filesystems can be produced host-side (qemu's `vvfat` driver
- * plus `raw` offset/size windows, see `qemu_img_smoke.ts`), but ext4 cannot:
+ * tables and FAT filesystems are produced host-side (this package writes both
+ * as bytes, spliced through `raw` offset/size windows), but ext4 cannot be:
  * it needs a Linux kernel executing target-architecture ELF. So ext4 and
  * package installs happen inside a throwaway guest, and the guest brings its
  * own `e2fsck` — the oracle that makes the result checkable.
