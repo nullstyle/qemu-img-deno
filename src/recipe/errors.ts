@@ -25,16 +25,137 @@ export interface UnrepresentableEntry {
   readonly reason: CapabilityTrait;
 }
 
+/**
+ * Why `plan()` refused, as a stable machine-readable token.
+ *
+ * `RecipePlanError` covers two dozen unrelated causes, and before this existed
+ * the only way to tell them apart was to match on `message` — which couples
+ * every caller's control flow to prose this package rewrites whenever a
+ * measurement improves. These values do not change with the wording; a member
+ * is only ever added, or removed in a major bump.
+ */
+export type RecipePlanErrorCode =
+  /** `platform.machine` is an unversioned alias like `"virt"`. */
+  | "unversioned-machine"
+  /** Two steps share an `id`. */
+  | "duplicate-step-id"
+  /** A step id contains `:`, which the planner reserves for generated layers. */
+  | "reserved-step-id-separator"
+  /** Two partitions share a `label`, so their derived GUIDs collide. */
+  | "duplicate-partition-label"
+  /** A recipe declares more than one `partition` step. */
+  | "multiple-partition-tables"
+  /** `base.rootPartition` is below 1; GPT partition numbers are 1-based. */
+  | "root-partition-out-of-range"
+  /** A `partition` step would lay a new GPT over an existing base image. */
+  | "partition-over-image-base"
+  /** A `run` or `copyIn` step has no single unambiguous root filesystem. */
+  | "ambiguous-root-filesystem"
+  /** `firstPartitionOffset` is negative, fractional, or unaligned. */
+  | "invalid-first-partition-offset"
+  /** A partition `size` is not a positive whole number of bytes. */
+  | "invalid-partition-size"
+  /** A partition uses `"rest"` but is not the last one declared. */
+  | "rest-not-last"
+  /** A partition has no room left on the declared disk. */
+  | "partition-no-room"
+  /** A partition would overrun the GPT's backup header. */
+  | "partition-past-last-usable-lba"
+  /** A FAT volume label exceeds 11 bytes. */
+  | "fat-label-too-long"
+  /** A FAT partition is smaller than vvfat's fixed geometry. */
+  | "fat-window-too-small"
+  /** A FAT partition is larger than vvfat's fixed geometry. */
+  | "fat-window-too-large"
+  /** An ext4 partition declares a `from` staging tree it cannot carry. */
+  | "ext4-staging-tree"
+  /** A `copyIn` destination is not an absolute, normalized path. */
+  | "copyin-destination"
+  /** A `copyIn` payload holds a file larger than a ustar size field. */
+  | "copyin-file-too-large"
+  /** `boot` is `"uefi-removable"` but no partition has type `"esp"`. */
+  | "missing-esp"
+  /** The ESP holds something other than FAT. */
+  | "esp-not-fat"
+  /** The ESP staging tree lacks the architecture's EFI fallback binary. */
+  | "missing-efi-fallback"
+  /** A guest step was planned with no appliance identity. */
+  | "appliance-required"
+  /** The appliance's architecture disagrees with `platform.arch`. */
+  | "appliance-arch-mismatch";
+
 /** A recipe is statically wrong. Thrown by `plan()`, before any I/O. */
 export class RecipePlanError extends Error {
   /** The offending step's id, or `"recipe"` for a whole-recipe problem. */
   readonly stepId: string;
+  /** Which refusal this is, independent of the message's wording. */
+  readonly code: RecipePlanErrorCode;
 
   /** Build the error; `detail` must name the fix, not just the problem. */
-  constructor(stepId: string, detail: string) {
+  constructor(stepId: string, code: RecipePlanErrorCode, detail: string) {
     super(`${stepId}: ${detail}`);
     this.name = "RecipePlanError";
     this.stepId = stepId;
+    this.code = code;
+  }
+}
+
+/**
+ * A declared input could not be read, named against the recipe that declared it.
+ *
+ * `resolveRecipe` is the only I/O before planning, and its failures used to
+ * surface as whatever `Deno.readFile` or `Deno.readDir` threw: `NotFound: No
+ * such file or directory (os error 2): readdir './esp'`. That names an errno
+ * and a path, and nothing about which step, which field, or which of the two
+ * input kinds was expected — so a `dir("./esp")` typo in a recipe with four
+ * staging trees left the reader diffing paths by hand.
+ *
+ * It stays separate from {@linkcode RecipePlanError} because the two answer
+ * different questions: this one means the recipe may be perfectly well-formed
+ * and the filesystem does not match it, which is a different fix from a recipe
+ * that is statically wrong.
+ */
+export class InputResolutionError extends Error {
+  /** The declaring step's id, or `"recipe"` for `base.from`. */
+  readonly stepId: string;
+  /** Where in the recipe it was declared, e.g. `steps[0].from`. */
+  readonly field: string;
+  /** The path as declared, unmodified. */
+  readonly path: string;
+  /** Which input kind the recipe asked for. */
+  readonly inputKind: "file" | "dir";
+
+  /** Build the error, turning the host's failure into recipe coordinates. */
+  constructor(
+    stepId: string,
+    field: string,
+    inputKind: "file" | "dir",
+    path: string,
+    cause: unknown,
+  ) {
+    const what = inputKind === "dir" ? "directory" : "file";
+    const detail = cause instanceof Deno.errors.NotFound
+      ? `no such ${what}`
+      : cause instanceof Deno.errors.NotADirectory
+      ? "that path is a file, and this input is declared as a directory"
+      : cause instanceof Deno.errors.IsADirectory
+      ? "that path is a directory, and this input is declared as a file"
+      : cause instanceof Error
+      ? cause.message
+      : String(cause);
+    super(
+      `${stepId}: ${field} declares the ${what} ${JSON.stringify(path)}, ` +
+        `which could not be read — ${detail}. Every declared input is hashed ` +
+        "into the cache key before anything is built, so this is resolved " +
+        `against the process's working directory, not the recipe's file. Fix ` +
+        `the path, or create the ${what} it names.`,
+      { cause },
+    );
+    this.name = "InputResolutionError";
+    this.stepId = stepId;
+    this.field = field;
+    this.path = path;
+    this.inputKind = inputKind;
   }
 }
 

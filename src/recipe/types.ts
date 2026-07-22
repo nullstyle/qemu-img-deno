@@ -90,11 +90,16 @@ export type FilesystemSpec =
      * FAT synthesized by qemu's `vvfat` driver from a host directory.
      *
      * vvfat's geometry is FIXED and content-independent: `fatType: 16` yields
-     * exactly 528450048 usable bytes, `fatType: 12` yields 33005568. A
-     * smaller partition is refused at plan time with the exact figure.
-     * `fatType: 32` is refused outright — qemu's vvfat FAT32 output is a
-     * FAT16-shaped BPB with a doubled allocation table, which conformant
-     * drivers misread.
+     * exactly 528450048 usable bytes, `fatType: 12` yields 32997888. The
+     * partition must be that size EXACTLY, and both directions are refused at
+     * plan time with the figures — a smaller window truncates a filesystem
+     * whose BPB claims the full size, and a larger one is a window qemu-img
+     * refuses to open at all. `fatType: 32` is refused outright — qemu's vvfat
+     * FAT32 output is a FAT16-shaped BPB with a doubled allocation table,
+     * which conformant drivers misread.
+     *
+     * A consequence worth stating: neither figure is a multiple of 4096, so a
+     * FAT partition cannot be laid out on a `sectorSize: 4096` disk at all.
      */
     readonly kind: "fat";
     readonly from: DirInput;
@@ -126,7 +131,20 @@ export interface PartitionSpec {
   readonly label: string;
   /** Partition type. */
   readonly type: PartitionType;
-  /** Size in bytes, or `"rest"` to fill the remaining space. */
+  /**
+   * Size in bytes, or `"rest"` to fill the remaining space.
+   *
+   * Deliberately NOT named `sizeBytes`, unlike {@linkcode BaseSpec}'s
+   * `sizeBytes` and `virtualSizeBytes`. It is a size *specification* rather
+   * than a byte count, and a name promising bytes would be a lie in the
+   * `"rest"` case — the direction this package refuses everywhere else. The
+   * three names were weighed against a unifying rename and kept: the base's
+   * two are also not interchangeable, since `virtualSizeBytes` is an assertion
+   * about a file that already exists and is explicitly not its size on disk.
+   *
+   * A byte count here is rounded UP to the sector size, so the partition is
+   * never smaller than asked. A `"rest"` partition must be the last declared.
+   */
   readonly size: number | "rest";
   /** Contents. */
   readonly contents: FilesystemSpec;
@@ -193,7 +211,13 @@ export type Step =
 export type BaseSpec =
   | {
     readonly kind: "blank";
-    /** Virtual size in bytes. */
+    /**
+     * Virtual size in bytes of the qcow2 to create.
+     *
+     * The `"image"` arm spells the same quantity `virtualSizeBytes`, because
+     * there the number is an assertion about a file that already exists rather
+     * than an instruction — see that field.
+     */
     readonly sizeBytes: number;
     /**
      * qcow2 creation options. `cluster_size` is a cache-key input rather than

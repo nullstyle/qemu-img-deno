@@ -20,6 +20,7 @@ import type {
   FilesystemSpec,
   GuestArch,
   PartitionSpec,
+  Recipe,
   ResolvedInput,
   ResolvedRecipe,
   Step,
@@ -29,13 +30,37 @@ import type {
 export type Executor = "image" | "bytes" | "guest";
 
 /**
- * vvfat's usable byte count per FAT type. The geometry is fixed and
- * content-independent — a directory of one file and a directory of a thousand
- * both yield exactly this — so a partition smaller than it truncates a
- * filesystem whose BPB claims the full size.
+ * vvfat's usable byte count per FAT type — the size a FAT partition must be,
+ * exactly.
+ *
+ * The geometry is fixed and content-independent: a tree of one 4-byte file and
+ * a tree of 200 64 KiB files both yield the same numbers, measured on qemu-img
+ * 11.0.2. vvfat presents a whole disk with its own MBR, and `build()` splices
+ * the window past it (LBA 63, 32256 bytes), so these are the device size less
+ * that offset — and they are also exactly what the synthesized BPB's
+ * `totalSectors` claims:
+ *
+ * | fatType | vvfat device | MBR partition entry     | BPB totalSectors |
+ * | ------- | ------------ | ----------------------- | ---------------- |
+ * | 12      | 33030144     | LBA 63, 64449 sectors   | 64449            |
+ * | 16      | 528482304    | LBA 63, 1032129 sectors | 1032129          |
+ *
+ * BOTH directions are refused, and the reasons differ. A SMALLER partition
+ * truncates a filesystem whose BPB claims the full size. A LARGER one does not
+ * merely waste the tail: `build()` opens the source as
+ * `raw,offset=32256,size=<partition length>` over the vvfat node, and qemu-img
+ * refuses to open that at all — "The sum of offset (32256) and size (…) has to
+ * be smaller or equal to the actual size of the containing file (…)".
+ *
+ * BREAKING: `12` was `33005568` through 0.2.1, which is the device size less
+ * 24576 rather than less 32256 — 7680 bytes too many. A recipe that sized a
+ * FAT12 partition with this very constant therefore passed `plan()` and then
+ * failed in `build()` with that raw qemu error, which is the failure this
+ * refusal exists to prevent. No working cache entry moves: every recipe the old
+ * value admitted and the new one rejects was unbuildable.
  */
 export const VVFAT_USABLE_BYTES: Readonly<Record<12 | 16, number>> = {
-  12: 33_005_568,
+  12: 32_997_888,
   16: 528_450_048,
 };
 
@@ -172,6 +197,28 @@ export interface Plan {
   explain(): string;
 }
 
+/**
+ * The appliance identity {@linkcode plan} needs for a guest step.
+ *
+ * `ApplianceIdentity` from `./system` satisfies this structurally, which is the
+ * point: the planner reads only these two fields, so it does not import the
+ * guest tier and the tier stays substitutable.
+ */
+export interface PlanAppliance {
+  /** Digest over every field of the appliance's identity. */
+  readonly digest: string;
+  /**
+   * The architecture the appliance executes.
+   *
+   * Required, and checked against `platform.arch`. Without it a plan accepts
+   * an x86_64 appliance for an aarch64 recipe and runs every guest step on the
+   * wrong architecture — `mke2fs` still writes a filesystem, `run` scripts
+   * still exit 0, and the artifact is a plausible image whose ELF the target
+   * machine cannot execute.
+   */
+  readonly arch: GuestArch;
+}
+
 /** Options for {@linkcode plan}. */
 export interface PlanOptions {
   /**
@@ -184,10 +231,39 @@ export interface PlanOptions {
    * different toolchain under a key that claims they match. Obtain it with
    * `readApplianceIdentity()` from `./system`.
    */
-  readonly appliance?: {
-    /** Digest over every field of the appliance's identity. */
-    readonly digest: string;
-  };
+  readonly appliance?: PlanAppliance;
+}
+
+/**
+ * The appliance a guest step will run on, refusing the two ways it can be wrong.
+ *
+ * Both refusals live here rather than at the call sites so the `<id>` and
+ * `<id>:mkfs` layers of one declared step cannot end up judging the appliance
+ * differently.
+ */
+function requireAppliance(
+  stepId: string,
+  arch: GuestArch,
+  options: PlanOptions,
+): PlanAppliance {
+  const appliance = options.appliance;
+  if (appliance === undefined) {
+    throw new RecipePlanError(stepId, "appliance-required", APPLIANCE_REQUIRED);
+  }
+  if (appliance.arch !== arch) {
+    throw new RecipePlanError(
+      stepId,
+      "appliance-arch-mismatch",
+      `this step runs in the build appliance, which is ${appliance.arch}, ` +
+        `but the recipe targets ${arch}. The appliance executes the step's ` +
+        `binaries, so the layer would be built by ${appliance.arch} tools for ` +
+        `an ${arch} image — and nothing downstream notices: mke2fs writes a ` +
+        "valid filesystem either way, and a `run` script exits 0. Plan with " +
+        `\`readApplianceIdentity({ arch: "${arch}" })\`, or change ` +
+        "`platform.arch` to match the appliance you have.",
+    );
+  }
+  return appliance;
 }
 
 function sectorSizeOf(resolved: ResolvedRecipe): number {
@@ -219,11 +295,19 @@ function planLayout(
   const total = totalSizeBytes(resolved);
   const totalSectors = Math.floor(total / sector);
   const firstOffset = step.firstPartitionOffset ?? 1024 * 1024;
-  if (firstOffset % sector !== 0) {
+  // `% sector` alone let `-1048576` through: it leaves `-0`, which is not
+  // `!== 0`, and `Math.max` below then quietly used LBA 34 instead.
+  if (
+    !Number.isSafeInteger(firstOffset) || firstOffset < 0 ||
+    firstOffset % sector !== 0
+  ) {
     throw new RecipePlanError(
       step.id,
-      `firstPartitionOffset ${firstOffset} is not a multiple of the ` +
-        `${sector}-byte sector size`,
+      "invalid-first-partition-offset",
+      `firstPartitionOffset is ${firstOffset}; it must be a non-negative ` +
+        `whole number of bytes and a multiple of the ${sector}-byte sector ` +
+        "size. Round it to a sector boundary — 1048576 is the 1 MiB alignment " +
+        "every modern producer emits.",
     );
   }
   const firstUsable = Math.max(GPT_HEAD_SECTORS, firstOffset / sector);
@@ -236,13 +320,32 @@ function planLayout(
     if (partition.size === "rest" && !isLast) {
       throw new RecipePlanError(
         step.id,
-        `partition "${partition.label}" uses "rest" but is not last`,
+        "rest-not-last",
+        `partition "${partition.label}" uses "rest" but is not last. Only the ` +
+          "final partition can take the remaining space; move it last, or " +
+          "give it a byte count.",
       );
     }
     let lengthSectors: number;
     if (partition.size === "rest") {
       lengthSectors = lastUsable - cursor + 1;
     } else {
+      // Every guard below is arithmetic on this number, and NaN or Infinity
+      // passes all of them: `Math.ceil(NaN)` is NaN, `NaN <= 0` is false, and
+      // `NaN > lastUsable` is false. The value reached `canonicalJson`, which
+      // threw `TypeError: canonicalJson: non-finite number at $.payload…` —
+      // an internal detail of the key scheme naming nothing the caller wrote.
+      if (!Number.isSafeInteger(partition.size) || partition.size <= 0) {
+        throw new RecipePlanError(
+          step.id,
+          "invalid-partition-size",
+          `partition "${partition.label}" declares size ${partition.size}; a ` +
+            "partition size must be a positive whole number of bytes below " +
+            `2^53, or the string "rest" to fill what is left. Give it a byte ` +
+            "count — a computed size that came out NaN usually means a unit " +
+            "multiplication with an undefined operand.",
+        );
+      }
       // Round UP: rounding down would silently hand back a partition smaller
       // than the caller asked for, which is the failure class this refuses.
       lengthSectors = Math.ceil(partition.size / sector);
@@ -250,8 +353,10 @@ function planLayout(
     if (lengthSectors <= 0) {
       throw new RecipePlanError(
         step.id,
+        "partition-no-room",
         `partition "${partition.label}" has no room left on a ` +
-          `${total}-byte disk`,
+          `${total}-byte disk. Grow \`base.sizeBytes\`, or shrink the ` +
+          "partitions declared ahead of it.",
       );
     }
     const lastLba = cursor + lengthSectors - 1;
@@ -259,9 +364,11 @@ function planLayout(
       const overBytes = (lastLba - lastUsable) * sector;
       throw new RecipePlanError(
         step.id,
+        "partition-past-last-usable-lba",
         `partition "${partition.label}" runs ${overBytes} bytes past the last ` +
           `usable LBA (${lastUsable}). A GPT reserves the final ` +
-          `${GPT_TAIL_SECTORS} sectors for its backup header.`,
+          `${GPT_TAIL_SECTORS} sectors for its backup header. Shrink it by ` +
+          `${overBytes} bytes, or grow the disk by at least that much.`,
       );
     }
     validateContents(step.id, partition, lengthSectors * sector, resolved);
@@ -286,23 +393,50 @@ function validateContents(
   lengthBytes: number,
   resolved: ResolvedRecipe,
 ): void {
+  const sectorSize = sectorSizeOf(resolved);
   const contents = partition.contents;
   if (contents.kind === "fat") {
     if (new TextEncoder().encode(contents.label).byteLength > 11) {
       throw new RecipePlanError(
         stepId,
-        `FAT label "${contents.label}" exceeds 11 bytes`,
+        "fat-label-too-long",
+        `FAT label "${contents.label}" exceeds 11 bytes, which is the whole ` +
+          "volume-label field in a FAT boot sector. Shorten it to 11 bytes.",
       );
     }
     const required = VVFAT_USABLE_BYTES[contents.fatType];
+    const fixed = `vvfat's FAT${contents.fatType} geometry is fixed at ` +
+      `${required} bytes regardless of content`;
     if (lengthBytes < required) {
       throw new RecipePlanError(
         stepId,
-        `partition "${partition.label}" is ${lengthBytes} bytes, but vvfat's ` +
-          `FAT${contents.fatType} geometry is fixed at ${required} bytes ` +
-          "regardless of content. A smaller window truncates a filesystem " +
-          `whose BPB claims the full size. Grow the partition to ${required} ` +
-          "bytes or more.",
+        "fat-window-too-small",
+        `partition "${partition.label}" is ${lengthBytes} bytes, but ${fixed}. ` +
+          "A smaller window truncates a filesystem whose BPB claims the full " +
+          `size. Grow the partition to exactly ${required} bytes.`,
+      );
+    }
+    if (lengthBytes > required) {
+      // The other side was never a refusal, so it landed in build() as
+      // qemu-img's own words about a `raw` node it could not open: "The sum of
+      // offset (32256) and size (…) has to be smaller or equal to the actual
+      // size of the containing file (…)" — three numbers, none of them the
+      // partition the recipe declared.
+      const sectorNote = required % sectorSize === 0
+        ? `Shrink the partition to exactly ${required} bytes.`
+        : `And ${required} is not a multiple of this recipe's ` +
+          `${sectorSize}-byte sector size, so no \`size\` can land on it: a ` +
+          `vvfat FAT${contents.fatType} filesystem cannot be laid out on a ` +
+          `${sectorSize}-byte-sector disk at all. Use \`sectorSize: 512\`, or ` +
+          "build this partition's filesystem some other way.";
+      throw new RecipePlanError(
+        stepId,
+        "fat-window-too-large",
+        `partition "${partition.label}" is ${lengthBytes} bytes, ` +
+          `${lengthBytes - required} more than ${fixed}. build() splices the ` +
+          "filesystem through a `raw` window of exactly the partition's " +
+          "length over the vvfat node, and qemu-img refuses to open a window " +
+          `past the end of what vvfat synthesized. ${sectorNote}`,
       );
     }
   }
@@ -313,6 +447,7 @@ function validateContents(
     if ("from" in contents) {
       throw new RecipePlanError(
         stepId,
+        "ext4-staging-tree",
         `partition "${partition.label}" declares ext4 contents with a ` +
           "`from` tree, but the layer that creates an ext4 filesystem formats " +
           "it and nothing else. The tree would be dropped, leaving a " +
@@ -430,6 +565,7 @@ function validateCopyIn(
   if (bad) {
     throw new RecipePlanError(
       step.id,
+      "copyin-destination",
       `copyIn "to" must be an absolute, normalized path inside the image's ` +
         `root filesystem (got ${JSON.stringify(to)}). A relative or ` +
         "`..`-bearing path would resolve against whatever the guest's working " +
@@ -450,10 +586,51 @@ function validateCopyIn(
   if (huge !== undefined) {
     throw new RecipePlanError(
       step.id,
+      "copyin-file-too-large",
       `${huge.path} is ${huge.sizeBytes} bytes; a ustar size field holds at ` +
         `most ${USTAR_MAX_SIZE_BYTES}. Split the file, or deliver it out of ` +
         "band and reference it from a `run` step.",
     );
+  }
+}
+
+/**
+ * Refuse two partitions sharing a `label`.
+ *
+ * The label is not decoration: every identity a partition gets is derived from
+ * it by hashing, so two that share one are not merely confusing, they are
+ * indistinguishable. `build()` computes the GPT `uniqueGuid` as
+ * `deriveGuid(guidSeed, "partition:" + label)`, and an ext4 window's volume
+ * UUID and hash seed as `deriveGuid(fsSeed, "fs:" + label)` and
+ * `"hash:" + label`. A duplicate therefore mints one PARTUUID for two
+ * partitions — so `/dev/disk/by-partuuid` and a `root=PARTUUID=` kernel
+ * argument resolve to whichever the kernel enumerated last — and, for two ext4
+ * windows, one filesystem UUID as well, which `blkid` and `/etc/fstab` cannot
+ * tell apart either. Nothing downstream fails: the image builds, mounts and
+ * boots, from an arbitrary one of the two.
+ */
+function refuseDuplicatePartitionLabels(recipe: Recipe): void {
+  for (const step of recipe.steps) {
+    if (step.kind !== "partition") continue;
+    const seen = new Set<string>();
+    for (const partition of step.partitions) {
+      if (!seen.has(partition.label)) {
+        seen.add(partition.label);
+        continue;
+      }
+      throw new RecipePlanError(
+        step.id,
+        "duplicate-partition-label",
+        `two partitions are labelled "${partition.label}". Every identity a ` +
+          "partition gets is derived from that label by hashing — its GPT " +
+          "PARTUUID, and for ext4 its volume UUID and hash seed — so both " +
+          "would be minted identical, and `/dev/disk/by-partuuid`, `blkid` " +
+          "and a `root=PARTUUID=` argument would each resolve to whichever " +
+          "the kernel enumerated last. The image would still build, mount " +
+          "and boot, from an arbitrary one of the two. Give them distinct " +
+          "labels; a partition label may be up to 36 UTF-16 code units.",
+      );
+    }
   }
 }
 
@@ -464,6 +641,7 @@ function validateRecipe(resolved: ResolvedRecipe): void {
   if (machine !== undefined && !/-\d+\.\d+$/.test(machine)) {
     throw new RecipePlanError(
       "recipe",
+      "unversioned-machine",
       `machine "${machine}" is an unversioned alias. It resolves to whatever ` +
         "the installed qemu calls current and moves on the next upgrade — " +
         "changing ACPI tables and device enumeration while the cache key, " +
@@ -473,18 +651,25 @@ function validateRecipe(resolved: ResolvedRecipe): void {
   const ids = new Set<string>();
   for (const step of recipe.steps) {
     if (ids.has(step.id)) {
-      throw new RecipePlanError(step.id, "duplicate step id");
+      throw new RecipePlanError(
+        step.id,
+        "duplicate-step-id",
+        "duplicate step id. Step ids name layers, so two steps sharing one " +
+          "cannot be told apart in a plan, a store or a build log. Rename one.",
+      );
     }
     ids.add(step.id);
     if (step.id.includes(":")) {
       throw new RecipePlanError(
         step.id,
+        "reserved-step-id-separator",
         "`:` is reserved in step ids — the planner uses it to name layers it " +
           "generates, so a partition step carrying ext4 plans as `<id>` plus " +
           "`<id>:mkfs`. Rename the step.",
       );
     }
   }
+  refuseDuplicatePartitionLabels(recipe);
 
   const ext4Count = recipe.steps
     .filter((step) => step.kind === "partition")
@@ -497,14 +682,17 @@ function validateRecipe(resolved: ResolvedRecipe): void {
     if (recipe.base.rootPartition < 1) {
       throw new RecipePlanError(
         "recipe",
+        "root-partition-out-of-range",
         `base.rootPartition is ${recipe.base.rootPartition}; GPT partition ` +
-          "numbers are 1-based, and /dev/vda0 does not exist.",
+          "numbers are 1-based, and /dev/vda0 does not exist. Read the number " +
+          "off the image and declare that.",
       );
     }
     const laying = recipe.steps.find((step) => step.kind === "partition");
     if (laying !== undefined) {
       throw new RecipePlanError(
         laying.id,
+        "partition-over-image-base",
         "a partition step on an existing base image lays a new GPT over the " +
           "one the image already has, discarding every partition in it. Start " +
           'from `base: { kind: "blank" }` to own the layout, or drop this ' +
@@ -520,6 +708,7 @@ function validateRecipe(resolved: ResolvedRecipe): void {
     if (recipe.base.kind === "blank" && ext4Count !== 1) {
       throw new RecipePlanError(
         step.id,
+        "ambiguous-root-filesystem",
         `a ${step.kind} step mounts the recipe's root filesystem, and this ` +
           `recipe declares ${ext4Count} ext4 partitions. Declare exactly one, ` +
           'or start from `base: { kind: "image", rootPartition }` to name the ' +
@@ -537,13 +726,17 @@ function validateRecipe(resolved: ResolvedRecipe): void {
     if (esp === undefined) {
       throw new RecipePlanError(
         "recipe",
-        'boot is "uefi-removable" but no partition has type "esp"',
+        "missing-esp",
+        'boot is "uefi-removable" but no partition has type "esp". Declare ' +
+          'one, or set `boot: { kind: "none" }` if this is a data disk.',
       );
     }
     if (esp.contents.kind !== "fat") {
       throw new RecipePlanError(
         "recipe",
-        `the ESP holds ${esp.contents.kind}; UEFI requires FAT there`,
+        "esp-not-fat",
+        `the ESP holds ${esp.contents.kind}; UEFI firmware reads FAT and ` +
+          'nothing else there. Give it `contents: { kind: "fat", … }`.',
       );
     }
     const fallback = EFI_FALLBACK[recipe.platform.arch];
@@ -552,10 +745,12 @@ function validateRecipe(resolved: ResolvedRecipe): void {
     if (!has) {
       throw new RecipePlanError(
         "recipe",
+        "missing-efi-fallback",
         `the ESP staging tree has no ${fallback}. That is the only boot path ` +
           "independent of an NVRAM Boot#### entry — and NVRAM lives in a " +
           "per-run vars file outside the image, so an image that boots only " +
-          "because efibootmgr ran is not a reproducible artifact.",
+          `because efibootmgr ran is not a reproducible artifact. Stage the ` +
+          `bootloader at ${fallback}.`,
       );
     }
   }
@@ -620,7 +815,10 @@ export async function plan(
       if (layout !== undefined) {
         throw new RecipePlanError(
           step.id,
-          "a recipe declares one partition table",
+          "multiple-partition-tables",
+          "a recipe declares one partition table, and this is the second " +
+            "`partition` step. The later one would overwrite the earlier " +
+            "one's GPT. Merge their partitions into a single step.",
         );
       }
       layout = planLayout(step, resolved);
@@ -644,9 +842,9 @@ export async function plan(
       ? guestFilesystems(step)
       : [];
     const executor = executorOf(step);
-    if (executor === "guest" && options.appliance === undefined) {
-      throw new RecipePlanError(step.id, APPLIANCE_REQUIRED);
-    }
+    const stepAppliance = executor === "guest"
+      ? requireAppliance(step.id, recipe.platform.arch, options)
+      : undefined;
 
     const key = await recipeKey({
       stepKind: step.kind,
@@ -664,7 +862,9 @@ export async function plan(
       // Only guest layers carry it: their bytes depend on the appliance, and
       // folding it into a host-side layer's key would invalidate every cached
       // GPT and FAT for a toolchain they never touch.
-      ...(executor === "guest" ? { appliance: options.appliance?.digest } : {}),
+      ...(stepAppliance === undefined
+        ? {}
+        : { appliance: stepAppliance.digest }),
       // In the preimage so that uncacheability actually propagates, rather
       // than being asserted in prose and forgotten.
       ancestorUncacheable,
@@ -694,9 +894,11 @@ export async function plan(
     // so its realization key folds in the actual bytes of the GPT whose
     // partitions its kernel is about to parse.
     if (guestIndices.length === 0) continue;
-    if (options.appliance === undefined) {
-      throw new RecipePlanError(`${step.id}:mkfs`, APPLIANCE_REQUIRED);
-    }
+    const mkfsAppliance = requireAppliance(
+      `${step.id}:mkfs`,
+      recipe.platform.arch,
+      options,
+    );
     const partitionStep = step as Extract<Step, { kind: "partition" }>;
     const mkfsKey = await recipeKey({
       stepKind: "partition:mkfs",
@@ -719,7 +921,7 @@ export async function plan(
         machine: recipe.platform.machine ?? "",
       },
       determinism: recipe.determinism,
-      appliance: options.appliance.digest,
+      appliance: mkfsAppliance.digest,
       ancestorUncacheable,
     });
     steps.push({
