@@ -44,6 +44,33 @@ export interface StoredLayer {
   readonly containerSha256: string;
   /** The parent's container digest, for auditing. */
   readonly parentContainerSha256?: string;
+  /**
+   * The parent layer's key, absent on a base layer.
+   *
+   * Recorded so garbage collection can walk the chain without opening every
+   * image. A layer's qcow2 names its parent too — as a relative backing path —
+   * but reading that back means trusting the very file the collector is
+   * deciding whether to delete.
+   */
+  readonly parentRealizationKey?: RealizationKey;
+}
+
+/** A layer directory that another process is building right now. */
+export class LayerBusyError extends Error {
+  /** The contended key. */
+  readonly realizationKey: RealizationKey;
+
+  /** Build the error naming the layer and the wait that timed out. */
+  constructor(key: RealizationKey, waitedMs: number) {
+    super(
+      `layer ${key.slice(0, 12)} is being built by another process, and it ` +
+        `did not finish within ${waitedMs}ms. Guest layers boot a VM, so a ` +
+        "legitimate build can take a while — raise `lockTimeoutMs`, or find " +
+        "the stalled build. Nothing was written.",
+    );
+    this.name = "LayerBusyError";
+    this.realizationKey = key;
+  }
 }
 
 /** Raised when a cached layer's bytes no longer match its recorded digest. */
@@ -68,10 +95,19 @@ export class LayerIntegrityError extends Error {
 export class LayerStore {
   /** Root directory holding `layers/`. */
   readonly root: string;
+  /**
+   * How long {@linkcode begin} waits for another process's lock.
+   *
+   * Generous by default: a guest layer boots a VM, and a cross-architecture
+   * one runs under TCG at roughly a twelfth of native speed.
+   */
+  readonly lockTimeoutMs: number;
+  readonly #locks = new Map<RealizationKey, Deno.FsFile>();
 
   /** Open (and lazily create) a store rooted at `root`. */
-  constructor(root: string) {
+  constructor(root: string, options: { readonly lockTimeoutMs?: number } = {}) {
     this.root = root;
+    this.lockTimeoutMs = options.lockTimeoutMs ?? 600_000;
   }
 
   /** The published directory for a key. */
@@ -120,12 +156,163 @@ export class LayerStore {
     return stored;
   }
 
-  /** Begin a layer: a clean `.partial` sibling directory. */
+  /**
+   * Begin a layer: a clean `.partial` sibling directory, held under an
+   * exclusive advisory lock until {@linkcode publish} or {@linkcode abandon}.
+   *
+   * Without the lock, two builds that miss the same key both do the work and
+   * both publish — which for a guest layer means two VM boots for one result,
+   * and a window in which a reader sees the loser's bytes under the winner's
+   * key. The lock file lives OUTSIDE the `.partial` directory, because that
+   * directory is deleted and recreated here and a lock held on a deleted inode
+   * guards nothing.
+   */
   async begin(key: RealizationKey): Promise<string> {
-    const dir = this.partialDir(key);
-    await Deno.remove(dir, { recursive: true }).catch(() => {});
-    await Deno.mkdir(dir, { recursive: true });
-    return dir;
+    const lock = await this.#acquire(key);
+    this.#locks.set(key, lock);
+    try {
+      const dir = this.partialDir(key);
+      await Deno.remove(dir, { recursive: true }).catch(() => {});
+      await Deno.mkdir(dir, { recursive: true });
+      return dir;
+    } catch (error) {
+      await this.#release(key);
+      throw error;
+    }
+  }
+
+  /**
+   * Give up on an in-flight layer, releasing its lock and removing the
+   * `.partial` directory.
+   *
+   * A failed guest step leaves a half-written filesystem there. It can never
+   * be published — publishing is a rename that only `publish()` performs — but
+   * without this it would sit until the next `begin()` for the same key, still
+   * holding the lock in this process.
+   */
+  async abandon(key: RealizationKey): Promise<void> {
+    await Deno.remove(this.partialDir(key), { recursive: true }).catch(
+      () => {},
+    );
+    await this.#release(key);
+  }
+
+  /** Every published layer in the store. */
+  async list(): Promise<StoredLayer[]> {
+    const layers: StoredLayer[] = [];
+    for await (const entry of this.#entries()) {
+      const layer = await this.get(entry, { trust: true }).catch(() =>
+        undefined
+      );
+      if (layer !== undefined) layers.push(layer);
+    }
+    return layers;
+  }
+
+  /**
+   * Delete every layer not reachable from `keep`, and report what went.
+   *
+   * Reachability follows the backing chain, so keeping a leaf keeps every
+   * ancestor it reads through. This is the only safe rule: a qcow2 overlay is
+   * a delta against its parent, and deleting a parent leaves a child that
+   * opens with an error at best and reads someone else's clusters at worst.
+   *
+   * In-flight `.partial` directories are never collected — another process may
+   * hold one — and a layer whose lock cannot be taken is skipped rather than
+   * waited on.
+   */
+  async gc(
+    options: { readonly keep: readonly RealizationKey[] },
+  ): Promise<{ removed: RealizationKey[]; keptBytes: number }> {
+    const byKey = new Map<RealizationKey, StoredLayer>();
+    for (const layer of await this.list()) {
+      byKey.set(layer.realizationKey, layer);
+    }
+
+    const reachable = new Set<RealizationKey>();
+    const walk = (key: RealizationKey | undefined): void => {
+      while (key !== undefined && !reachable.has(key)) {
+        reachable.add(key);
+        key = byKey.get(key)?.parentRealizationKey;
+      }
+    };
+    for (const root of options.keep) walk(root);
+
+    const removed: RealizationKey[] = [];
+    let keptBytes = 0;
+    for (const [key, layer] of byKey) {
+      if (reachable.has(key)) {
+        keptBytes += await Deno.stat(layer.path).then((s) => s.size).catch(
+          () => 0,
+        );
+        continue;
+      }
+      const lock = await this.#tryAcquire(key);
+      if (lock === undefined) continue;
+      try {
+        await Deno.remove(this.layerDir(key), { recursive: true });
+        removed.push(key);
+      } finally {
+        lock.close();
+      }
+    }
+    return { removed, keptBytes };
+  }
+
+  async *#entries(): AsyncGenerator<RealizationKey> {
+    const root = `${this.root}/layers`;
+    try {
+      for await (const entry of Deno.readDir(root)) {
+        if (!entry.isDirectory || entry.name.endsWith(".partial")) continue;
+        // Directory names ARE realization keys; that is the store's whole
+        // addressing scheme.
+        yield entry.name as unknown as RealizationKey;
+      }
+    } catch {
+      // No store on disk yet is an empty store, not an error.
+    }
+  }
+
+  #lockPath(key: RealizationKey): string {
+    return `${this.root}/layers/${key}.lock`;
+  }
+
+  async #tryAcquire(key: RealizationKey): Promise<Deno.FsFile | undefined> {
+    await Deno.mkdir(`${this.root}/layers`, { recursive: true });
+    const file = await Deno.open(this.#lockPath(key), {
+      create: true,
+      write: true,
+      read: true,
+    });
+    // `tryLock`, never `lock`. The blocking form waits forever, which turns
+    // the timeout below into decoration and deadlocks a GC pass against any
+    // build that is holding the same key.
+    const held = await file.tryLock(true).catch(() => false);
+    if (!held) {
+      file.close();
+      return undefined;
+    }
+    return file;
+  }
+
+  async #acquire(key: RealizationKey): Promise<Deno.FsFile> {
+    const deadline = Date.now() + this.lockTimeoutMs;
+    for (;;) {
+      const held = await this.#tryAcquire(key);
+      if (held !== undefined) return held;
+      if (Date.now() >= deadline) {
+        throw new LayerBusyError(key, this.lockTimeoutMs);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+  }
+
+  async #release(key: RealizationKey): Promise<void> {
+    const held = this.#locks.get(key);
+    if (held === undefined) return;
+    this.#locks.delete(key);
+    held.close();
+    await Deno.remove(this.#lockPath(key)).catch(() => {});
   }
 
   /**
@@ -138,7 +325,12 @@ export class LayerStore {
   async publish(
     key: RealizationKey,
     recipeKey: RecipeKey,
-    parentContainerSha256?: string,
+    parent?: {
+      /** The parent's container digest. */
+      readonly containerSha256: string;
+      /** The parent's key, for garbage collection. */
+      readonly realizationKey: RealizationKey;
+    },
   ): Promise<StoredLayer> {
     const partial = this.partialDir(key);
     const imagePath = `${partial}/${IMAGE_NAME}`;
@@ -148,7 +340,10 @@ export class LayerStore {
       realizationKey: key,
       recipeKey,
       containerSha256,
-      ...(parentContainerSha256 === undefined ? {} : { parentContainerSha256 }),
+      ...(parent === undefined ? {} : {
+        parentContainerSha256: parent.containerSha256,
+        parentRealizationKey: parent.realizationKey,
+      }),
     };
     await Deno.writeTextFile(
       `${partial}/manifest.json`,
@@ -166,6 +361,7 @@ export class LayerStore {
     // reproduce, so the freshly built bytes are the ones to keep.
     await Deno.remove(published, { recursive: true }).catch(() => {});
     await Deno.rename(partial, published);
+    await this.#release(key);
     return { ...record, path: `${published}/${IMAGE_NAME}` };
   }
 }

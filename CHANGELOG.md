@@ -116,6 +116,18 @@ an ESP gets built on a machine with no `mkfs.fat`.
   partition step laid over an existing base image, and a guest step planned with
   no appliance identity.
 
+- `LayerStore` concurrency and garbage collection. `begin()` now takes an
+  exclusive advisory lock on the key and holds it until `publish()` or the new
+  `abandon()`; without it two builds that miss the same key both do the work —
+  for a guest layer, two VM boots for one result — and a reader can briefly see
+  the loser's bytes under the winner's key. `gc({ keep })` deletes every layer
+  not reachable from the given roots, following the backing chain so that
+  keeping a leaf keeps every ancestor it reads through; deleting a parent would
+  leave a child reading someone else's clusters. A contended layer is skipped,
+  never waited on, so a collection can never deadlock against a build. Manifests
+  gained `parentRealizationKey` to make that walk possible without opening every
+  image.
+
 ### Fixed
 
 - **`LayerStore.publish()` could never re-publish a key.** `rename` onto a

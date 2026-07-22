@@ -99,7 +99,12 @@ export {
 
 export { type Artifact, build, type BuildOptions } from "./build.ts";
 
-export { LayerIntegrityError, LayerStore, type StoredLayer } from "./store.ts";
+export {
+  LayerBusyError,
+  LayerIntegrityError,
+  LayerStore,
+  type StoredLayer,
+} from "./store.ts";
 
 export {
   EFI_FALLBACK,

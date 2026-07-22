@@ -398,95 +398,109 @@ export async function build(
     }
 
     const dir = await store.begin(key);
-    const imagePath = `${dir}/image.qcow2`;
-    if (parent === undefined) {
-      const base = resolved.recipe.base;
-      if (base.kind === "image") {
-        const info = await qemu.info(base.from.path, { format: base.format });
-        if (info.virtualSizeBytes !== base.virtualSizeBytes) {
-          throw new Error(
-            `base image ${base.from.path} has a virtual size of ` +
-              `${info.virtualSizeBytes} bytes; the recipe declares ` +
-              `${base.virtualSizeBytes}. Every partition LBA and the backup ` +
-              "GPT's position derive from that number, so planning against " +
-              "the wrong one lays out a disk that is not this one.",
-          );
+    let published: StoredLayer;
+    try {
+      const imagePath = `${dir}/image.qcow2`;
+      if (parent === undefined) {
+        const base = resolved.recipe.base;
+        if (base.kind === "image") {
+          const info = await qemu.info(base.from.path, { format: base.format });
+          if (info.virtualSizeBytes !== base.virtualSizeBytes) {
+            throw new Error(
+              `base image ${base.from.path} has a virtual size of ` +
+                `${info.virtualSizeBytes} bytes; the recipe declares ` +
+                `${base.virtualSizeBytes}. Every partition LBA and the backup ` +
+                "GPT's position derive from that number, so planning against " +
+                "the wrong one lays out a disk that is not this one.",
+            );
+          }
+          // Copied in, never referenced as a backing file. A backing reference
+          // would bake an absolute host path into a store layer and destroy the
+          // relocatability the store promises — and would leave the layer's
+          // content at the mercy of a file outside the store.
+          await qemu.convert(base.from.path, imagePath, {
+            sourceFormat: base.format,
+            format: "qcow2",
+            parallel: 1,
+          });
+        } else {
+          await qemu.create(imagePath, {
+            format: "qcow2",
+            size: base.sizeBytes,
+            ...(base.options === undefined ? {} : { options: base.options }),
+          });
         }
-        // Copied in, never referenced as a backing file. A backing reference
-        // would bake an absolute host path into a store layer and destroy the
-        // relocatability the store promises — and would leave the layer's
-        // content at the mercy of a file outside the store.
-        await qemu.convert(base.from.path, imagePath, {
-          sourceFormat: base.format,
-          format: "qcow2",
-          parallel: 1,
-        });
       } else {
+        // Relative, so the whole store stays relocatable — and resolvable from
+        // the same-depth `.partial` sibling both before and after the rename.
         await qemu.create(imagePath, {
           format: "qcow2",
-          size: base.sizeBytes,
-          ...(base.options === undefined ? {} : { options: base.options }),
+          backing: `../${parent.realizationKey}/image.qcow2`,
+          backingFormat: "qcow2",
         });
       }
-    } else {
-      // Relative, so the whole store stays relocatable — and resolvable from
-      // the same-depth `.partial` sibling both before and after the rename.
-      await qemu.create(imagePath, {
-        format: "qcow2",
-        backing: `../${parent.realizationKey}/image.qcow2`,
-        backingFormat: "qcow2",
-      });
-    }
 
-    if (step.executor === "bytes") {
-      const declared = resolved.recipe.steps[step.index];
-      if (declared?.kind === "partition" && plan.layout !== undefined) {
-        await runBytesLayer(
-          qemu,
+      if (step.executor === "bytes") {
+        const declared = resolved.recipe.steps[step.index];
+        if (declared?.kind === "partition" && plan.layout !== undefined) {
+          await runBytesLayer(
+            qemu,
+            imagePath,
+            scratch,
+            declared,
+            plan.layout,
+            step.partitionIndices ?? plan.layout.map((_, i) => i),
+            resolved,
+          );
+        }
+      } else if (step.executor === "guest") {
+        const { script, data } = await guestWork(step, plan, resolved);
+        const declared = resolved.recipe.steps[step.index];
+        const result = await options.guest!.run({
+          stepId: step.id,
+          // The layer's own `.partial`, opened read-write. Never a published
+          // parent: qemu would open that read-write too, and every descendant
+          // already cached against it would be reading different bytes.
           imagePath,
-          scratch,
-          declared,
-          plan.layout,
-          step.partitionIndices ?? plan.layout.map((_, i) => i),
-          resolved,
-        );
+          script,
+          nonce: await stepNonce(key, step.id),
+          scratchDir: dir,
+          ...(data === undefined ? {} : { data }),
+          ...(declared?.kind === "run" && declared.network === true
+            ? { network: true }
+            : {}),
+          ...(sectorSize === 4096 ? { sectorSize } : {}),
+        });
+        // Four independent signals, because the guest's own exit code answers
+        // only the first of them: a step can return 0 over a filesystem that
+        // failed to unmount, that e2fsck rejects, or that the kernel logged I/O
+        // errors against. Any one of them means the layer must not be published.
+        const { outcome } = result;
+        if (
+          outcome.code !== 0 || outcome.umountRc !== 0 ||
+          (outcome.fsckRc ?? 0) !== 0 || outcome.dmesgErrors !== 0
+        ) {
+          throw new GuestStepFailedError(step.id, result);
+        }
       }
-    } else if (step.executor === "guest") {
-      const { script, data } = await guestWork(step, plan, resolved);
-      const declared = resolved.recipe.steps[step.index];
-      const result = await options.guest!.run({
-        stepId: step.id,
-        // The layer's own `.partial`, opened read-write. Never a published
-        // parent: qemu would open that read-write too, and every descendant
-        // already cached against it would be reading different bytes.
-        imagePath,
-        script,
-        nonce: await stepNonce(key, step.id),
-        scratchDir: dir,
-        ...(data === undefined ? {} : { data }),
-        ...(declared?.kind === "run" && declared.network === true
-          ? { network: true }
-          : {}),
-        ...(sectorSize === 4096 ? { sectorSize } : {}),
-      });
-      // Four independent signals, because the guest's own exit code answers
-      // only the first of them: a step can return 0 over a filesystem that
-      // failed to unmount, that e2fsck rejects, or that the kernel logged I/O
-      // errors against. Any one of them means the layer must not be published.
-      const { outcome } = result;
-      if (
-        outcome.code !== 0 || outcome.umountRc !== 0 ||
-        (outcome.fsckRc ?? 0) !== 0 || outcome.dmesgErrors !== 0
-      ) {
-        throw new GuestStepFailedError(step.id, result);
-      }
-    }
 
-    const published = await store.publish(
-      key,
-      step.recipeKey,
-      parent?.containerSha256,
-    );
+      published = await store.publish(
+        key,
+        step.recipeKey,
+        parent === undefined ? undefined : {
+          containerSha256: parent.containerSha256,
+          realizationKey: parent.realizationKey,
+        },
+      );
+    } catch (error) {
+      // A failed layer must leave nothing a later build could mistake for
+      // progress, and must not keep holding the key's lock. The `.partial`
+      // directory can hold a half-written filesystem — publishing is the only
+      // thing that ever renames it into place, so it was never reachable, but
+      // it would sit there and the lock would stay held in this process.
+      await store.abandon(key);
+      throw error;
+    }
     layers.push(published);
     parent = published;
   }
