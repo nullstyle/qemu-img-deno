@@ -1,5 +1,8 @@
 .build/
 .claude/
 scratch/
-.appliance/
+# No trailing slash: `.appliance/` ignores a DIRECTORY of that name but not a
+# SYMLINK of it, and a stray symlink checked out over the real directory
+# deletes a 220 MiB build product.
+.appliance
 tests/.tmp/
