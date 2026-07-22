@@ -633,6 +633,12 @@ function chrootHelper(arch: GuestScriptArch): readonly string[] {
  */
 const RESOLV_HELPER: readonly string[] = [
   "QI_RESOLV_SAVED=0",
+  // Whether install actually WROTE. Restore undoes only what install did:
+  // install returns early when the APPLIANCE has no resolver of its own, and
+  // an unconditional delete in restore would then remove the image's own
+  // /etc/resolv.conf — one install never touched. That ships an image which
+  // builds, boots, and silently cannot resolve anything.
+  "QI_RESOLV_WROTE=0",
   "qi_resolv_install() {",
   "  [ -f /etc/resolv.conf ] || return 0",
   '  mkdir -p "$1/etc"',
@@ -640,12 +646,14 @@ const RESOLV_HELPER: readonly string[] = [
   '    cp -P "$1/etc/resolv.conf" /qi/resolv.saved; QI_RESOLV_SAVED=1',
   "  fi",
   '  cp /etc/resolv.conf "$1/etc/resolv.conf"',
+  "  QI_RESOLV_WROTE=1",
   "}",
   "qi_resolv_restore() {",
-  // Unconditional, and before the restore: what install left behind is the
-  // BUILD HOST's resolver, and it must not ship inside the image whether or
-  // not there was something to put back. `rm -f` then `cp -P` is the measured
-  // pair — the restore was measured putting a dangling link back intact.
+  '  [ "$QI_RESOLV_WROTE" = 1 ] || return 0',
+  // Before the restore, and reached only when install wrote: what install
+  // left behind is the BUILD HOST's resolver, and it must not ship inside the
+  // image whether or not there was something to put back. `rm -f` then
+  // `cp -P` is the measured pair — restore was measured putting a dangling
   '  rm -f "$1/etc/resolv.conf"',
   '  if [ "$QI_RESOLV_SAVED" = 1 ]; then',
   '    cp -P /qi/resolv.saved "$1/etc/resolv.conf"',

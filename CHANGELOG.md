@@ -280,11 +280,6 @@ an ESP gets built on a machine with no `mkfs.fat`.
   observations rather than asserted: `--strict` compares allocation status,
   which is the same class of container property (`smoke:recipe` now demonstrates
   it calling a content-identical image different).
-- **Two different exported classes were named `GuestStepFailedError`**, and the
-  one `build()` actually threw was declared in `build.ts` and exported from
-  nowhere. The only importable spelling was `./system`'s, which `instanceof`
-  never matched, so there was no way to catch a failed guest layer by type. The
-  duplicate is gone and `./recipe` re-exports the one that is thrown.
 - **A networked `chroot` step silently had no resolver in every Debian and
   Ubuntu cloud image.** The save guard tested `[ -e "$1/etc/resolv.conf" ]`,
   which is **false for a dangling symlink** — and that is exactly the shape
