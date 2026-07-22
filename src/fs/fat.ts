@@ -86,6 +86,13 @@ export const SECTOR_BYTES = 512;
 export const DIR_ENTRY_BYTES = 32;
 
 /**
+ * Largest file a FAT directory entry can record: `DIR_FileSize` is a uint32.
+ *
+ * Exported so a caller can refuse before staging bytes it cannot store.
+ */
+export const MAX_FILE_BYTES = 0xffff_ffff;
+
+/**
  * Cluster-count thresholds that *define* the three FAT types.
  *
  * Straight from the spec's own determination rule: a volume with fewer than
@@ -826,6 +833,22 @@ function buildTree(entries: readonly StagedEntry[]): Node {
     const sizeBytes = entry.type !== "file"
       ? 0
       : entry.body?.byteLength ?? declared ?? 0;
+    // `DIR_FileSize` is a uint32, so 4 GiB - 1 is the largest length FAT can
+    // record — and the failure is silent, not loud: the length wraps modulo
+    // 2^32, the clusters are all written and chained, `fsck_msdos` reports
+    // "too many clusters allocated", and a reader returns the wrapped length.
+    // At exactly 4 GiB that is zero bytes, so the file is on the volume,
+    // occupying its full space, and reads back empty.
+    if (sizeBytes > MAX_FILE_BYTES) {
+      throw new FatEntryError(
+        path,
+        `is ${sizeBytes} bytes, over the ${MAX_FILE_BYTES} a FAT directory ` +
+          "entry can record — its size field is 32 bits wide. The length " +
+          "would wrap: at exactly 4 GiB the file reads back as empty while " +
+          "still occupying every cluster. Split the file, or put it on a " +
+          "filesystem that can hold it.",
+      );
+    }
 
     const node: Node = {
       path,

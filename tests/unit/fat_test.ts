@@ -11,6 +11,7 @@ import {
   FatGeometryError,
   fatGeometryFor,
   type FatOptions,
+  MAX_FILE_BYTES,
   minimumFatSizeBytes,
   SECTOR_BYTES,
 } from "../../src/fs/fat.ts";
@@ -1088,4 +1089,31 @@ Deno.test("describeFat rejects bytes that are not a boot sector", () => {
     FatGeometryError,
     "too short",
   );
+});
+
+Deno.test("a file too large for DIR_FileSize is refused, not wrapped", () => {
+  // `DIR_FileSize` is a uint32. Past it the length wraps modulo 2^32 while
+  // every cluster is still written and chained, so the volume mounts, the file
+  // occupies its full space, and a reader returns the wrapped length — at
+  // exactly 4 GiB, zero. Measured before this refusal: fsck_msdos exit 206,
+  // "has too many clusters allocated (logical=0, physical=4294967296)".
+  const at = (sizeBytes: number) => [{
+    path: "big.bin",
+    type: "file" as const,
+    sizeBytes,
+  }];
+  // The boundary itself is representable and must still size.
+  assert(minimumFatSizeBytes(at(MAX_FILE_BYTES), { fatType: 32 }) > 0);
+  for (const over of [MAX_FILE_BYTES + 1, 4 * 1024 ** 3, 5 * 1024 ** 3]) {
+    assertThrows(
+      () => minimumFatSizeBytes(at(over), { fatType: 32 }),
+      FatEntryError,
+      "32 bits wide",
+    );
+    // And through the geometry path plan() actually calls, not just sizing.
+    assertThrows(
+      () => fatGeometryFor(at(over), { sizeBytes: 8 * 1024 ** 3, fatType: 32 }),
+      FatEntryError,
+    );
+  }
 });
