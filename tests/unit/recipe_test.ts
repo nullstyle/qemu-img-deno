@@ -1,9 +1,16 @@
-import { assert, assertEquals, assertRejects, assertThrows } from "@std/assert";
+import {
+  assert,
+  assertEquals,
+  assertRejects,
+  assertStrictEquals,
+  assertThrows,
+} from "@std/assert";
 import {
   canonicalJson,
   defineRecipe,
   dir,
   file,
+  GuestStepFailedError,
   type Input,
   type InputResolver,
   plan,
@@ -20,6 +27,12 @@ import {
   UnrepresentableContentError,
   VVFAT_USABLE_BYTES,
 } from "../../src/recipe/mod.ts";
+// Imported under a second name so the test can assert the two public subpaths
+// hand back the same class, rather than two that merely agree on `.name`.
+import {
+  GuestStepFailedError as SystemGuestStepFailedError,
+  type StepOutcome,
+} from "../../src/system/mod.ts";
 
 /**
  * A resolver with no filesystem behind it: tests declare exactly what a tree
@@ -854,4 +867,65 @@ Deno.test("plan is deterministic: same input, same keys and geometry", async () 
   assertEquals(a.outputRecipeKey, b.outputRecipeKey);
   assertEquals(a.layout, b.layout);
   assertEquals(a.explain(), b.explain());
+});
+
+Deno.test("the guest failure `build()` throws is catchable from both subpaths", () => {
+  // Regression: there were once TWO classes named `GuestStepFailedError` — the
+  // one `build()` threw, unexported, and one on `./system` that nothing ever
+  // constructed. A consumer catching the exported one silently never matched,
+  // and fell through to whatever generic handler followed. `.name` is equal on
+  // any impostor, so `instanceof` against the real class is the only check.
+  const outcome: StepOutcome = {
+    code: 0,
+    stage: "step",
+    outputDigest: "",
+    umountRc: 0,
+    fsckRc: 1,
+    dmesgErrors: 0,
+    detail: "the root filesystem was left dirty",
+  };
+  const error = new GuestStepFailedError("root:mkfs", outcome, "boot log\n");
+
+  assertStrictEquals(GuestStepFailedError, SystemGuestStepFailedError);
+  assert(error instanceof SystemGuestStepFailedError);
+  assertEquals(error.stepId, "root:mkfs");
+  assertStrictEquals(error.outcome, outcome);
+  // The dangerous shape: exit 0 over a filesystem that failed its checks. The
+  // message has to say which of the four signals fired, or it reads as a pass.
+  assert(
+    error.message.includes("the step script succeeded but"),
+    `spells out that the exit code alone looked fine:\n${error.message}`,
+  );
+  assert(
+    error.message.includes("e2fsck -fn returned 1"),
+    `names the signal that actually failed:\n${error.message}`,
+  );
+});
+
+Deno.test("a guest failure names every signal that fired, not just the first", () => {
+  // The four signals are independent, so a step can trip several at once. A
+  // message that stops at the exit code makes the corruption underneath it
+  // invisible until something downstream rediscovers it.
+  const error = new GuestStepFailedError("root:mkfs", {
+    code: 32,
+    stage: "step",
+    outputDigest: "",
+    umountRc: 1,
+    fsckRc: 4,
+    dmesgErrors: 7,
+    detail: "mkfs died mid-write",
+  }, "boot log\n");
+  for (
+    const signal of [
+      "exited 32",
+      "an unmount under /mnt failed",
+      "e2fsck -fn returned 4",
+      "7 ext4/I/O error lines",
+    ]
+  ) {
+    assert(
+      error.message.includes(signal),
+      `all four signals are reported, missing "${signal}":\n${error.message}`,
+    );
+  }
 });

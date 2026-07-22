@@ -102,6 +102,12 @@ export {
 
 export { type Artifact, build, type BuildOptions } from "./build.ts";
 
+// `build()` is the only thing that throws it, so it has to be catchable from
+// the subpath `build()` lives on — but it is declared in the guest tier,
+// because nothing under `src/system/` may import `src/recipe/`. Same class
+// either way: `instanceof` matches whichever subpath the caller imported from.
+export { GuestStepFailedError } from "../system/errors.ts";
+
 export {
   LayerBusyError,
   LayerIntegrityError,

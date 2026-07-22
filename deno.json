@@ -2,6 +2,8 @@
   "name": "@nullstyle/qemu-img",
   "version": "0.2.1",
   "license": "Apache-2.0",
+  "//exclude": "Git worktrees live under .claude/ and are gitignored, but deno does not read .gitignore — so `deno check .` would descend into every in-flight worktree and fail on somebody else's half-written code.",
+  "exclude": [".claude/"],
   "exports": {
     ".": "./mod.ts",
     "./runner": "./src/runner.ts",

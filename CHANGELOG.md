@@ -107,6 +107,11 @@ an ESP gets built on a machine with no `mkfs.fat`.
   bumping Alpine cannot leave a stale layer looking like a hit. Disks are
   addressed by **identity**, not position: roles ride the kernel cmdline as
   serial tokens and the guest resolves them from `/sys/block/vd*/serial`.
+  `GuestStepFailedError` — what `build()` throws when a guest step's exit code,
+  unmount, `e2fsck` or dmesg scan says the layer must not be published — is
+  exported from **both** `./system` and `./recipe`, since `build()` lives on the
+  latter. One class, so `instanceof` matches whichever subpath a caller reached
+  for; `.name` alone cannot distinguish it from a generic failure.
 - **`buildTar` in `./fs`** — a ustar writer, because both host tars lose data
   while exiting `0` (see the guest-tier hazard table). It throws where they
   drop, and emits a GNU `'L'` record for names with no prefix/name split.
@@ -160,10 +165,17 @@ an ESP gets built on a machine with no `mkfs.fat`.
   Preimage bumped to `qemu-img-realization@2`, so keys minted under the old
   scheme are unreachable rather than merely unlikely to hit.
 - **`smoke:system` asserted byte-identical containers where it meant an
-  identical filesystem**, and so failed on the above — 5 runs in 10. It now
-  compares guest-visible content with `qemu-img compare` and content digests,
-  asserts that two cold stores agree on every realization key, and reports the
-  container and allocation comparisons as observations rather than failures.
+  identical filesystem**, and so failed on the above — 5 runs in 10, flaky in
+  the worst direction: red while the property it meant to test held. It now
+  digests the ext4 partition's guest-visible bytes through a `raw` window on the
+  **mkfs layer** — never the finished artifact, whose `copyIn` layer mounts the
+  filesystem read-write and stamps `s_mtime`/`s_wtime`/`s_mount_count` with no
+  way back — then cross-checks the whole layer with `qemu-img compare` and with
+  the content digest a key folds, and asserts that two cold stores agree on
+  every realization key. The container and `--strict` comparisons are printed as
+  observations rather than asserted: `--strict` compares allocation status,
+  which is the same class of container property (`smoke:recipe` now demonstrates
+  it calling a content-identical image different).
 - **`LayerStore.publish()` could never re-publish a key.** `rename` onto a
   non-empty directory is `ENOTEMPTY`, and an uncacheable layer skips the cache
   lookup and so reaches `publish()` on _every_ run — meaning any recipe with a

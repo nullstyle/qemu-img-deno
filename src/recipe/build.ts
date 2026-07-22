@@ -20,7 +20,7 @@ import { buildTar, type TarEntry } from "../fs/tar.ts";
 import {
   copyInScript,
   type GuestRunner,
-  type GuestStepResult,
+  GuestStepFailedError,
   type MkfsPartition,
   mkfsScript,
   runScript,
@@ -62,38 +62,6 @@ export interface BuildOptions {
    * layer BEFORE it still builds, publishes and caches.
    */
   readonly guest?: GuestRunner;
-}
-
-/** A guest step ran, and either it or the filesystem under it failed. */
-export class GuestStepFailedError extends Error {
-  /** The offending step's id. */
-  readonly stepId: string;
-  /** Everything the guest reported. */
-  readonly outcome: GuestStepResult["outcome"];
-  /** The guest's serial console, for diagnosis. */
-  readonly console: string;
-
-  /** Build the error, naming which of the four signals actually failed. */
-  constructor(stepId: string, result: GuestStepResult) {
-    const { outcome } = result;
-    const reasons = [
-      outcome.code !== 0 ? `the script exited ${outcome.code}` : "",
-      outcome.umountRc !== 0 ? "a filesystem failed to unmount" : "",
-      (outcome.fsckRc ?? 0) !== 0 ? `e2fsck exited ${outcome.fsckRc}` : "",
-      outcome.dmesgErrors !== 0
-        ? `the kernel logged ${outcome.dmesgErrors} I/O or ext4 errors`
-        : "",
-    ].filter((reason) => reason !== "");
-    super(
-      `${stepId}: ${reasons.join(", ")} (stage ${outcome.stage}). The layer ` +
-        "was NOT published, so nothing downstream can cache against it.\n" +
-        result.console.split("\n").slice(-20).join("\n"),
-    );
-    this.name = "GuestStepFailedError";
-    this.stepId = stepId;
-    this.outcome = outcome;
-    this.console = result.console;
-  }
 }
 
 /** What a build produced. */
@@ -481,7 +449,7 @@ export async function build(
           outcome.code !== 0 || outcome.umountRc !== 0 ||
           (outcome.fsckRc ?? 0) !== 0 || outcome.dmesgErrors !== 0
         ) {
-          throw new GuestStepFailedError(step.id, result);
+          throw new GuestStepFailedError(step.id, outcome, result.console);
         }
       }
 

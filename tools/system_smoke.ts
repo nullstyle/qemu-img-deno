@@ -299,34 +299,78 @@ try {
     qemu,
     guest,
   });
-  const mkfsIndex = planned.steps.findIndex((s) => s.id === "table:mkfs");
-  const first = artifact.layers[mkfsIndex];
-  const second = rebuilt.layers[mkfsIndex];
+  // Compare the GUEST-VISIBLE bytes, never the layer's `containerSha256`.
+  // That digest covers the qcow2 container, which `store.ts` documents as
+  // "deliberately the wrong artifact identity — it moves with cluster
+  // layout": measured on this very recipe, at least four distinct container
+  // digests over one 2424832-byte ext4 image, `qemu-img compare --strict`
+  // identical on every pair, and the assertion that compared them red on 5
+  // runs in 10 — flaky in the worst direction, failing while the property it
+  // meant to test held.
+  const rootPart = planned.layout!.find((p) => p.filesystem === "ext4")!;
+  const ext4Digest = async (image: string): Promise<string> => {
+    const raw = `${work}/cmp-${crypto.randomUUID()}.raw`;
+    await qemu.convert(
+      {
+        imageOpts: {
+          driver: "raw",
+          offset: rootPart.offsetBytes,
+          size: rootPart.lengthBytes,
+          file: { driver: "qcow2", file: { driver: "file", filename: image } },
+        },
+      },
+      raw,
+      { format: "raw", parallel: 1 },
+    );
+    const digest = await crypto.subtle.digest(
+      "SHA-256",
+      await Deno.readFile(raw),
+    );
+    await Deno.remove(raw).catch(() => {});
+    return Array.from(new Uint8Array(digest))
+      .map((b) => b.toString(16).padStart(2, "0")).join("");
+  };
   // This is what turns the mke2fs determinism flags from a claim into a
   // tested property. Without E2FSPROGS_FAKE_TIME, -U and -E hash_seed the two
   // filesystems differ, every descendant's key moves, and the store thrashes.
-  //
-  // What they promise is a byte-identical FILESYSTEM, so that is what is
-  // asserted, by two oracles that share nothing: qemu's own comparison of the
-  // guest-visible content, and the digest the realization key folds. This
-  // assertion used to read `containerSha256 === containerSha256`, which is a
-  // strictly stronger claim that mke2fs never made — see the observations
-  // below, and `realizationKey` in src/recipe/keys.ts.
+  // The MKFS LAYER, never the finished artifact. The copyIn layer above it
+  // mounts the filesystem read-write, and a rw mount stamps s_mtime, s_wtime
+  // and s_mount_count with no way back — so the artifact is content-
+  // reproducible but deliberately not byte-reproducible, exactly as the
+  // guest-tier hazard table says. Comparing it here would test the opposite
+  // of the property this asserts.
+  const mkfsIndex = planned.steps.findIndex((s) => s.id === "table:mkfs");
+  const first = artifact.layers[mkfsIndex];
+  const second = rebuilt.layers[mkfsIndex];
+  const [firstExt4, secondExt4] = await Promise.all([
+    ext4Digest(first.path),
+    ext4Digest(second.path),
+  ]);
+  assert(
+    firstExt4 === secondExt4,
+    "two independent boots produced byte-identical ext4:\n" +
+      `  first  ${firstExt4}\n  second ${secondExt4}`,
+  );
+  pass(`ext4 is byte-identical across boots (${firstExt4.slice(0, 16)}…)`);
+
+  // And the whole layer agrees, by two oracles that share no code with the
+  // partition digest above: qemu's own comparison of the guest-visible
+  // content, and the digest a realization key actually folds.
   const same = await qemu.compare(first.path, second.path, {
     format: "qcow2",
     formatB: "qcow2",
   });
   assert(
     same.identical,
-    `two independent boots produced the same ext4:\n${same.output}`,
+    `qemu-img compare agrees over the whole layer:\n${same.output}`,
   );
   assert(
     first.contentSha256 === second.contentSha256,
-    "and the same content digest:\n" +
+    "and so does the content digest:\n" +
       `  first  ${first.contentSha256}\n  second ${second.contentSha256}`,
   );
   pass(
-    `ext4 content is identical across boots (${
+    `the layer's content digest matches too (${
       first.contentSha256.slice(0, 16)
     }…)`,
   );
