@@ -66,6 +66,23 @@ an ESP gets built on a machine with no `mkfs.fat`.
   Capability traits are DERIVED from the walked tree, so a symlink nobody
   noticed still refuses a FAT partition.
 
+- **`./fs`** — a GPT writer: protective MBR, header, entry array and the backup
+  at the tail, with CRC-32 and mixed-endian GUID serialization. Two details are
+  load-bearing. Every byte of the footprint is written explicitly, including the
+  127 unused entry slots: on a fresh image assuming zeros is fine, but on a
+  qcow2 OVERLAY unwritten clusters read _through_ to the backing file, and stale
+  bytes there surface as phantom partition entries. And the backup header is not
+  a copy — `MyLBA`/`AlternateLBA` are swapped and its CRC differs, so a
+  byte-for-byte duplicate of the primary is invalid in a way some tools accept
+  and others reject.
+- **`LayerStore` and `build()`** — layers are qcow2 overlays chained by RELATIVE
+  backing references, published by renaming a same-depth `<key>.partial`
+  sibling. The same-depth part is required, not stylistic: `qemu-img create`
+  resolves a backing reference against the target's own directory and opens it
+  before creating anything, so a `tmp/<uuid>/` staging dir can never resolve
+  `../<parent>/image.qcow2`. Layers are `chmod 0444` and re-verified against
+  their recorded digest on every cache hit.
+
 ### Fixed
 
 - `timeoutMs` was not a wall-clock deadline. The abort raced the child's

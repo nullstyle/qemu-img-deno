@@ -97,6 +97,10 @@ export {
   traitsOf,
 } from "./resolve.ts";
 
+export { type Artifact, build, type BuildOptions } from "./build.ts";
+
+export { LayerIntegrityError, LayerStore, type StoredLayer } from "./store.ts";
+
 export {
   EFI_FALLBACK,
   type Executor,

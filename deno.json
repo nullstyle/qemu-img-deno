@@ -6,6 +6,7 @@
     ".": "./mod.ts",
     "./runner": "./src/runner.ts",
     "./recipe": "./src/recipe/mod.ts",
+    "./fs": "./src/fs/mod.ts",
     "./testing": "./testing/mod.ts"
   },
   "imports": {
@@ -22,9 +23,10 @@
     "fmt": "deno fmt",
     "lint": "deno lint",
     "check": "deno fmt --check && deno lint && deno check .",
-    "doc:lint": "deno doc --lint mod.ts src/runner.ts src/recipe/mod.ts testing/mod.ts",
+    "doc:lint": "deno doc --lint mod.ts src/runner.ts src/recipe/mod.ts src/fs/mod.ts testing/mod.ts",
     "test": "deno test --allow-run=echo,cat,false,sleep,sh --allow-read=tests,deno.json --allow-write=tests/.tmp tests/",
     "smoke": "deno run --allow-run --allow-read --allow-write --allow-env tools/qemu_img_smoke.ts",
+    "smoke:recipe": "deno run --allow-run --allow-read --allow-write --allow-env tools/recipe_smoke.ts",
     "appliance": "deno run --allow-run=bsdtar,sh --allow-read --allow-write --allow-net=dl-cdn.alpinelinux.org tools/build_appliance.ts",
     "appliance:run": "deno run --allow-run --allow-read --allow-write tools/appliance_run.ts",
     "publish:check": "deno run --allow-read tools/check_publish.ts",
