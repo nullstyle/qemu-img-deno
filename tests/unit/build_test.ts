@@ -10,6 +10,7 @@ import { FakeQemuImg } from "../../testing/mod.ts";
 import { build } from "../../src/recipe/build.ts";
 import { plan } from "../../src/recipe/plan.ts";
 import { LayerStore } from "../../src/recipe/store.ts";
+import { LocalInputResolver } from "../../src/recipe/resolve.ts";
 import {
   BaseImageSizeMismatchError,
   GuestExecutorUnavailableError,
@@ -52,7 +53,22 @@ const DETERMINISM = {
 } as const;
 /** Stand-in appliance identity; plan() only ever folds its digest. */
 const APPLIANCE = { digest: "ap".repeat(32) };
-const ESP_DIR = "/staging/esp";
+/**
+ * A REAL staging tree, resolved by the real resolver.
+ *
+ * It used to be the fictional path `/staging/esp` with hand-written digests,
+ * which was fine while the fake qemu never opened it. It is not fine now:
+ * `build()` re-walks a FAT staging tree and re-hashes every file against the
+ * digest its cache key names, precisely so a tree edited between resolve and
+ * build cannot publish under the old key. A fictional tree cannot exercise
+ * that, and would only prove the check can be bypassed by not having a tree.
+ */
+const ESP_DIR = await (async () => {
+  const dir = `${await scratchDir()}/esp`;
+  await Deno.mkdir(`${dir}/EFI/BOOT`, { recursive: true });
+  await Deno.writeTextFile(`${dir}/EFI/BOOT/BOOTAA64.EFI`, "MZ!\n");
+  return dir;
+})();
 
 function dirInput(
   path: string,
@@ -69,13 +85,11 @@ function dirInput(
   };
 }
 
-const ESP_INPUT = dirInput(ESP_DIR, [{
-  path: "EFI/BOOT/BOOTAA64.EFI",
-  type: "file",
-  mode: 0o644,
-  sizeBytes: 4,
-  sha256: "f".repeat(64),
-}]);
+/** Resolved by `LocalInputResolver`, so the entries describe what is on disk. */
+const ESP_INPUT: ResolvedInput = await new LocalInputResolver().resolve({
+  kind: "dir",
+  path: ESP_DIR,
+});
 
 /** A FAT partition the host writes, and optionally an ext4 one the guest makes. */
 function partitionStep(withExt4: boolean): Step {
@@ -584,7 +598,15 @@ Deno.test("a second build of the same plan is all cache hits and no work", async
       guest: secondGuest,
     });
 
-    assertEquals(after.cacheHits, ["base", "table", "table:mkfs", "setup"]);
+    // `cacheHits` holds REALIZATION KEYS, not step ids. The distinction is the
+    // whole point of the rename: the natural read —
+    // `layers.filter((l) => cacheHits.includes(l.realizationKey))` — silently
+    // returned [] forever while this field held ids.
+    assertEquals(
+      after.cacheHits,
+      after.layers.map((layer) => layer.realizationKey),
+      "every layer was served from cache, by key",
+    );
     assertEquals(after.cacheHits.length, planned.steps.length);
     assertEquals(after.realizationKey, before.realizationKey);
     assertEquals(
