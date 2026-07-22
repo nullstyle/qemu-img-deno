@@ -197,14 +197,20 @@ function writeEntries(
     view.setBigUint64(at + 32, BigInt(partition.firstLba), true);
     view.setBigUint64(at + 40, BigInt(partition.lastLba), true);
     view.setBigUint64(at + 48, partition.attributes ?? 0n, true);
-    const name = [...partition.name];
+    // UTF-16LE, at most 36 code UNITS. A JS string is already UTF-16, so
+    // `name.length` counts units and `name.charCodeAt(i)` yields each unit,
+    // both halves of a surrogate pair included. Stepping by code POINT with
+    // `[...name]` would write an astral character's high surrogate alone and
+    // drop the low one, and would miscount the limit (36 astral points is 72
+    // units). The reader in ../block/gpt.ts encodes names the same way.
+    const name = partition.name;
     if (name.length > 36) {
       throw new TypeError(
-        `partition name "${partition.name}" exceeds 36 UTF-16 code units`,
+        `partition name "${name}" exceeds 36 UTF-16 code units`,
       );
     }
-    for (let code = 0; code < name.length; code++) {
-      view.setUint16(at + 56 + code * 2, name[code].charCodeAt(0), true);
+    for (let unit = 0; unit < name.length; unit++) {
+      view.setUint16(at + 56 + unit * 2, name.charCodeAt(unit), true);
     }
   });
   return bytes;

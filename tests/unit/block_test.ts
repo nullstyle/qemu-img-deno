@@ -6,6 +6,7 @@ import {
   encodeGptEntries,
   encodeGptHeader,
   type GptEntry,
+  GptParseError,
   type GptProblemCode,
   GptRepairRefusedError,
   parseGpt,
@@ -319,10 +320,11 @@ Deno.test("grow: repair is idempotent and the healthy case writes nothing", () =
 });
 
 Deno.test("grow: a stranded backup under a partition is left alone", () => {
-  // The real sequence this guards: grow the image, let growpart extend the
-  // partition into the new space, and only then repair. growpart rewrites the
-  // primary and leaves the backup where it was — now underneath the partition
-  // it just extended. Zeroing it blindly would punch a hole in a filesystem.
+  // The real sequence this guards: after a grow, a partition is extended to
+  // fill the new space (by growpart, gdisk, or by hand) and the primary is
+  // rewritten, while the old backup header still sits mid-disk — now
+  // underneath the partition that was just extended over it. Zeroing that
+  // sector blindly would punch a hole in the filesystem on top of it.
   const disk = makeDisk({
     diskSizeBytes: 16 * MiB,
     partitions: [{ firstLba: 2048, lastLba: 32700, name: "root" }],
@@ -645,4 +647,247 @@ Deno.test("every problem names a fix, and no fix names sgdisk", () => {
       );
     }
   }
+});
+
+// Defect #1: sameTable() omitted lastUsableLba, so two headers describing disks
+// of different sizes read back as "the same table" — the disagreement went
+// undetected and repair silently overwrote the backup with the primary's view.
+Deno.test("headers disagreeing only on LastUsableLBA are caught, not merged", () => {
+  const sectorSize = 512;
+  const diskSizeBytes = 16 * MiB;
+  const totalSectors = diskSizeBytes / sectorSize; // 32768
+  const arraySectors = 32;
+  const entries = [
+    entry({ index: 0, firstLba: 2048, lastLba: 20000, name: "root" }),
+  ];
+  const disk = layTable({ diskSizeBytes, sectorSize, entries });
+
+  // The primary keeps the correct LastUsableLBA — so `last-usable-stale` never
+  // fires to mask the test — while the backup is rewritten, its own CRC still
+  // valid, with a LastUsableLBA 100 sectors short. The two headers now describe
+  // disks of different sizes, disagreeing on nothing else.
+  const entryBytes = encodeGptEntries(entries, 128, 128);
+  const correctLastUsable = totalSectors - arraySectors - 2; // 32734
+  const backupHeader = encodeGptHeader({
+    revision: 0x00010000,
+    headerSizeBytes: 92,
+    headerCrc32: 0,
+    myLba: totalSectors - 1,
+    alternateLba: 1,
+    firstUsableLba: 2 + arraySectors,
+    lastUsableLba: correctLastUsable - 100,
+    diskGuid: DISK_GUID,
+    entryArrayLba: totalSectors - arraySectors - 1,
+    entryCount: 128,
+    entrySizeBytes: 128,
+    entriesCrc32: crc32(entryBytes),
+  }, sectorSize);
+  disk.set(backupHeader, (totalSectors - 1) * sectorSize);
+
+  const parsed = parseGpt(disk);
+  assertEquals(parsed.primary.status, "ok");
+  assertEquals(parsed.backup.status, "ok", "the backup still self-verifies");
+  assertEquals(parsed.primary.header?.lastUsableLba, correctLastUsable);
+  assertEquals(parsed.backup.header?.lastUsableLba, correctLastUsable - 100);
+
+  const diagnosis = diagnoseGpt(parsed);
+  assertEquals(diagnosis.ok, false, "a header disagreement is not 'ok'");
+  const problem = diagnosis.problems.find((p) => p.code === "headers-disagree");
+  assert(problem !== undefined, codes(diagnosis.problems).join(","));
+  assertEquals(problem.repairable, false);
+  assert(problem.detail.includes("LastUsableLBA"), problem.detail);
+
+  const error = assertThrows(
+    () => repairGpt(disk),
+    GptRepairRefusedError,
+  ) as GptRepairRefusedError;
+  assertEquals(codes(error.problems), ["headers-disagree"]);
+
+  // The legitimate case is untouched: a healthy primary and backup differ in
+  // MyLBA/AlternateLBA/PartitionEntryLBA by design, and that is NOT a
+  // disagreement.
+  const healthy = diagnoseGpt(parseGpt(layTable({
+    diskSizeBytes,
+    sectorSize,
+    entries,
+  })));
+  assert(
+    !codes(healthy.problems).includes("headers-disagree"),
+    "the deliberate primary/backup differences must not read as a disagreement",
+  );
+  assertEquals(healthy.ok, true);
+});
+
+// Defect #2: the stranded-backup zeroing sized its write from entryArrayLba read
+// out of a header whose CRC had failed — a negative length crashed with an
+// untyped RangeError, a large one wiped an arbitrary span.
+Deno.test("a stranded header with a failed CRC is refused, not trusted for a write", () => {
+  const sectorSize = 512;
+  const disk = layTable({
+    diskSizeBytes: 16 * MiB,
+    sectorSize,
+    entries: [
+      entry({ index: 0, firstLba: 2048, lastLba: 20000, name: "root" }),
+    ],
+  });
+  const grown = grow(disk, 24 * MiB);
+
+  // The old backup header sits stranded at LBA 32767 after the grow. Give it a
+  // wild PartitionEntryLBA (well past its own sector) and leave the recorded
+  // CRC alone, so the header no longer self-verifies. Sized from this u64 the
+  // zeroing would compute `(32767 - 4294967295 + 1) * 512` — a negative
+  // Uint8Array length, an untyped RangeError.
+  const strandedLba = 32767;
+  const patch = new DataView(
+    grown.buffer,
+    grown.byteOffset + strandedLba * sectorSize,
+    sectorSize,
+  );
+  patch.setBigUint64(72, 0xffffffffn, true); // PartitionEntryLBA, CRC now stale
+
+  const parsed = parseGpt(grown, { sectorSize });
+  assertEquals(parsed.primary.status, "ok");
+  assertEquals(parsed.stranded?.lba, strandedLba);
+  assertEquals(parsed.stranded?.status, "bad-header-crc");
+  assertEquals(parsed.stranded?.header?.entryArrayLba, 0xffffffff);
+
+  const error = assertThrows(
+    () => repairGpt(grown, { sectorSize }),
+    GptRepairRefusedError,
+  ) as GptRepairRefusedError;
+  assertEquals(codes(error.problems), ["stranded-backup-unverifiable"]);
+  assert(error.message.includes(String(strandedLba)), error.message);
+});
+
+// Defect #3: an entry array too big for the 256 KiB read window came back
+// "unread" on both sides, which diagnoseGpt folded into "no-gpt" — telling the
+// caller to RECREATE a table that was perfectly sound.
+Deno.test("an entry array past the read window is 'unread', not 'no GPT'", () => {
+  const sectorSize = 512;
+  const diskSizeBytes = 8 * MiB;
+  const totalSectors = diskSizeBytes / sectorSize; // 16384
+  const entryCount = 4096; // 4096 * 128 = 512 KiB array, 1024 sectors
+  const entrySize = 128;
+  const arraySectors = Math.ceil(entryCount * entrySize / sectorSize); // 1024
+  const backupArrayLba = totalSectors - arraySectors - 1; // 15359
+  const backupHeaderLba = totalSectors - 1; // 16383
+
+  const entryBytes = encodeGptEntries(
+    [entry({ index: 0, firstLba: 1026, lastLba: 8000, name: "root" })],
+    entryCount,
+    entrySize,
+  );
+  const common = {
+    revision: 0x00010000,
+    headerSizeBytes: 92,
+    headerCrc32: 0,
+    firstUsableLba: 2 + arraySectors, // 1026
+    lastUsableLba: totalSectors - arraySectors - 2, // 15358
+    diskGuid: DISK_GUID,
+    entryCount,
+    entrySizeBytes: entrySize,
+    entriesCrc32: crc32(entryBytes),
+  };
+  const disk = new Uint8Array(diskSizeBytes);
+  disk.set(protectiveMbr(totalSectors, sectorSize), 0);
+  disk.set(
+    encodeGptHeader({
+      ...common,
+      myLba: 1,
+      alternateLba: backupHeaderLba,
+      entryArrayLba: 2,
+    }, sectorSize),
+    sectorSize,
+  );
+  disk.set(entryBytes, 2 * sectorSize);
+  disk.set(entryBytes, backupArrayLba * sectorSize);
+  disk.set(
+    encodeGptHeader({
+      ...common,
+      myLba: backupHeaderLba,
+      alternateLba: 1,
+      entryArrayLba: backupArrayLba,
+    }, sectorSize),
+    backupHeaderLba * sectorSize,
+  );
+
+  // Read whole, this is a perfectly sound table.
+  assertEquals(
+    diagnoseGpt(parseGpt(disk, { sectorSize })).ok,
+    true,
+    "the disk itself is sound when fully read",
+  );
+
+  // Now read it as readGptImage does — only the first and last 256 KiB. The
+  // 512 KiB entry array falls outside both windows, so both sides are unread.
+  const span = 64 * 4096; // 262144, what readGptImage fetches
+  const view = new DiskView(diskSizeBytes, [
+    { offsetBytes: 0, bytes: disk.subarray(0, span) },
+    {
+      offsetBytes: diskSizeBytes - span,
+      bytes: disk.subarray(diskSizeBytes - span),
+    },
+  ]);
+  const parsed = parseGptView(view, { sectorSize });
+  assertEquals(parsed.primary.status, "unread");
+  assertEquals(parsed.backup.status, "unread");
+
+  const diagnosis = diagnoseGpt(parsed);
+  assertEquals(diagnosis.ok, false);
+  const cs = codes(diagnosis.problems);
+  assert(cs.includes("table-unread"), cs.join(","));
+  assert(!cs.includes("no-gpt"), "a windowing limit is not 'no GPT'");
+  for (const problem of diagnosis.problems) {
+    assert(
+      !/recreate/i.test(problem.fix),
+      `an unread window must not tell the caller to recreate: ${problem.fix}`,
+    );
+    assert(
+      /widen|read more|window/i.test(problem.fix),
+      `the fix should be to widen the read: ${problem.fix}`,
+    );
+  }
+});
+
+// Defect #4: encodeGptEntries iterated the name by code POINT and wrote one
+// UTF-16 unit per element, so an astral character was written as its lone high
+// surrogate and the low surrogate was dropped.
+Deno.test("encodeGptEntries preserves an astral name's surrogate pair", () => {
+  const emoji = "😀"; // U+1F600 → UTF-16 D83D DE00, two code units
+  const encoded = encodeGptEntries(
+    [entry({ index: 0, name: emoji })],
+    128,
+    128,
+  );
+  const dv = new DataView(
+    encoded.buffer,
+    encoded.byteOffset,
+    encoded.byteLength,
+  );
+  // The name field starts at byte 56. Both units must be present.
+  assertEquals(dv.getUint16(56, true), 0xd83d, "high surrogate");
+  assertEquals(
+    dv.getUint16(58, true),
+    0xde00,
+    "low surrogate — dropped by bug",
+  );
+
+  // And it round-trips through the reader as the original emoji, on both sides.
+  const disk = layTable({
+    diskSizeBytes: 16 * MiB,
+    sectorSize: 512,
+    entries: [entry({ index: 0, firstLba: 2048, lastLba: 20000, name: emoji })],
+  });
+  const parsed = parseGpt(disk);
+  assertEquals(parsed.primary.entries[0].name, emoji, "round-trips (primary)");
+  assertEquals(parsed.backup.entries[0].name, emoji, "round-trips (backup)");
+
+  // The 36-unit cap is counted in code UNITS: 36 astral characters are 72 code
+  // units and must be refused, where the by-code-point bug counted 36 and
+  // silently truncated.
+  assertThrows(
+    () =>
+      encodeGptEntries([entry({ index: 0, name: emoji.repeat(36) })], 128, 128),
+    GptParseError,
+  );
 });

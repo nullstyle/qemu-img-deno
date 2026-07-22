@@ -5,10 +5,22 @@
  * `qemu-img resize` moves the end of the disk, and a GPT stores its backup
  * header **in the last sector**. Growing strands that backup mid-disk and
  * leaves both headers claiming a `LastUsableLBA` from the old size; shrinking
- * discards it outright. Neither is reported by anything: the primary header
- * still self-verifies, so the image boots and `qemu-img check` is clean, right
- * up until something strict (`growpart`, a firmware update, Apple's own
- * parser) reads the table and disagrees.
+ * discards it outright. Nothing raises an error: the primary header still
+ * self-verifies, so the image boots and `qemu-img check` is clean. The damage
+ * is in the tail bytes — the backup header is no longer in the disk's last
+ * sector, where the 1.0 spec requires it. Independent parsers do not shout
+ * about it: measured on macOS 25.5 (`deno task smoke:block`), `diskutil list`
+ * parses a grown table and names its partitions without complaint, and
+ * `gpt -r show` exits 0 with no warning, betraying the damage only by omitting
+ * the `Sec GPT header`/`Sec GPT table` rows a healthy disk ends with. This
+ * module is what reads those tail bytes back and says what is wrong.
+ *
+ * (cloud-utils' `growpart` is sometimes cast as a victim of this; it is the
+ * opposite. Its sgdisk/sfdisk providers RELOCATE a stale secondary header to
+ * the disk end *before* growing a partition, so growpart repairs this rather
+ * than tripping over it. That is reasoned from cloud-utils' documented
+ * behavior, unmeasured here: growpart is Linux-only and this package never
+ * runs it.)
  *
  * Repairing that needs no `sgdisk` and no Linux — it is a few hundred bytes of
  * header arithmetic over two windows at either end of the disk. What it does
@@ -287,16 +299,23 @@ export function encodeGptEntries(
     view.setBigUint64(at + 32, BigInt(entry.firstLba), true);
     view.setBigUint64(at + 40, BigInt(entry.lastLba), true);
     view.setBigUint64(at + 48, entry.attributes, true);
-    const name = [...entry.name];
+    // The name field is UTF-16LE and holds a fixed number of code UNITS
+    // ((entrySizeBytes - 56) / 2). Iterate by code unit, not code point: a JS
+    // string is already UTF-16, so `name.length` is the code-unit count and
+    // `name.charCodeAt(i)` yields each unit — including both halves of a
+    // surrogate pair. Spreading with `[...name]` would step by code POINT, so
+    // an astral character would be written as its high surrogate alone and its
+    // low surrogate dropped, and the length would be checked against the wrong
+    // unit (36 astral points is 72 units, twice what the field holds).
     const maxCodeUnits = Math.floor((entrySizeBytes - 56) / 2);
-    if (name.length > maxCodeUnits) {
+    if (entry.name.length > maxCodeUnits) {
       throw new GptParseError(
-        `partition name "${entry.name}" exceeds the ${maxCodeUnits} UTF-16 ` +
-          `code units a ${entrySizeBytes}-byte entry holds`,
+        `partition name "${entry.name}" is ${entry.name.length} UTF-16 code ` +
+          `units, over the ${maxCodeUnits} a ${entrySizeBytes}-byte entry holds`,
       );
     }
-    for (let code = 0; code < name.length; code++) {
-      view.setUint16(at + 56 + code * 2, name[code].charCodeAt(0), true);
+    for (let unit = 0; unit < entry.name.length; unit++) {
+      view.setUint16(at + 56 + unit * 2, entry.name.charCodeAt(unit), true);
     }
   }
   return bytes;
@@ -502,6 +521,17 @@ function probeSectorSize(view: DiskView): SectorSize {
 export type GptProblemCode =
   /** Neither side holds a table this reader can use. */
   | "no-gpt"
+  /**
+   * A side's bytes were not all fetched — a windowed view too small for this
+   * table. A limit of the read, not damage to the disk; the fix is a wider
+   * window, never recreating the table.
+   */
+  | "table-unread"
+  /**
+   * A stale backup header sits mid-disk but its own CRC does not verify, so
+   * the extent it occupies cannot be trusted enough to zero over.
+   */
+  | "stranded-backup-unverifiable"
   /** The primary header or its entry array does not verify. */
   | "primary-corrupt"
   /** The last sector holds no usable backup header. */
@@ -571,14 +601,55 @@ function geometryFor(
   };
 }
 
+/**
+ * Disk-defining header fields on which two sides disagree, as printable
+ * `field X vs Y` strings — empty when the two describe the same disk.
+ *
+ * `MyLBA`, `AlternateLBA`, `PartitionEntryLBA` and the header CRC that covers
+ * them are DELIBERATELY different between a primary and its backup — a backup
+ * is not a byte copy of the primary — so they are not compared: a table where
+ * only those differ is one table, correctly mirrored. Everything else here
+ * describes the disk itself, `LastUsableLBA` included; a difference in any of
+ * it means the two headers describe *different disks*, which is the case this
+ * whole comparison exists to catch. Omitting `LastUsableLBA` let two headers
+ * that put the usable end in different places read back as "the same table".
+ */
+function tableDisagreements(a: GptHeader, b: GptHeader): readonly string[] {
+  const diffs: string[] = [];
+  if (a.revision !== b.revision) {
+    diffs.push(`revision ${hex(a.revision)} vs ${hex(b.revision)}`);
+  }
+  if (a.headerSizeBytes !== b.headerSizeBytes) {
+    diffs.push(`HeaderSize ${a.headerSizeBytes} vs ${b.headerSizeBytes}`);
+  }
+  if (a.firstUsableLba !== b.firstUsableLba) {
+    diffs.push(`FirstUsableLBA ${a.firstUsableLba} vs ${b.firstUsableLba}`);
+  }
+  if (a.lastUsableLba !== b.lastUsableLba) {
+    diffs.push(`LastUsableLBA ${a.lastUsableLba} vs ${b.lastUsableLba}`);
+  }
+  if (a.diskGuid !== b.diskGuid) {
+    diffs.push(`disk GUID ${a.diskGuid} vs ${b.diskGuid}`);
+  }
+  if (a.entryCount !== b.entryCount) {
+    diffs.push(`NumberOfPartitionEntries ${a.entryCount} vs ${b.entryCount}`);
+  }
+  if (a.entrySizeBytes !== b.entrySizeBytes) {
+    diffs.push(
+      `SizeOfPartitionEntry ${a.entrySizeBytes} vs ${b.entrySizeBytes}`,
+    );
+  }
+  if (a.entriesCrc32 !== b.entriesCrc32) {
+    diffs.push(
+      `entry-array CRC ${hex(a.entriesCrc32)} vs ${hex(b.entriesCrc32)}`,
+    );
+  }
+  return diffs;
+}
+
 function sameTable(a: GptSide, b: GptSide): boolean {
   if (a.header === undefined || b.header === undefined) return false;
-  if (a.header.diskGuid !== b.header.diskGuid) return false;
-  if (a.header.firstUsableLba !== b.header.firstUsableLba) return false;
-  if (a.header.entriesCrc32 !== b.header.entriesCrc32) return false;
-  if (a.header.entryCount !== b.header.entryCount) return false;
-  if (a.header.entrySizeBytes !== b.header.entrySizeBytes) return false;
-  return true;
+  return tableDisagreements(a.header, b.header).length === 0;
 }
 
 /** Pick the side a repair should rebuild from. */
@@ -612,6 +683,44 @@ export function diagnoseGpt(parsed: ParsedGpt): GptDiagnosis {
     ? undefined
     : geometryFor(parsed.totalSectors, trusted.side.header!, parsed.sectorSize);
   const expectedLastUsableLba = geometry?.lastUsableLba ?? -1;
+
+  // A side read back "unread" when a windowed view did not fetch the bytes it
+  // needed — the header sector, or the entry array a good header points at
+  // (readGptImage takes the first and last 256 KiB, so a table whose array is
+  // larger, or placed further in, falls outside). That is a limit of THIS
+  // read, not damage to the disk. Folding it into "no-gpt" would tell a caller
+  // to recreate a table that is very likely perfectly sound, and treating an
+  // unread side as "corrupt" would rewrite one this reader simply did not see.
+  // Surface it on its own and refuse to judge or repair until the bytes are in
+  // hand; the fix is a wider window, never recreating the table.
+  const unreadSides = [parsed.primary, parsed.backup].filter((side) =>
+    side.status === "unread"
+  );
+  if (unreadSides.length > 0) {
+    for (const side of unreadSides) {
+      const which = side.lba === 1
+        ? "the primary (LBA 1)"
+        : `the backup (LBA ${side.lba})`;
+      problems.push({
+        code: "table-unread",
+        detail: `${which} side was not fully read` +
+          `${side.note === undefined ? "" : `: ${side.note}`}` +
+          " — this view does not cover the whole table",
+        fix: "read more of the disk and diagnose again: widen the window " +
+          "(readGptImage fetches only the first and last 256 KiB) or parse a " +
+          "fuller image. This is a limit of the read, not damage — leave the " +
+          "table in place",
+        repairable: false,
+      });
+    }
+    return {
+      ok: false,
+      problems,
+      source: "none",
+      expectedLastUsableLba,
+      expectedBackupLba,
+    };
+  }
 
   if (trusted === undefined) {
     problems.push({
@@ -669,13 +778,14 @@ export function diagnoseGpt(parsed: ParsedGpt): GptDiagnosis {
   } else if (
     parsed.primary.status === "ok" && !sameTable(parsed.primary, parsed.backup)
   ) {
+    const diffs = tableDisagreements(
+      parsed.primary.header!,
+      parsed.backup.header!,
+    );
     problems.push({
       code: "headers-disagree",
       detail: `LBA 1 and LBA ${expectedBackupLba} both verify but describe ` +
-        `different tables (disk GUID ${parsed.primary.header!.diskGuid} vs ` +
-        `${parsed.backup.header!.diskGuid}, entry-array CRC ` +
-        `${hex(parsed.primary.header!.entriesCrc32)} vs ` +
-        `${hex(parsed.backup.header!.entriesCrc32)})`,
+        `different disks (${diffs.join("; ")})`,
       fix: "refused on purpose — picking a side silently discards whichever " +
         "table was right. Inspect both with parseGpt() and rewrite the one " +
         "you want with buildGpt()",
@@ -933,17 +1043,57 @@ export function planGptRepair(
     stranded !== undefined && options.zeroStrandedBackup !== false &&
     stranded.header !== undefined && stranded.lba !== geometry.backupHeaderLba
   ) {
+    // The extent to zero is [entryArrayLba .. strandedHeaderLba], and
+    // entryArrayLba is a u64 read straight off the stranded header. `parseGpt`
+    // populates `stranded` for a header whose CRC FAILED too — readSide returns
+    // the decoded struct alongside every status but "no-signature" — so a
+    // stranded header whose own CRC did not verify carries an unverified
+    // entryArrayLba, and sizing a write from it would compute a `RangeError:
+    // Invalid typed array length` when it reads back past its own LBA, or wipe
+    // an arbitrary span of live data when it does not. Refuse that rather than
+    // guess an extent. "bad-entries-crc" and "unread" are NOT refused: readSide
+    // reaches those only after the HEADER CRC has passed, so their
+    // entryArrayLba is trustworthy even though the array bytes are not — and a
+    // disk whose real primary/backup are repairable must not be refused over a
+    // leftover, per GptRepairRefusedError's contract.
+    if (
+      stranded.status === "bad-header-crc" || stranded.status === "unsupported"
+    ) {
+      const problem: GptProblem = {
+        code: "stranded-backup-unverifiable",
+        detail: `a stale "EFI PART" header sits at LBA ${stranded.lba}, but ` +
+          `it did not verify cleanly (${stranded.status}` +
+          `${stranded.note === undefined ? "" : `: ${stranded.note}`}), so ` +
+          "the disk extent it occupies cannot be derived from its fields",
+        fix:
+          "its PartitionEntryLBA is untrustworthy, so it is not zeroed from " +
+          "an unverified header. Inspect the sector with parseGpt(); once you " +
+          "know what is there, pass zeroStrandedBackup: false to repair the " +
+          "table and leave the stale header in place, or clear that sector " +
+          "yourself",
+        repairable: false,
+      };
+      throw new GptRepairRefusedError(
+        "this GPT's repair cannot safely finish:\n" +
+          `  - ${problem.detail}\n    fix: ${problem.fix}`,
+        [problem],
+      );
+    }
     const first = stranded.header.entryArrayLba;
     const last = stranded.lba;
-    const covered = kept.some((entry) =>
-      entry.firstLba <= last && entry.lastLba >= first
-    );
-    if (!covered && first > 1 && last < totalSectors) {
-      writes.push({
-        offsetBytes: first * sectorSize,
-        bytes: new Uint8Array((last - first + 1) * sectorSize),
-        what: `stranded backup (LBA ${first}..${last})`,
-      });
+    // Bound the span even with a verified header: the array must sit at or
+    // before the header it precedes (`first <= last`) and inside the disk.
+    if (first > 1 && first <= last && last < totalSectors) {
+      const covered = kept.some((entry) =>
+        entry.firstLba <= last && entry.lastLba >= first
+      );
+      if (!covered) {
+        writes.push({
+          offsetBytes: first * sectorSize,
+          bytes: new Uint8Array((last - first + 1) * sectorSize),
+          what: `stranded backup (LBA ${first}..${last})`,
+        });
+      }
     }
   }
 
