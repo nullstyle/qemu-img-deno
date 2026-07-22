@@ -79,6 +79,54 @@ export class UnrepresentableContentError extends Error {
 }
 
 /**
+ * `base.virtualSizeBytes` does not match what `qemu-img info` reports.
+ *
+ * Raised by `build()` rather than `plan()` because `plan()` runs no binary: the
+ * only size available to it is the FILE's, which for the Alpine aarch64 cloud
+ * image is 225378304 bytes against a virtual size of 257949696 — a 12.6%
+ * shortfall that looks entirely plausible.
+ *
+ * The two directions mean different things, so they get different messages.
+ * Declaring MORE than the image holds is how a grow request is spelled, since
+ * a recipe has no other way to ask for one; declaring less is a plain
+ * misreading. Neither is silently accommodated.
+ */
+export class BaseImageSizeMismatchError extends Error {
+  /** The base image's path, as declared. */
+  readonly path: string;
+  /** What the recipe declared. */
+  readonly declaredBytes: number;
+  /** What `qemu-img info` reported. */
+  readonly actualBytes: number;
+
+  /** Build the error, branching on which way the numbers disagree. */
+  constructor(path: string, declaredBytes: number, actualBytes: number) {
+    const head = `base image ${path} has a virtual size of ${actualBytes} ` +
+      `bytes; the recipe declares ${declaredBytes}`;
+    const detail = declaredBytes > actualBytes
+      ? ". Declaring more than the image holds is how a recipe asks to GROW " +
+        "it, and growing is not supported here yet. `resize()` alone does not " +
+        "do it: on this image it left the primary GPT header untouched, so " +
+        "`AlternateLBA` and `LastUsableLBA` still named the old final sector, " +
+        "the backup header stayed stranded where the disk used to end, and " +
+        "the new space fell outside the usable range every partitioner reads " +
+        "— measured, adding 1 GiB yielded 1 GiB no partition could occupy. " +
+        "Making it work needs the backup header rewritten at the new tail " +
+        "(the `repairGpt()` work), so until that lands, grow the image out of " +
+        "band, repair its GPT, and declare the size it actually ended up with."
+      : ". Declare the size `qemu-img info` reports for the image you are " +
+        "actually passing. A base image is copied in whole, so this number " +
+        "does not resize anything — it is the assertion that the file on disk " +
+        "is still the one this recipe was written against.";
+    super(head + detail);
+    this.name = "BaseImageSizeMismatchError";
+    this.path = path;
+    this.declaredBytes = declaredBytes;
+    this.actualBytes = actualBytes;
+  }
+}
+
+/**
  * A step needs the guest appliance, and this build was planned without one.
  *
  * Not a stub and not a silent no-op: the message names what the step wanted

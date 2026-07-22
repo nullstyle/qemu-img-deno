@@ -128,6 +128,54 @@ an ESP gets built on a machine with no `mkfs.fat`.
   size available to it is the _file's_ — which for a sparse qcow2 is nowhere
   near the disk's. `build()` checks it against `qemu-img info` and refuses a
   mismatch.
+- **Customizing an existing cloud image, exercised end to end.** The
+  `base.kind: "image"` path had never been run against a real one. It is now,
+  against a sha256-pinned Alpine aarch64 cloud image (`cloud.lock.json`,
+  `deno task smoke:cloud`), and the measured facts about that image are in the
+  lockfile rather than in prose: 257949696 bytes virtual against 225378304 on
+  disk, root on partition 2 as ext4 with 1024-byte blocks, partition 1 a 512 KiB
+  FAT ESP, 5507 files, **89% full with ~35 MiB writable**. The build itself
+  needed no change — a `copyIn` and a `run` landed and `e2fsck` stayed clean on
+  the first try. What needed changing was every way of getting it wrong.
+
+  A `run`/`copyIn` step now **preflights the root partition** before touching
+  it. A declared layout is cross-checked against the kernel's own parse of the
+  GPT; an existing image has no planned geometry to check against, so
+  `rootPartition` was a number nothing verified. Pointing it at Alpine's FAT ESP
+  used to arrive as `mount: … Invalid argument` followed by twelve lines of
+  e2fsck superblock-recovery advice — because the device was registered for
+  `/init`'s `e2fsck` epilogue _before_ the mount was attempted, so the checker
+  ran on FAT too. The node is now waited for (exit `68`, listing the partitions
+  that do exist) and `blkid` must report ext2/3/4 (`69` unrecognizable, `70`
+  something else, named) **before** anything is registered or mounted.
+
+  `blkid` is parsed, not queried. busybox 1.37.0's applet takes `[BLOCKDEV]...`
+  and nothing else: it accepts `-s TYPE -o value` silently and prints the whole
+  line anyway, so the util-linux spelling compares
+  `/dev/vda2: LABEL="/" … TYPE="ext4"` against `ext4` and rejects a good root.
+  It also exits `0` on a device with no filesystem, so the empty output is the
+  signal and the status is not. `ext2` and `ext3` are accepted because the ext4
+  driver mounts them — measured, both at rc 0, both reported as `ext4` in
+  `/proc/mounts`.
+
+- `BaseImageSizeMismatchError`, replacing a bare `Error` — and splitting by
+  direction, because the two disagreements mean different things. Declaring
+  **more** than the image holds is the only way a recipe can spell a grow, and
+  growing is refused with the reason: `resize()` on this image left the primary
+  GPT header untouched, so `AlternateLBA` and `LastUsableLBA` still named the
+  old final sector, the backup header stayed stranded where the disk used to
+  end, and `+1G` yielded 1 GiB outside every partitioner's usable range. Linux
+  parsed the table and mounted it anyway, since it reads the primary — which is
+  why this is refused rather than left to be discovered later. Declaring
+  **less** is a plain misreading and says so. An absent `virtual-size` from
+  `qemu-img info` is also refused now rather than treated as a match.
+- A failed `copyIn` extraction prints `df` for the target root. Cloud images
+  ship nearly full, so ENOSPC is the likeliest failure, and busybox tar reports
+  only `tar: write error: No space left on device` — naming neither the
+  filesystem nor how full it was. Deliberately diagnosis and not a guard: the
+  archive's byte count is not the space it occupies after ext4 rounds every file
+  up to a block, so a precheck would refuse builds that fit. Measured, the step
+  exits `71`, `e2fsck` still passes, and only the base layer publishes.
 - Plan-time refusals for the guest tier: a step id containing `:` (reserved for
   generated layers), a `run`/`copyIn` step with no unambiguous root filesystem,
   a non-absolute or non-normalized `copyIn` destination, a `copyIn` tree the
@@ -228,6 +276,19 @@ an ESP gets built on a machine with no `mkfs.fat`.
   concatenated cpio members resolving later-wins; block devices reject unaligned
   reads, so the payload is sector-framed with an explicit length; and
   `kernel_power_off()` does not sync, so the status record is fsynced.
+- `deno task smoke:cloud` customizes a pinned cloud image and checks the one
+  property a customize flow lives or dies by: that everything it did **not**
+  touch is untouched. It fingerprints the pristine base in the guest (path-set
+  digest, file count, `/etc/os-release` sha256), builds a `copyIn` and a `run`
+  on top, and re-fingerprints — plus refusal coverage for a FAT `rootPartition`,
+  a partition number the image lacks, and a declared grow. Skips cleanly, exit
+  0, with no qemu, no appliance, or no cached image and no network.
+  `cloud.lock.json` is separate from `appliance.lock.json` on purpose: the
+  latter's digest is folded into every guest layer's cache key, so adding a
+  section to it would invalidate every built appliance and cached layer for an
+  image the appliance never touches. Alpine publishes `.sha512` but no `.sha256`
+  sidecar for these, so the lockfile records the published sha512 and the sha256
+  over those same verified bytes.
 - `deno task appliance:run [--arch=…] [--target=…] <step.sh>` runs a step inside
   it. Measured: **0.3 s** on aarch64 under `hvf`, **5.6 s** for x86_64 under TCG
   emulation on Apple Silicon. Guests run with `-nic none`.

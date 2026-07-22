@@ -36,7 +36,10 @@ import {
   totalSizeBytes,
 } from "./plan.ts";
 import { LayerStore, type StoredLayer } from "./store.ts";
-import { GuestExecutorUnavailableError } from "./errors.ts";
+import {
+  BaseImageSizeMismatchError,
+  GuestExecutorUnavailableError,
+} from "./errors.ts";
 import { resolvedDir } from "./resolve.ts";
 import type { ResolvedRecipe, Step } from "./types.ts";
 
@@ -374,19 +377,30 @@ export async function build(
         const base = resolved.recipe.base;
         if (base.kind === "image") {
           const info = await qemu.info(base.from.path, { format: base.format });
-          if (info.virtualSizeBytes !== base.virtualSizeBytes) {
+          // An absent `virtual-size` is not a pass. It means the one check
+          // standing between a recipe and a base image it was not written
+          // against could not run, and treating "unknown" as "matches" is the
+          // silent-acceptance shape this package refuses everywhere else.
+          if (info.virtualSizeBytes === undefined) {
             throw new Error(
-              `base image ${base.from.path} has a virtual size of ` +
-                `${info.virtualSizeBytes} bytes; the recipe declares ` +
-                `${base.virtualSizeBytes}. Every partition LBA and the backup ` +
-                "GPT's position derive from that number, so planning against " +
-                "the wrong one lays out a disk that is not this one.",
+              `qemu-img info reported no virtual size for ${base.from.path} ` +
+                `(format ${base.format}). The declared virtualSizeBytes ` +
+                "cannot be checked against it, so the base is refused rather " +
+                "than accepted unverified. Confirm the format is the image's " +
+                "real one.",
+            );
+          }
+          if (info.virtualSizeBytes !== base.virtualSizeBytes) {
+            throw new BaseImageSizeMismatchError(
+              base.from.path,
+              base.virtualSizeBytes,
+              info.virtualSizeBytes,
             );
           }
           // Copied in, never referenced as a backing file. A backing reference
-          // would bake an absolute host path into a store layer and destroy the
-          // relocatability the store promises — and would leave the layer's
-          // content at the mercy of a file outside the store.
+          // would bake an absolute host path into a store layer and destroy
+          // the relocatability the store promises — and would leave the
+          // layer's content at the mercy of a file outside the store.
           await qemu.convert(base.from.path, imagePath, {
             sourceFormat: base.format,
             format: "qcow2",

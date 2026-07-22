@@ -32,6 +32,7 @@
     "smoke:recipe": "deno run --allow-run --allow-read --allow-write --allow-env tools/recipe_smoke.ts",
     "appliance": "deno run --allow-run=bsdtar,sh --allow-read --allow-write --allow-net=dl-cdn.alpinelinux.org tools/build_appliance.ts",
     "smoke:system": "deno run --allow-run --allow-read --allow-write --allow-env tools/system_smoke.ts",
+    "smoke:cloud": "deno run --allow-run --allow-read --allow-write --allow-env --allow-net=dl-cdn.alpinelinux.org tools/cloud_smoke.ts",
     "appliance:run": "deno run --allow-run --allow-read --allow-write tools/appliance_run.ts",
     "publish:check": "deno run --allow-read tools/check_publish.ts",
     "publish:dry": "deno publish --dry-run"

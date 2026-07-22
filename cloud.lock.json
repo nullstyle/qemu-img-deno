@@ -1,0 +1,51 @@
+{
+  "lockfileVersion": 1,
+  "_comment": [
+    "Pinned cloud images for tools/cloud_smoke.ts — a base image this package",
+    "did NOT produce, which is the whole point: every other smoke validates",
+    "bytes we wrote against oracles, and this one validates that customizing",
+    "someone else's artifact leaves it intact.",
+    "",
+    "Separate from appliance.lock.json on purpose. readApplianceIdentity()",
+    "folds that file's sha256 into every guest layer's cache key, so adding a",
+    "section to it would invalidate every appliance already built and every",
+    "layer already cached — for an image the appliance never touches.",
+    "",
+    "Alpine publishes .sha512 and a GPG .asc for these, but no .sha256 sidecar.",
+    "`sha512` below is the published digest, verified against the sidecar at",
+    "the URL; `sha256` is over the same verified bytes and is what the fetcher",
+    "enforces, so the pin matches the rest of this repo's spelling.",
+    "",
+    "The `measured` block is a property of the pinned bytes, not of Alpine:",
+    "every figure was read out of THIS file, and the smoke asserts them rather",
+    "than restating them in code. Refresh the whole entry together."
+  ],
+  "images": {
+    "alpine-aarch64": {
+      "url": "https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/cloud/generic_alpine-3.21.7-aarch64-uefi-cloudinit-r0.qcow2",
+      "file": "generic_alpine-3.21.7-aarch64-uefi-cloudinit-r0.qcow2",
+      "arch": "aarch64",
+      "format": "qcow2",
+      "sizeBytes": 225378304,
+      "sha256": "53598a689858f4fb44a3d30bb84d271a62dbaf69dd8236e14edd3a11924d2ee6",
+      "sha512": "8dc1f3c12dc00a84438cd1a6fc95932e1e91cd6f3a9d0080b26df135e44db22c39a95e3201f418122e65e73909518f04508579d97e0855f8ab67fa1f082e0abf",
+      "measured": {
+        "virtualSizeBytes": 257949696,
+        "clusterSize": 65536,
+        "rootPartition": 2,
+        "rootFilesystem": "ext4",
+        "rootLabel": "/",
+        "rootBlockSizeBytes": 1024,
+        "rootTotalBlocks": 249856,
+        "rootFreeBlocks": 40729,
+        "rootReservedBlocks": 12492,
+        "writableBytesAsRoot": 37509120,
+        "espPartition": 1,
+        "espFilesystem": "vfat",
+        "espLengthBytes": 524288,
+        "regularFileCount": 5507,
+        "osReleaseSha256": "d5ea128b80aea23a85e41f25be80f54ea454a61ab8a1ed92cca4fc1db67afe1e"
+      }
+    }
+  }
+}
