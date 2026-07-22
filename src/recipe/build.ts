@@ -41,7 +41,7 @@ import {
   GuestExecutorUnavailableError,
 } from "./errors.ts";
 import { resolvedDir } from "./resolve.ts";
-import type { ResolvedRecipe, Step } from "./types.ts";
+import type { DirInput, ResolvedInput, ResolvedRecipe, Step } from "./types.ts";
 
 /** vvfat's own MBR occupies the first 32256 bytes; a window past it is the
  * bare filesystem. */
@@ -75,8 +75,25 @@ export interface Artifact {
   readonly realizationKey: RealizationKey;
   /** Per-layer provenance, base first. */
   readonly layers: readonly StoredLayer[];
-  /** Which layers were served from cache. */
-  readonly cacheHits: readonly string[];
+  /**
+   * The {@linkcode StoredLayer.realizationKey} of every layer served from
+   * cache, so `layers` can actually be filtered by it:
+   *
+   * ```ts
+   * import type { Artifact } from "@nullstyle/qemu-img/recipe";
+   * declare const artifact: Artifact;
+   * const hits = artifact.layers.filter((layer) =>
+   *   artifact.cacheHits.includes(layer.realizationKey)
+   * );
+   * ```
+   *
+   * BREAKING in 0.3.0: this held `step.id` while being typed `readonly
+   * string[]` and documented as naming layers, so the filter above compiled
+   * and returned `[]` forever — the shape this package refuses everywhere
+   * else. A step id is still recoverable: `StoredLayer.recipeKey` is the
+   * `PlannedStep.recipeKey` the plan already carries.
+   */
+  readonly cacheHits: readonly RealizationKey[];
 }
 
 /** Map a recipe partition type to its spec GUID. */
@@ -88,6 +105,217 @@ function typeGuidFor(type: string, arch: string): string {
       : PARTITION_TYPE_GUIDS["linux-root-x86_64"];
   }
   return PARTITION_TYPE_GUIDS["linux-generic"];
+}
+
+/**
+ * The epoch whose LOCAL rendering equals `epoch`'s UTC calendar time.
+ *
+ * qemu's vvfat renders every timestamp through `localtime_r` before packing it
+ * into a FAT directory entry, and FAT stores local time with no offset field —
+ * so the same `sourceDateEpoch` lands as a different calendar time, and
+ * different bytes, on every host whose clock is not set to UTC. Measured on
+ * qemu 11.0.2: the same pinned tree converted under `TZ=UTC` and
+ * `TZ=Asia/Tokyo` differs in 75 bytes.
+ *
+ * Pre-shifting the host mtime by the host's own UTC offset cancels that, so
+ * the entry records `sourceDateEpoch` read as UTC wherever it is built. The
+ * one instant this cannot express is a local time inside a spring-forward gap,
+ * which does not exist and which the `Date` constructor normalizes forward by
+ * the gap's width; a recipe pinned there records an hour later on hosts in
+ * that zone. That is strictly narrower than the every-zone-differs it
+ * replaces, so it is documented rather than refused.
+ */
+function vvfatLocalEpoch(epoch: number): number {
+  const utc = new Date(epoch * 1000);
+  const local = new Date(
+    utc.getUTCFullYear(),
+    utc.getUTCMonth(),
+    utc.getUTCDate(),
+    utc.getUTCHours(),
+    utc.getUTCMinutes(),
+    utc.getUTCSeconds(),
+    0,
+  );
+  return Math.floor(local.getTime() / 1000);
+}
+
+/** One live entry of a staging tree, with the path it is recorded under. */
+interface LiveEntry {
+  /** Path relative to the tree root, `/`-separated. */
+  readonly path: string;
+  /** Absolute path on the host. */
+  readonly full: string;
+  /** What the host says it is. */
+  readonly info: Deno.FileInfo;
+}
+
+/** Walk a staging tree parents-first, in the resolver's byte-wise order. */
+async function* liveEntries(
+  root: string,
+  prefix = "",
+): AsyncGenerator<LiveEntry> {
+  const children: Deno.DirEntry[] = [];
+  for await (const child of Deno.readDir(`${root}/${prefix}`)) {
+    children.push(child);
+  }
+  // Byte-wise, matching `walkTree()` in ./resolve.ts — a locale-aware sort
+  // would make the order depend on the machine's collation settings.
+  children.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+  for (const child of children) {
+    const path = prefix === "" ? child.name : `${prefix}/${child.name}`;
+    const full = `${root}/${path}`;
+    const info = await Deno.lstat(full);
+    yield { path, full, info };
+    if (info.isDirectory && !info.isSymlink) yield* liveEntries(root, path);
+  }
+}
+
+/**
+ * Copy a FAT staging tree into `scratch`, verified against the digest the
+ * resolver recorded, with every timestamp pinned.
+ *
+ * One copy fixes two defects, and both are cache-poisoning rather than
+ * cosmetic.
+ *
+ * **The tree vvfat reads must be the tree the key names.** `qemu-img` opens
+ * the staging directory at BUILD time, but the layer's realization key was
+ * computed from the digest `resolveRecipe()` took earlier. Editing the tree
+ * in between published the new bytes under the old tree's key — permanently,
+ * because a later hit serves that layer without ever re-reading the tree.
+ * Copying first and hashing the COPY closes the window rather than narrowing
+ * it: vvfat reads bytes this function already checked against the manifest,
+ * and nothing outside can reach them afterwards. This is the re-hash
+ * {@linkcode tarOf} already does for `copyIn`, extended to the tree's SHAPE —
+ * a tree that gained a file would otherwise be published without it, which is
+ * the same silent shortfall from the other direction.
+ *
+ * **vvfat stamps the host's timestamps into every directory entry.** It reads
+ * `st_mtime`, `st_atime` and `st_ctime` off each file and packs them into the
+ * entry's write, access and creation fields; it takes no time option, so
+ * `determinism.sourceDateEpoch` never reaches it. Measured against qemu
+ * 11.0.2 on macOS-aarch64, over a two-file tree: re-staging identical content
+ * moved 30 bytes, and moving the mtimes alone, the atimes alone, a
+ * subdirectory's own mtime, or the root directory's own mtime each moved the
+ * image on its own (28–33 bytes). Pinning mtime and atime on the copy — every
+ * file, every directory, and the root — settles the write-time and
+ * access-date fields for good.
+ *
+ * It does NOT settle `st_ctime`, and that limit is the kernel's rather than
+ * this code's: no userspace call sets it, and `utimes()` bumps it to now as a
+ * side effect of pinning the other two. Measured end to end, two builds of one
+ * recipe from separately staged trees six seconds apart: 16 differing bytes
+ * before this function existed, 8 after — and all 8 sit at offset 14 of a
+ * 32-byte directory entry, which is `DIR_CrtTime`. So a FAT layer is still not
+ * byte-reproducible across two builds far enough apart in wall clock. Closing
+ * that means rewriting the creation fields after the convert, which needs a
+ * FAT directory walker — it belongs beside the other format writers in
+ * `src/fs/`, not here.
+ *
+ * A hardlink farm is not an option for the copy: mtime is inode metadata, so
+ * `Deno.utime()` through a link moves the ORIGINAL's mtime too — measured, and
+ * it would mutate the caller's staging tree. Symlinks never reach here, since
+ * `plan()` refuses a FAT tree that has one; one appearing after `resolve()` is
+ * refused below with the rest of the drift.
+ */
+async function stageFatTree(
+  scratch: string,
+  stepId: string,
+  from: DirInput,
+  recorded: ResolvedInput,
+  epoch: number,
+): Promise<string> {
+  // An entry-less resolution is not a pass. The digest in the key was taken
+  // over a walk this build cannot reconstruct, so there is nothing to check
+  // the tree against — and treating "unverifiable" as "matches" is the
+  // silent-acceptance shape refused for the base image's size above.
+  if (recorded.entries === undefined) {
+    throw new Error(
+      `${stepId}: the resolver recorded no entries for ${from.path}, so the ` +
+        "staging tree cannot be checked against the digest its cache key " +
+        "names. Resolve directory inputs with LocalInputResolver, or have " +
+        "the custom resolver populate ResolvedInput.entries.",
+    );
+  }
+  const root = await Deno.makeTempDir({ dir: scratch, prefix: "vvfat-" });
+  const expected = new Map(
+    recorded.entries.map((entry) => [entry.path, entry]),
+  );
+  const seen = new Set<string>();
+  const drifted = (path: string, what: string): Error =>
+    new Error(
+      `${stepId}: ${path} ${what} between resolving this recipe and building ` +
+        "it. The layer's key names the tree the resolver walked, so " +
+        "publishing this would cache the wrong bytes under it. Re-run " +
+        "resolveRecipe() after changing a staging tree.",
+    );
+
+  for await (const entry of liveEntries(from.path)) {
+    const want = expected.get(entry.path);
+    if (want === undefined) throw drifted(entry.path, "appeared");
+    seen.add(entry.path);
+    const type = entry.info.isSymlink
+      ? "symlink"
+      : entry.info.isDirectory
+      ? "dir"
+      : "file";
+    if (type !== want.type) {
+      throw drifted(entry.path, `changed from a ${want.type} to a ${type}`);
+    }
+    // The mode is in the resolver's manifest, and `plan()` derives a tree's
+    // required traits from it — a file that gained the executable or setuid
+    // bit after resolving is one plan() would have refused for FAT, so
+    // building it anyway would drop metadata the recipe was checked against.
+    if ((entry.info.mode ?? 0) !== want.mode) {
+      throw drifted(
+        entry.path,
+        `changed mode from ${want.mode.toString(8)} to ` +
+          `${(entry.info.mode ?? 0).toString(8)}`,
+      );
+    }
+    const target = `${root}/${entry.path}`;
+    if (type === "dir") {
+      await Deno.mkdir(target, { recursive: true });
+      continue;
+    }
+    if (type === "symlink") {
+      // Unreachable through plan(), which refuses a FAT tree carrying one —
+      // FAT has no symlinks, so vvfat would follow it and copy the target's
+      // bytes in under the link's name. Refused here too rather than copied,
+      // because reaching this line means the plan and the tree disagree.
+      throw new Error(
+        `${stepId}: ${entry.path} is a symlink, and FAT cannot represent one. ` +
+          "plan() refuses a FAT staging tree containing symlinks, so this " +
+          "tree is not the one that was planned. Re-run resolveRecipe() and " +
+          "plan(), or replace the link with the file it points at.",
+      );
+    }
+    await Deno.copyFile(entry.full, target);
+    // The COPY, not the source: this is the byte sequence vvfat will read, so
+    // it is the one whose digest has to match the key.
+    const actual = await sha256Hex(await Deno.readFile(target));
+    if (want.sha256 !== undefined && actual !== want.sha256) {
+      throw drifted(
+        entry.path,
+        `changed content (recorded ${want.sha256.slice(0, 12)}, now ` +
+          `${actual.slice(0, 12)})`,
+      );
+    }
+  }
+  for (const path of expected.keys()) {
+    if (!seen.has(path)) throw drifted(path, "was removed");
+  }
+
+  // Deepest first, and the root last. Order is not load-bearing for mtime —
+  // changing a child's timestamps does not touch its parent's — but creating
+  // an entry inside a directory DOES, so every directory has to be pinned
+  // after the last thing written into it.
+  const pinned = vvfatLocalEpoch(epoch);
+  const paths = [...expected.keys()].sort((a, b) =>
+    b.split("/").length - a.split("/").length
+  );
+  for (const path of paths) await Deno.utime(`${root}/${path}`, pinned, pinned);
+  await Deno.utime(root, pinned, pinned);
+  return root;
 }
 
 /** A `raw` window onto a qcow2 layer, for splicing bytes into one partition. */
@@ -163,26 +391,42 @@ async function runBytesLayer(
     if (!own.includes(index)) continue;
     const contents = step.partitions[index].contents;
     if (contents.kind !== "fat") continue;
-    // vvfat synthesizes the filesystem from the host directory; the `raw`
-    // window at 32256 strips vvfat's own MBR, so the partition type byte is
-    // ours rather than vvfat's 0x06.
-    await qemu.convert(
-      {
-        imageOpts: {
-          driver: "raw",
-          offset: VVFAT_MBR_BYTES,
-          size: partition.lengthBytes,
-          file: {
-            driver: "vvfat",
-            dir: contents.from.path,
-            "fat-type": contents.fatType,
-            label: contents.label,
+    // Never `contents.from.path`: qemu would read the staging tree live, at
+    // build time, under a key computed from the digest the resolver took
+    // earlier. See stageFatTree().
+    const staged = await stageFatTree(
+      scratch,
+      step.id,
+      contents.from,
+      resolvedDir(resolved, contents.from),
+      recipe.determinism.sourceDateEpoch,
+    );
+    try {
+      // vvfat synthesizes the filesystem from the host directory; the `raw`
+      // window at 32256 strips vvfat's own MBR, so the partition type byte is
+      // ours rather than vvfat's 0x06.
+      await qemu.convert(
+        {
+          imageOpts: {
+            driver: "raw",
+            offset: VVFAT_MBR_BYTES,
+            size: partition.lengthBytes,
+            file: {
+              driver: "vvfat",
+              dir: staged,
+              "fat-type": contents.fatType,
+              label: contents.label,
+            },
           },
         },
-      },
-      window(imagePath, partition.offsetBytes, partition.lengthBytes),
-      { noCreate: true, parallel: 1 },
-    );
+        window(imagePath, partition.offsetBytes, partition.lengthBytes),
+        { noCreate: true, parallel: 1 },
+      );
+    } finally {
+      // A snapshot is a full copy of the ESP tree, so leaving it behind would
+      // grow the store's scratch by one ESP per built layer.
+      await Deno.remove(staged, { recursive: true }).catch(() => {});
+    }
   }
 }
 
@@ -296,7 +540,11 @@ async function tarOf(
         type: "symlink",
         mode: entry.mode,
         mtime,
-        linkTarget: entry.linkTarget ?? "",
+        // Passed through undefined rather than defaulted to "": buildTar()
+        // refuses a symlink with no target, because an empty linkname
+        // extracts as a dangling link. `?? ""` satisfied the guard's letter
+        // and produced exactly the link it exists to prevent.
+        linkTarget: entry.linkTarget,
       });
       continue;
     }
@@ -340,7 +588,7 @@ export async function build(
   await Deno.mkdir(`${store.root}/layers`, { recursive: true });
 
   const layers: StoredLayer[] = [];
-  const cacheHits: string[] = [];
+  const cacheHits: RealizationKey[] = [];
   let parent: StoredLayer | undefined;
 
   for (const step of plan.steps) {
@@ -363,7 +611,7 @@ export async function build(
       ? await store.get(key, { trust: options.trustCache })
       : undefined;
     if (cached !== undefined) {
-      cacheHits.push(step.id);
+      cacheHits.push(cached.realizationKey);
       layers.push(cached);
       parent = cached;
       continue;
