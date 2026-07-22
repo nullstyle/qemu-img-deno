@@ -299,22 +299,55 @@ try {
     qemu,
     guest,
   });
-  const mkfsIndex = planned.steps.findIndex((s) => s.id === "table:mkfs");
+  // Compare the GUEST-VISIBLE partition bytes, never the layer's
+  // `containerSha256`. That digest covers the qcow2 container, which
+  // `store.ts` documents as "deliberately the wrong artifact identity — it
+  // moves with cluster layout": measured, three cold builds of this very
+  // recipe produced two different container digests and ONE ext4 image, so
+  // asserting on the container is a flaky test of a property that holds.
+  const rootPart = planned.layout!.find((p) => p.filesystem === "ext4")!;
+  const ext4Digest = async (image: string): Promise<string> => {
+    const raw = `${work}/cmp-${crypto.randomUUID()}.raw`;
+    await qemu.convert(
+      {
+        imageOpts: {
+          driver: "raw",
+          offset: rootPart.offsetBytes,
+          size: rootPart.lengthBytes,
+          file: { driver: "qcow2", file: { driver: "file", filename: image } },
+        },
+      },
+      raw,
+      { format: "raw", parallel: 1 },
+    );
+    const digest = await crypto.subtle.digest(
+      "SHA-256",
+      await Deno.readFile(raw),
+    );
+    await Deno.remove(raw).catch(() => {});
+    return Array.from(new Uint8Array(digest))
+      .map((b) => b.toString(16).padStart(2, "0")).join("");
+  };
   // This is what turns the mke2fs determinism flags from a claim into a
   // tested property. Without E2FSPROGS_FAKE_TIME, -U and -E hash_seed the two
   // filesystems differ, every descendant's key moves, and the store thrashes.
+  // The MKFS LAYER, never the finished artifact. The copyIn layer above it
+  // mounts the filesystem read-write, and a rw mount stamps s_mtime, s_wtime
+  // and s_mount_count with no way back — so the artifact is content-
+  // reproducible but deliberately not byte-reproducible, exactly as the
+  // guest-tier hazard table says. Comparing it here would test the opposite
+  // of the property this asserts.
+  const mkfsIndex = planned.steps.findIndex((s) => s.id === "table:mkfs");
+  const [first, second] = await Promise.all([
+    ext4Digest(artifact.layers[mkfsIndex].path),
+    ext4Digest(rebuilt.layers[mkfsIndex].path),
+  ]);
   assert(
-    artifact.layers[mkfsIndex].containerSha256 ===
-      rebuilt.layers[mkfsIndex].containerSha256,
+    first === second,
     "two independent boots produced byte-identical ext4:\n" +
-      `  first  ${artifact.layers[mkfsIndex].containerSha256}\n` +
-      `  second ${rebuilt.layers[mkfsIndex].containerSha256}`,
+      `  first  ${first}\n  second ${second}`,
   );
-  pass(
-    `ext4 layer is byte-identical across boots (${
-      artifact.layers[mkfsIndex].containerSha256.slice(0, 16)
-    }…)`,
-  );
+  pass(`ext4 is byte-identical across boots (${first.slice(0, 16)}…)`);
 
   console.log("\nsystem smoke: all green");
 } catch (error) {
