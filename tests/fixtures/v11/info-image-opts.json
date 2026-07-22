@@ -1,0 +1,26 @@
+{
+    "children": [
+        {
+            "name": "file",
+            "info": {
+                "children": [
+                ],
+                "virtual-size": 1048576,
+                "filename": "plain.raw",
+                "format": "file",
+                "actual-size": 1048576,
+                "format-specific": {
+                    "type": "file",
+                    "data": {
+                    }
+                },
+                "dirty-flag": false
+            }
+        }
+    ],
+    "virtual-size": 1048576,
+    "filename": "plain.raw",
+    "format": "raw",
+    "actual-size": 1048576,
+    "dirty-flag": false
+}

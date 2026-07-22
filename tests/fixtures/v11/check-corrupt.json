@@ -1,0 +1,8 @@
+{
+    "image-end-offset": 65536,
+    "total-clusters": 64,
+    "corruptions": 3,
+    "check-errors": 0,
+    "filename": "corrupt.qcow2",
+    "format": "qcow2"
+}

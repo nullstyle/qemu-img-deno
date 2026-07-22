@@ -30,6 +30,22 @@ export interface CallOptions {
   readonly timeoutMs?: number;
 }
 
+/**
+ * The {@linkcode RunOptions} a verb may set on top of the client defaults.
+ *
+ * Cancellation (`signal`/`timeoutMs`) is composed separately by
+ * {@linkcode buildRunOptions}; everything here is passed straight through.
+ * The stream dispositions belong in this set because
+ * {@linkcode import("./qemu_img.ts").QemuImg.prototype.raw} is the documented
+ * way out of the captured-pipe hang described on
+ * {@linkcode RunOptions.stdout}, and a workaround that cannot be reached is
+ * not a workaround.
+ */
+export type RunOverrides = Pick<
+  RunOptions,
+  "stdin" | "uncapped" | "stdout" | "stderr"
+>;
+
 /** {@linkcode QemuImgOptions} with defaults applied. */
 export interface ResolvedOptions {
   readonly runner: CommandRunner;
@@ -58,7 +74,7 @@ export function resolveOptions(options: QemuImgOptions = {}): ResolvedOptions {
 export function buildRunOptions(
   defaults: ResolvedOptions,
   call: CallOptions = {},
-  extra: Pick<RunOptions, "stdin" | "uncapped"> = {},
+  extra: RunOverrides = {},
 ): RunOptions {
   const signals = [defaults.signal, call.signal].filter(
     (signal): signal is AbortSignal => signal !== undefined,

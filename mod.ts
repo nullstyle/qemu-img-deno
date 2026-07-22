@@ -41,7 +41,11 @@ export {
 } from "./src/runner.ts";
 
 // Options:
-export { type CallOptions, type QemuImgOptions } from "./src/options.ts";
+export {
+  type CallOptions,
+  type QemuImgOptions,
+  type RunOverrides,
+} from "./src/options.ts";
 
 // Errors:
 export {

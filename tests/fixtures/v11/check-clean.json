@@ -1,0 +1,7 @@
+{
+    "image-end-offset": 262144,
+    "total-clusters": 64,
+    "check-errors": 0,
+    "filename": "clean.qcow2",
+    "format": "qcow2"
+}

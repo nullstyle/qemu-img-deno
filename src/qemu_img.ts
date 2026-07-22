@@ -21,6 +21,7 @@ import {
   type QemuImgOptions,
   type ResolvedOptions,
   resolveOptions,
+  type RunOverrides,
 } from "./options.ts";
 import { QemuImgMissingError, QemuImgUnsafeOperationError } from "./errors.ts";
 import {
@@ -389,13 +390,16 @@ export class QemuImg {
   /** Create a client; all options default (real runner, `"qemu-img"`). */
   constructor(options: QemuImgOptions = {}) {
     this.#o = resolveOptions(options);
+    // The tag needs no separator: it is the argument of `-c`/`-a`/`-d`, so
+    // getopt consumes it whatever it starts with (measured: `snapshot -c -x`
+    // creates a snapshot tagged `-x`). Only the path can be mistaken for one.
     this.snapshot = {
       create: (path, tag, call = {}) =>
-        this.#checkedVoid(["snapshot", "-c", tag, path], call),
+        this.#checkedVoid(["snapshot", "-c", tag, ...operands(path)], call),
       apply: (path, tag, call = {}) =>
-        this.#checkedVoid(["snapshot", "-a", tag, path], call),
+        this.#checkedVoid(["snapshot", "-a", tag, ...operands(path)], call),
       delete: (path, tag, call = {}) =>
-        this.#checkedVoid(["snapshot", "-d", tag, path], call),
+        this.#checkedVoid(["snapshot", "-d", tag, ...operands(path)], call),
       list: async (path, call = {}) =>
         (await this.info(path, call)).snapshots ?? [],
     };
@@ -406,7 +410,19 @@ export class QemuImg {
     return this.#o.bin;
   }
 
-  /** Whether `qemu-img --version` runs successfully (`false` when the binary is missing). */
+  /**
+   * Whether `qemu-img --version` runs successfully.
+   *
+   * Answers rather than throwing for every way the binary itself can be
+   * unusable: absent (`NotFound`), and present but not executable — a plain
+   * file without `+x`, or a directory on `PATH` — which `Deno.Command` raises
+   * as `PermissionDenied` (`os error 13`), not `NotFound`.
+   *
+   * A missing `--allow-run` grant is deliberately *not* swallowed. Deno 2
+   * raises that as `Deno.errors.NotCapable`, a distinct class, and it is a
+   * defect in the calling program rather than a statement about the host —
+   * reporting `false` would send the caller off to reinstall QEMU.
+   */
   async available(options: CallOptions = {}): Promise<boolean> {
     try {
       const result = await this.#o.runner.run(
@@ -416,7 +432,7 @@ export class QemuImg {
       );
       return result.success;
     } catch (error) {
-      if (error instanceof Deno.errors.NotFound) return false;
+      if (isMissingBinary(error)) return false;
       throw error;
     }
   }
@@ -438,10 +454,7 @@ export class QemuImg {
         buildRunOptions(this.#o, options),
       );
     } catch (error) {
-      if (error instanceof Deno.errors.NotFound) {
-        throw new QemuImgMissingError(this.#o.bin);
-      }
-      throw error;
+      throw asMissingBinary(error, this.#o.bin);
     }
     if (!result.success) throw new QemuImgMissingError(this.#o.bin);
     return parseQemuImgVersion(result.stdout);
@@ -455,7 +468,7 @@ export class QemuImg {
       ...(options.force === true ? ["--force"] : []),
       "-o",
       formatOptionsArg(options.options),
-      path,
+      ...operands(path),
     ], options);
   }
 
@@ -477,7 +490,7 @@ export class QemuImg {
       ...flag("-S", options.stepSize),
       ...(options.write === true ? ["-w"] : []),
       ...(options.noDrain === true ? ["--no-drain"] : []),
-      path,
+      ...operands(path),
     ], options);
     return result.stdout;
   }
@@ -503,16 +516,27 @@ export class QemuImg {
       "bitmap",
       ...flag("-f", options.format),
       ...actionArgs,
-      path,
-      name,
+      ...operands(path, name),
     ], options);
   }
 
   /**
    * Check image consistency: `qemu-img check --output=json <path>`.
-   * Exit codes `0`/`2`/`3` (clean / corruptions / unrepaired leaks) all
-   * produce a {@linkcode CheckResult} — inspect {@linkcode CheckResult.code};
-   * any other exit throws a `CommandError`.
+   *
+   * The contract is "a report whenever qemu-img produced one". Exit codes
+   * `0`/`2`/`3` (clean / corruptions / unrepaired leaks) always produce a
+   * {@linkcode CheckResult}, and so does exit `1` *when a report reached
+   * stdout* — `img_check()` dumps the JSON before it decides the exit status,
+   * so a run whose internal `check-errors` are nonzero prints a complete
+   * report and then exits `1`. Discarding that report would throw away the
+   * only field naming what went wrong. Always inspect
+   * {@linkcode CheckResult.code}: `1` means the check did not finish, so its
+   * counters are partial and "no corruptions" is not a clean bill of health.
+   *
+   * Exits that produce no report throw a `CommandError`: `1` with empty
+   * stdout (the image could not be opened — a missing file, a wrong `-f`, a
+   * header qemu rejects) and `63` (the format implements no check at all,
+   * e.g. raw). All measured on qemu-img 11.0.2.
    *
    * This validates the image's internal structure (refcounts, cluster
    * references), not that it holds the data you expect. qcow2 does flag a
@@ -529,10 +553,13 @@ export class QemuImg {
       ...flag("-f", options.format),
       ...flag("-r", options.repair),
       "--output=json",
-      path,
+      ...operands(path),
     ];
     const result = await this.#run(args, options, { uncapped: true });
-    if (!result.success && result.code !== 2 && result.code !== 3) {
+    const reported = result.code === 0 || result.code === 2 ||
+      result.code === 3 ||
+      (result.code === 1 && result.stdout.trimStart().startsWith("{"));
+    if (!reported) {
       throw new CommandError(result, this.#o.bin, args);
     }
     return parseCheckResult(result.stdout, result.code);
@@ -546,7 +573,7 @@ export class QemuImg {
       ...flag("-b", options.base),
       ...(options.drop === true ? ["-d"] : []),
       ...flag("-r", options.rate),
-      path,
+      ...operands(path),
     ], options);
   }
 
@@ -579,8 +606,7 @@ export class QemuImg {
         ? ["--image-opts"]
         : [...flag("-f", options.format), ...flag("-F", options.formatB)]),
       ...(options.strict === true ? ["-s"] : []),
-      refArg(a),
-      refArg(b),
+      ...operands(refArg(a), refArg(b)),
     ];
     const result = await this.#run(args, options);
     if (result.code !== 0 && result.code !== 1) {
@@ -664,8 +690,7 @@ export class QemuImg {
       ...(options.salvage === true ? ["--salvage"] : []),
       ...(options.targetIsZero === true ? ["--target-is-zero"] : []),
       ...(destIsGraph ? ["--target-image-opts"] : ["-O", options.format!]),
-      ...sources.map(refArg),
-      refArg(dest),
+      ...operands(...sources.map(refArg), refArg(dest)),
     ], options);
   }
 
@@ -680,8 +705,10 @@ export class QemuImg {
       ...(options.options === undefined
         ? []
         : ["-o", formatOptionsArg(options.options)]),
-      path,
-      ...(options.size === undefined ? [] : [sizeArg(options.size)]),
+      ...operands(
+        path,
+        ...(options.size === undefined ? [] : [sizeArg(options.size)]),
+      ),
     ], options);
   }
 
@@ -712,7 +739,7 @@ export class QemuImg {
         "info",
         ...(graph ? ["--image-opts"] : flag("-f", options.format)),
         "--output=json",
-        refArg(path),
+        ...operands(refArg(path)),
       ],
       options,
       { uncapped: true },
@@ -735,7 +762,7 @@ export class QemuImg {
         ...(graph ? ["--image-opts"] : flag("-f", options.format)),
         "--backing-chain",
         "--output=json",
-        refArg(path),
+        ...operands(refArg(path)),
       ],
       options,
       { uncapped: true },
@@ -754,7 +781,7 @@ export class QemuImg {
         "map",
         ...(graph ? ["--image-opts"] : flag("-f", options.format)),
         "--output=json",
-        refArg(path),
+        ...operands(refArg(path)),
       ],
       options,
       { uncapped: true },
@@ -791,7 +818,7 @@ export class QemuImg {
         "--output=json",
         ...(hasSize
           ? ["--size", sizeArg(options.size!)]
-          : [refArg(options.source!)]),
+          : operands(refArg(options.source!))),
       ],
       options,
       { uncapped: true },
@@ -831,7 +858,7 @@ export class QemuImg {
       "-b",
       options.backing,
       ...flag("-F", options.backingFormat),
-      path,
+      ...operands(path),
     ], options);
   }
 
@@ -848,49 +875,75 @@ export class QemuImg {
         ? []
         : [`--preallocation=${options.preallocation}`]),
       ...(options.shrink === true ? ["--shrink"] : []),
-      path,
+      // Only the path takes the separator: qemu-img pops the size off argv
+      // before getopt runs, so a relative "-512M" is never option-parsed.
+      ...operands(path),
       sizeArg(size),
     ], options);
   }
 
-  /** Escape hatch: run raw qemu-img argv through the seam (recorded by fakes like everything else). */
+  /**
+   * Escape hatch: run raw qemu-img argv through the seam (recorded by fakes
+   * like everything else).
+   *
+   * Every {@linkcode RunOptions} field is forwarded, `stdout`/`stderr`
+   * included — those two are the documented way out of the captured-pipe hang
+   * described on {@linkcode RunOptions.stdout}, and this method is the only
+   * place a caller can set them.
+   */
   async raw(
     args: readonly string[],
     options: RunOptions = {},
   ): Promise<CommandResult> {
-    return await this.#o.runner.run(this.#o.bin, args, {
-      ...buildRunOptions(this.#o, options, {
-        ...(options.stdin === undefined ? {} : { stdin: options.stdin }),
-        ...(options.uncapped === undefined
-          ? {}
-          : { uncapped: options.uncapped }),
-      }),
-    });
+    try {
+      return await this.#o.runner.run(
+        this.#o.bin,
+        args,
+        buildRunOptions(this.#o, options, {
+          ...(options.stdin === undefined ? {} : { stdin: options.stdin }),
+          ...(options.uncapped === undefined
+            ? {}
+            : { uncapped: options.uncapped }),
+          ...(options.stdout === undefined ? {} : { stdout: options.stdout }),
+          ...(options.stderr === undefined ? {} : { stderr: options.stderr }),
+        }),
+      );
+    } catch (error) {
+      throw asMissingBinary(error, this.#o.bin);
+    }
   }
 
-  #run(
+  async #run(
     args: readonly string[],
     call: CallOptions,
-    extra: Pick<RunOptions, "stdin" | "uncapped"> = {},
+    extra: RunOverrides = {},
   ): Promise<CommandResult> {
-    return this.#o.runner.run(
-      this.#o.bin,
-      args,
-      buildRunOptions(this.#o, call, extra),
-    );
+    try {
+      return await this.#o.runner.run(
+        this.#o.bin,
+        args,
+        buildRunOptions(this.#o, call, extra),
+      );
+    } catch (error) {
+      throw asMissingBinary(error, this.#o.bin);
+    }
   }
 
-  #checked(
+  async #checked(
     args: readonly string[],
     call: CallOptions,
-    extra: Pick<RunOptions, "stdin" | "uncapped"> = {},
+    extra: RunOverrides = {},
   ): Promise<CommandResult> {
-    return runChecked(
-      this.#o.runner,
-      this.#o.bin,
-      args,
-      buildRunOptions(this.#o, call, extra),
-    );
+    try {
+      return await runChecked(
+        this.#o.runner,
+        this.#o.bin,
+        args,
+        buildRunOptions(this.#o, call, extra),
+      );
+    } catch (error) {
+      throw asMissingBinary(error, this.#o.bin);
+    }
   }
 
   async #checkedVoid(
@@ -906,6 +959,30 @@ function flag(
   value: string | number | undefined,
 ): string[] {
   return value === undefined ? [] : [name, sizeArg(value)];
+}
+
+/**
+ * Whether a spawn failure means "this binary cannot be run", as opposed to a
+ * failure of the command itself.
+ *
+ * `NotFound` is a binary that is not on `PATH`; `PermissionDenied` (`os error
+ * 13`) is one that exists but cannot be executed — no `+x`, or a directory
+ * with the name. Deno 2 reports a missing `--allow-run` grant as `NotCapable`
+ * instead, which is excluded on purpose: that is the calling program's bug,
+ * and it must keep surfacing as itself.
+ */
+function isMissingBinary(error: unknown): boolean {
+  return error instanceof Deno.errors.NotFound ||
+    error instanceof Deno.errors.PermissionDenied;
+}
+
+/**
+ * Translate a spawn failure into {@linkcode QemuImgMissingError}, so no verb
+ * leaks a bare `Deno.errors.NotFound` naming a binary the caller never chose
+ * to spawn directly. Anything else passes through untouched.
+ */
+function asMissingBinary(error: unknown, bin: string): unknown {
+  return isMissingBinary(error) ? new QemuImgMissingError(bin) : error;
 }
 
 /** The shared refusal message for an option graph paired with a format flag. */
@@ -929,7 +1006,8 @@ function refArg(ref: ImageRef): string {
 
 /**
  * Render a {@linkcode BlockNodeSpec} to `key=value,child.key=value`, keys
- * sorted so the argv a given graph produces is stable.
+ * sorted so the argv a given graph produces is stable. Commas inside keys and
+ * values are escaped — see {@linkcode escapeOptionValue}.
  */
 export function renderBlockNode(node: BlockNodeSpec): string {
   const flat: Record<string, string> = {};
@@ -949,7 +1027,7 @@ export function renderBlockNode(node: BlockNodeSpec): string {
   walk(node, "");
   return Object.keys(flat)
     .sort()
-    .map((key) => `${key}=${flat[key]}`)
+    .map((key) => `${escapeOptionValue(key)}=${escapeOptionValue(flat[key])}`)
     .join(",");
 }
 
@@ -965,7 +1043,54 @@ function formatOptionsArg(options: FormatOptions): string {
       const rendered = typeof value === "boolean"
         ? (value ? "on" : "off")
         : String(value);
-      return `${key}=${rendered}`;
+      return `${escapeOptionValue(key)}=${escapeOptionValue(rendered)}`;
     })
     .join(",");
+}
+
+/**
+ * Escape one key or value for qemu's `QemuOpts` parser, which splits on `,`.
+ *
+ * A literal comma must be doubled. Both emitters this guards — `-o` and
+ * `--image-opts` — feed that parser, and it is **last-wins without a
+ * diagnostic**: measured on qemu-img 11.0.2,
+ * `--image-opts driver=raw,size=1048576,…,size=512` reports
+ * `"virtual-size": 512` and exits `0`. So a directory or label holding a
+ * comma does not fail — it silently builds a *different* node than the one
+ * asked for, and for the `raw` driver's `offset`/`size` window that means
+ * writing into the wrong region of the disk. Doubling round-trips exactly,
+ * including for values that themselves look like options: `-o
+ * backing_file=b,,d/base.qcow2` stores `b,d/base.qcow2`.
+ *
+ * Only `,` needs this. `=` splits on the first occurrence only, and newlines
+ * pass through literally — both verified against the same binary.
+ *
+ * `src/system/devices.ts` carries the same one-liner for its `-blockdev`
+ * emitter; the duplication is deliberate, since that module owns qemu-system
+ * argv and this one owns qemu-img argv.
+ */
+function escapeOptionValue(value: string): string {
+  return value.replaceAll(",", ",,");
+}
+
+/**
+ * Operand tokens, preceded by `--` when any of them would otherwise be read
+ * as a flag.
+ *
+ * qemu-img runs `getopt_long` per subcommand, so a path, bitmap name or
+ * option graph beginning with `-` is consumed as an option and the verb fails
+ * with `invalid option -- x` (measured on 11.0.2 for `create`, `info`,
+ * `resize` and `bitmap`). `--` is accepted by every verb this client drives,
+ * and is emitted only when needed so the argv for ordinary operands stays
+ * byte-identical.
+ *
+ * The separator is deliberately *not* placed before
+ * {@linkcode QemuImg.prototype.resize}'s size operand: `img_resize` pops that
+ * token off argv before calling `getopt_long`, precisely so a relative
+ * `"-512M"` survives, and it does — with or without `--`.
+ */
+function operands(...values: readonly string[]): string[] {
+  return values.some((value) => value.startsWith("-"))
+    ? ["--", ...values]
+    : [...values];
 }

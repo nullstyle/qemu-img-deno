@@ -1,4 +1,9 @@
 import { assert, assertEquals, assertRejects } from "@std/assert";
+import type {
+  CommandResult,
+  CommandRunner,
+  RunOptions,
+} from "../../src/runner.ts";
 import { CommandError } from "../../src/runner.ts";
 import {
   QemuImgMissingError,
@@ -10,6 +15,43 @@ import { failed, FakeQemuImg, ok } from "../../testing/mod.ts";
 function client(): { qemu: QemuImg; fake: FakeQemuImg } {
   const fake = new FakeQemuImg();
   return { qemu: new QemuImg({ runner: fake }), fake };
+}
+
+/**
+ * A runner that records the {@linkcode RunOptions} it was handed. The kit's
+ * `RecordedCall` keeps only `stdin`, so the stream dispositions need their own
+ * seam to be observable.
+ */
+class OptionRecordingRunner implements CommandRunner {
+  readonly seen: RunOptions[] = [];
+
+  run(
+    _bin: string,
+    _args: readonly string[],
+    options: RunOptions = {},
+  ): Promise<CommandResult> {
+    this.seen.push(options);
+    return Promise.resolve(ok("recorded"));
+  }
+}
+
+/** A runner whose spawn always fails the way `Deno.Command` would. */
+class UnspawnableRunner implements CommandRunner {
+  constructor(private readonly error: Error) {}
+
+  run(): Promise<CommandResult> {
+    return Promise.reject(this.error);
+  }
+}
+
+/** Argv for one call, with the fake short-circuited so only the shape matters. */
+async function argvOf(
+  drive: (qemu: QemuImg) => Promise<unknown>,
+): Promise<string> {
+  const fake = new FakeQemuImg();
+  fake.stub(() => true, ok("{}"));
+  await drive(new QemuImg({ runner: fake })).catch(() => {});
+  return fake.commandLines()[0] ?? "";
 }
 
 Deno.test("available/ensureAvailable reflect the binary's presence", async () => {
@@ -504,6 +546,260 @@ Deno.test("convert splices an option-graph source into an option-graph window", 
     "driver=raw,file.driver=qcow2,file.file.driver=file," +
     "file.file.filename=/disk.qcow2,offset=1048576,size=528450048",
   ]);
+});
+
+Deno.test("renderBlockNode doubles commas so QemuOpts cannot re-split a value", () => {
+  // qemu's QemuOpts parser splits on `,` and is last-wins WITHOUT a
+  // diagnostic: measured on qemu-img 11.0.2, an unescaped window over
+  // `/store,size=512/d.qcow2` reports `"virtual-size": 512` and exits 0.
+  assertEquals(
+    renderBlockNode({
+      driver: "raw",
+      offset: 0,
+      size: 1048576,
+      file: { driver: "file", filename: "/store,size=512/d.qcow2" },
+    }),
+    "driver=raw,file.driver=file," +
+      "file.filename=/store,,size=512/d.qcow2,offset=0,size=1048576",
+  );
+  // A key holding a comma is escaped too: qemu then rejects the unknown
+  // option by name instead of silently splitting it into two.
+  assertEquals(
+    renderBlockNode({ driver: "raw", "a,b": "c" }),
+    "a,,b=c,driver=raw",
+  );
+  // Nothing else needs escaping — `=` splits on the first occurrence only and
+  // newlines pass through literally, both verified against the same binary.
+  assertEquals(
+    renderBlockNode({ driver: "file", filename: "/eq=dir/d\nx.raw" }),
+    "driver=file,filename=/eq=dir/d\nx.raw",
+  );
+});
+
+Deno.test("-o option lists escape commas in keys and values", async () => {
+  const { qemu, fake } = client();
+  await qemu.create("/new.qcow2", {
+    format: "qcow2",
+    size: "1G",
+    options: { backing_file: "/a,b/base.qcow2", backing_fmt: "qcow2" },
+  });
+  assertEquals(fake.commandLines(), [
+    "qemu-img create -f qcow2 " +
+    "-o backing_file=/a,,b/base.qcow2,backing_fmt=qcow2 /new.qcow2 1G",
+  ]);
+});
+
+Deno.test("a leading-dash operand gets a -- separator, per verb", async () => {
+  // qemu-img runs getopt_long per subcommand, so `-d.qcow2` is otherwise
+  // consumed as flags and the verb dies with `invalid option -- d`.
+  assertEquals(
+    await argvOf((q) => q.create("-d.qcow2", { format: "qcow2", size: "1M" })),
+    "qemu-img create -f qcow2 -- -d.qcow2 1M",
+  );
+  assertEquals(
+    await argvOf((q) => q.info("-d.qcow2")),
+    "qemu-img info --output=json -- -d.qcow2",
+  );
+  assertEquals(
+    await argvOf((q) => q.check("-d.qcow2")),
+    "qemu-img check --output=json -- -d.qcow2",
+  );
+  assertEquals(
+    await argvOf((q) => q.map("-d.qcow2")),
+    "qemu-img map --output=json -- -d.qcow2",
+  );
+  assertEquals(
+    await argvOf((q) => q.convert("-a.qcow2", "-b.raw", { format: "raw" })),
+    "qemu-img convert -O raw -- -a.qcow2 -b.raw",
+  );
+  assertEquals(
+    await argvOf((q) => q.compare("-a.raw", "-b.raw")),
+    "qemu-img compare -- -a.raw -b.raw",
+  );
+  assertEquals(
+    await argvOf((q) => q.measure({ outputFormat: "qcow2", source: "-s.raw" })),
+    "qemu-img measure -O qcow2 --output=json -- -s.raw",
+  );
+  assertEquals(
+    await argvOf((q) => q.snapshot.create("-d.qcow2", "tag")),
+    "qemu-img snapshot -c tag -- -d.qcow2",
+  );
+  assertEquals(
+    await argvOf((q) => q.commit("-d.qcow2")),
+    "qemu-img commit -- -d.qcow2",
+  );
+  assertEquals(
+    await argvOf((q) => q.rebase("-d.qcow2", { backing: "/b.qcow2" })),
+    "qemu-img rebase -b /b.qcow2 -- -d.qcow2",
+  );
+  assertEquals(
+    await argvOf((q) => q.bench("-d.qcow2")),
+    "qemu-img bench -- -d.qcow2",
+  );
+  assertEquals(
+    await argvOf((q) => q.amend("-d.qcow2", { options: { compat: "1.1" } })),
+    "qemu-img amend -o compat=1.1 -- -d.qcow2",
+  );
+});
+
+Deno.test("the bitmap NAME takes the separator; the snapshot TAG does not", async () => {
+  // Measured on 11.0.2: `bitmap --add img.qcow2 -x` dies with
+  // `invalid option -- x`, while `snapshot -c -x img.qcow2` creates a
+  // snapshot tagged `-x` — the tag is getopt's own option-argument.
+  assertEquals(
+    await argvOf((q) => q.bitmap("/img.qcow2", "-bm", { op: "add" })),
+    "qemu-img bitmap --add -- /img.qcow2 -bm",
+  );
+  assertEquals(
+    await argvOf((q) => q.snapshot.create("/img.qcow2", "-tag")),
+    "qemu-img snapshot -c -tag /img.qcow2",
+  );
+});
+
+Deno.test("resize keeps a relative size out of the separator", async () => {
+  // img_resize() pops the size off argv before getopt runs, precisely so a
+  // negative delta survives; putting it after `--` would be harmless but
+  // would churn the argv of every ordinary shrink.
+  assertEquals(
+    await argvOf((q) => q.resize("/img.raw", "-512M", { shrink: true })),
+    "qemu-img resize --shrink /img.raw -512M",
+  );
+  assertEquals(
+    await argvOf((q) => q.resize("-d.raw", "-512M", { shrink: true })),
+    "qemu-img resize --shrink -- -d.raw -512M",
+  );
+});
+
+Deno.test("ordinary operands emit no separator at all", async () => {
+  assertEquals(
+    await argvOf((q) => q.info("/img.qcow2")),
+    "qemu-img info --output=json /img.qcow2",
+  );
+  assertEquals(
+    await argvOf((q) => q.convert("/a.raw", "/b.raw", { format: "raw" })),
+    "qemu-img convert -O raw /a.raw /b.raw",
+  );
+});
+
+Deno.test("raw forwards the stdout/stderr dispositions", async () => {
+  // The pipe-hang workaround documented on RunOptions.stdout is reachable
+  // only through raw(); buildRunOptions used to drop both fields.
+  const runner = new OptionRecordingRunner();
+  const qemu = new QemuImg({ runner });
+  await qemu.raw(["convert", "/a", "/b"], {
+    stdout: "null",
+    stderr: "inherit",
+    stdin: "payload",
+    uncapped: true,
+    timeoutMs: 1234,
+  });
+  assertEquals(runner.seen[0].stdout, "null");
+  assertEquals(runner.seen[0].stderr, "inherit");
+  assertEquals(runner.seen[0].stdin, "payload");
+  assertEquals(runner.seen[0].uncapped, true);
+  assertEquals(runner.seen[0].timeoutMs, 1234);
+  // Unset stays unset, so the runner's own "piped" default still applies.
+  await qemu.raw(["--version"]);
+  assertEquals("stdout" in runner.seen[1], false);
+  assertEquals("stderr" in runner.seen[1], false);
+});
+
+Deno.test("available answers false for a binary that is not executable", async () => {
+  // Deno.Command raises PermissionDenied (os error 13) for a file without
+  // +x, and for a directory on PATH; only a missing file is NotFound.
+  const noExec = new QemuImg({
+    runner: new UnspawnableRunner(
+      new Deno.errors.PermissionDenied("Failed to spawn: Permission denied"),
+    ),
+  });
+  assertEquals(await noExec.available(), false);
+  await assertRejects(() => noExec.ensureAvailable(), QemuImgMissingError);
+  await assertRejects(() => noExec.version(), QemuImgMissingError);
+});
+
+Deno.test("available lets a missing --allow-run grant through", async () => {
+  // Deno 2 reports that as NotCapable, a distinct class. Swallowing it would
+  // send the caller off to reinstall QEMU for a flag they forgot to pass.
+  const errors = Deno.errors as unknown as Record<string, ErrorConstructor>;
+  const qemu = new QemuImg({
+    runner: new UnspawnableRunner(
+      new errors.NotCapable('Requires run access to "qemu-img"'),
+    ),
+  });
+  await assertRejects(() => qemu.available(), Error, "Requires run access");
+});
+
+Deno.test("every verb maps an unspawnable binary to QemuImgMissingError", async () => {
+  // The friendly mapping existed but only version()/available() used it, so
+  // every other verb leaked a bare Deno.errors.NotFound.
+  for (
+    const spawnError of [
+      new Deno.errors.NotFound("No such file or directory (os error 2)"),
+      new Deno.errors.PermissionDenied("Permission denied (os error 13)"),
+    ]
+  ) {
+    const qemu = new QemuImg({ runner: new UnspawnableRunner(spawnError) });
+    const verbs: Record<string, () => Promise<unknown>> = {
+      info: () => qemu.info("/i.qcow2"),
+      infoChain: () => qemu.infoChain("/i.qcow2"),
+      map: () => qemu.map("/i.qcow2"),
+      check: () => qemu.check("/i.qcow2"),
+      measure: () => qemu.measure({ outputFormat: "qcow2", size: "1G" }),
+      create: () => qemu.create("/i.qcow2", { format: "qcow2", size: "1G" }),
+      convert: () => qemu.convert("/a", "/b", { format: "raw" }),
+      compare: () => qemu.compare("/a", "/b"),
+      commit: () => qemu.commit("/i.qcow2"),
+      amend: () => qemu.amend("/i.qcow2", { options: { compat: "1.1" } }),
+      bench: () => qemu.bench("/i.qcow2"),
+      bitmap: () => qemu.bitmap("/i.qcow2", "b", { op: "add" }),
+      dd: () => qemu.dd({ input: "/a", output: "/b" }),
+      rebase: () => qemu.rebase("/i.qcow2", { backing: "/b" }),
+      resize: () => qemu.resize("/i.qcow2", "+1G"),
+      snapshotCreate: () => qemu.snapshot.create("/i.qcow2", "t"),
+      snapshotApply: () => qemu.snapshot.apply("/i.qcow2", "t"),
+      snapshotDelete: () => qemu.snapshot.delete("/i.qcow2", "t"),
+      snapshotList: () => qemu.snapshot.list("/i.qcow2"),
+      raw: () => qemu.raw(["--version"]),
+      version: () => qemu.version(),
+    };
+    for (const [name, call] of Object.entries(verbs)) {
+      const error = await assertRejects(call, QemuImgMissingError);
+      assertEquals(error.bin, "qemu-img", `${name} reported the wrong bin`);
+    }
+  }
+});
+
+Deno.test("check keeps the report qemu-img printed before exiting 1", async () => {
+  // img_check() dumps the JSON and only then decides the status, so a run
+  // whose internal check-errors are nonzero exits 1 with a full report. The
+  // counters are the only record of what went wrong.
+  const { qemu, fake } = client();
+  fake.stub((call) => call.args[0] === "check", {
+    success: false,
+    code: 1,
+    stdout: '{"check-errors": 4, "corruptions": 2, "filename": "/i.qcow2"}',
+    stderr: "Check failed",
+  });
+  const result = await qemu.check("/i.qcow2");
+  assertEquals(result.code, 1);
+  assertEquals(result.checkErrors, 4);
+  assertEquals(result.corruptions, 2);
+});
+
+Deno.test("check still throws on an exit that printed no report", async () => {
+  // Measured on 11.0.2: a missing file, a wrong -f and a rejected header all
+  // exit 1 with stdout completely empty, and raw exits 63.
+  const { qemu, fake } = client();
+  fake.stub(
+    (call) => call.args[0] === "check",
+    failed(1, "Could not open '/i.qcow2': No such file or directory"),
+  );
+  await assertRejects(() => qemu.check("/i.qcow2"), CommandError);
+  fake.stub(
+    (call) => call.args[0] === "check",
+    failed(63, "This image format does not support checks"),
+  );
+  await assertRejects(() => qemu.check("/i.qcow2"), CommandError);
 });
 
 Deno.test("the option-graph guards refuse what qemu would reject later", async () => {
