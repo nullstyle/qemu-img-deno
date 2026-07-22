@@ -12,10 +12,12 @@ import { type RecipeKey, recipeKey } from "./keys.ts";
 import {
   type CapabilityTrait,
   RecipePlanError,
+  type RecipePlanErrorCode,
   UnrepresentableContentError,
 } from "./errors.ts";
-import { resolvedDir } from "./resolve.ts";
+import { resolvedDir, resolvedFile } from "./resolve.ts";
 import { USTAR_MAX_SIZE_BYTES } from "../fs/tar.ts";
+import { GUEST_TAR_FLAG } from "../system/script.ts";
 import type {
   FilesystemSpec,
   GuestArch,
@@ -519,6 +521,7 @@ function executorOf(step: Step): Executor {
       return "bytes";
     case "run":
     case "copyIn":
+    case "unpack":
       return "guest";
   }
 }
@@ -539,9 +542,13 @@ function summarize(step: Step): string {
         step.partitions.map((p) => `${p.label}/${p.contents.kind}`).join(", ")
       }`;
     case "run":
-      return `run: ${step.script.split("\n")[0].slice(0, 48)}`;
+      return `run${step.chroot === true ? " (chroot)" : ""}: ${
+        step.script.split("\n")[0].slice(0, 40)
+      }`;
     case "copyIn":
       return `copyIn: ${step.from.path} -> ${step.to}`;
+    case "unpack":
+      return `unpack: ${step.from.path} -> ${step.to}`;
   }
 }
 
@@ -557,21 +564,12 @@ function validateCopyIn(
   step: Extract<Step, { kind: "copyIn" }>,
   resolved: ResolvedRecipe,
 ): void {
-  const to = step.to;
-  const bad = !to.startsWith("/") ||
-    to.includes("//") ||
-    to.includes("\0") ||
-    to.split("/").some((segment) => segment === "." || segment === "..");
-  if (bad) {
-    throw new RecipePlanError(
-      step.id,
-      "copyin-destination",
-      `copyIn "to" must be an absolute, normalized path inside the image's ` +
-        `root filesystem (got ${JSON.stringify(to)}). A relative or ` +
-        "`..`-bearing path would resolve against whatever the guest's working " +
-        "directory happened to be, which is not something this recipe states.",
-    );
-  }
+  refuseUnnormalizedDestination(
+    step.id,
+    step.kind,
+    "copyin-destination",
+    step.to,
+  );
   const input = resolvedDir(resolved, step.from);
   const destination = FILESYSTEM_TRAITS.ext4 ?? [];
   refuseUnrepresentable(
@@ -632,6 +630,102 @@ function refuseDuplicatePartitionLabels(recipe: Recipe): void {
       );
     }
   }
+}
+
+/**
+ * Refuse a destination that is not an absolute, normalized in-image path.
+ *
+ * Shared by `copyIn` and `unpack` so the two never disagree about what a
+ * destination is. The `code` is passed rather than derived from `kind`: a
+ * caller branches on the code, and the two step kinds are separate refusals
+ * even though the check behind them is one function.
+ */
+function refuseUnnormalizedDestination(
+  stepId: string,
+  kind: string,
+  code: RecipePlanErrorCode,
+  to: string,
+): void {
+  const bad = !to.startsWith("/") ||
+    to.includes("//") ||
+    to.includes("\0") ||
+    to.split("/").some((segment) => segment === "." || segment === "..");
+  if (!bad) return;
+  throw new RecipePlanError(
+    stepId,
+    code,
+    `${kind} "to" must be an absolute, normalized path inside the image's ` +
+      `root filesystem (got ${JSON.stringify(to)}). A relative or ` +
+      "`..`-bearing path would resolve against whatever the guest's working " +
+      "directory happened to be, which is not something this recipe states.",
+  );
+}
+
+/**
+ * Refuse an `unpack` whose archive the guest cannot open.
+ *
+ * The compression comes from the resolver's sniff of the file's leading bytes,
+ * never from its name. A resolver that reports none at all is refused rather
+ * than guessed at: the alternative is a boot, a disk attach, and `tar: invalid
+ * magic` from inside a VM.
+ */
+function validateUnpack(
+  step: Extract<Step, { kind: "unpack" }>,
+  resolved: ResolvedRecipe,
+): void {
+  refuseUnnormalizedDestination(
+    step.id,
+    step.kind,
+    "unpack-destination",
+    step.to,
+  );
+  const strip = step.stripComponents ?? 0;
+  if (!Number.isInteger(strip) || strip < 0) {
+    throw new RecipePlanError(
+      step.id,
+      "unpack-strip-components",
+      `stripComponents is ${strip}; it must be a non-negative integer. ` +
+        "busybox tar takes the value as a count of leading path components " +
+        "to drop, and a negative or fractional one is accepted as 0 — " +
+        "extracting the archive unstripped under a name that says otherwise.",
+    );
+  }
+  const input = resolvedFile(resolved, step.from);
+  const compression = input.compression;
+  if (compression === undefined) {
+    throw new RecipePlanError(
+      step.id,
+      "unpack-compression-unknown",
+      `the resolver reported no compression for ${step.from.path}. An ` +
+        "`unpack` step hands the archive to the guest as a raw block device, " +
+        "which has no filename for busybox `tar -a` to read an extension " +
+        "from, so the decompressor has to be chosen here. Use " +
+        "`LocalInputResolver`, or set `compression` on the ResolvedInput your " +
+        "resolver returns (see `detectCompression`).",
+    );
+  }
+  if (GUEST_TAR_FLAG[compression] !== undefined) return;
+  // Two different reasons, and conflating them would send the reader looking
+  // for the wrong thing. zstd is absent from the appliance; xz is present and
+  // gets the answer wrong over this transport.
+  const why = compression === "xz"
+    ? "busybox's xz reader does not stop at the end of the stream, so it " +
+      "runs into the zero padding that the raw-block-device transport adds " +
+      "(qemu rounds a data disk up to a 512-byte multiple). Measured: `tar " +
+      "-J` extracts every member correctly and then exits 1 with `tar: " +
+      "corrupted data`, which reads as a damaged archive and is not one"
+    : `there is no \`${compression}\` and no \`un${compression}\` applet in ` +
+      "the appliance's busybox 1.37.0 (measured against its applet list), " +
+      "and no such package on the pinned Alpine ISO";
+  throw new RecipePlanError(
+    step.id,
+    "unpack-compression-unsupported",
+    `${step.from.path} is ${compression}-compressed, and the appliance ` +
+      `cannot unpack ${compression}: ${why}. Recompress it as gzip, bzip2 or ` +
+      "lzma — all three were measured extracting at exit 0 over this exact " +
+      "transport — or hand it over uncompressed. For xz that is one command: " +
+      "`xz -dc rootfs.tar.xz | gzip > rootfs.tar.gz`.",
+  );
 }
 
 /** Refuse whole-recipe problems that no individual step owns. */
@@ -702,9 +796,11 @@ function validateRecipe(resolved: ResolvedRecipe): void {
   }
 
   for (const step of recipe.steps) {
-    if (step.kind !== "copyIn" && step.kind !== "run") continue;
-    // Both mount the image's root filesystem, so there has to be exactly one
-    // thing that unambiguously IS the root filesystem.
+    if (
+      step.kind !== "copyIn" && step.kind !== "run" && step.kind !== "unpack"
+    ) continue;
+    // All three mount the image's root filesystem, so there has to be exactly
+    // one thing that unambiguously IS the root filesystem.
     if (recipe.base.kind === "blank" && ext4Count !== 1) {
       throw new RecipePlanError(
         step.id,
@@ -715,8 +811,8 @@ function validateRecipe(resolved: ResolvedRecipe): void {
           "one already in the image.",
       );
     }
-    if (step.kind !== "copyIn") continue;
-    validateCopyIn(step, resolved);
+    if (step.kind === "copyIn") validateCopyIn(step, resolved);
+    if (step.kind === "unpack") validateUnpack(step, resolved);
   }
   if (recipe.boot.kind === "uefi-removable") {
     const partitionSteps = recipe.steps.filter((s) => s.kind === "partition");
@@ -825,6 +921,8 @@ export async function plan(
     }
     const stepInputs = step.kind === "copyIn"
       ? [resolvedDir(resolved, step.from)]
+      : step.kind === "unpack"
+      ? [resolvedFile(resolved, step.from)]
       : step.kind === "partition"
       ? step.partitions.flatMap((p) =>
         p.contents.kind === "fat"
@@ -989,8 +1087,23 @@ function payloadOf(step: Step): Record<string, unknown> {
         })),
       };
     case "run":
-      return { script: step.script, network: step.network === true };
+      return {
+        script: step.script,
+        network: step.network === true,
+        // In the preimage because a chrooted script and a bare one are
+        // different programs against different roots: `apk add` beside the
+        // target installs into the appliance and vanishes at poweroff, while
+        // the same string inside it installs into the image.
+        chroot: step.chroot === true,
+      };
     case "copyIn":
       return { to: step.to };
+    case "unpack":
+      // No `compression` here on purpose: it is a pure function of the
+      // archive's bytes, and those are already in the key through `inputs`.
+      // `to` and `stripComponents` are not — they are declared, and two
+      // recipes unpacking the same tarball to different places must not share
+      // a layer.
+      return { to: step.to, stripComponents: step.stripComponents ?? 0 };
   }
 }

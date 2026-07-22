@@ -15,7 +15,9 @@ import { sha256HexFile } from "../digest.ts";
 import { InputResolutionError } from "./errors.ts";
 import type { CapabilityTrait } from "./errors.ts";
 import type {
+  ArchiveCompression,
   DirInput,
+  FileInput,
   Input,
   Recipe,
   ResolvedEntry,
@@ -122,6 +124,57 @@ export function traitsOf(entries: readonly ResolvedEntry[]): CapabilityTrait[] {
   return [...traits].sort();
 }
 
+/** Leading magic bytes for each compression this package can name. */
+const COMPRESSION_MAGIC: readonly {
+  readonly compression: ArchiveCompression;
+  readonly magic: readonly number[];
+}[] = [
+  { compression: "gzip", magic: [0x1f, 0x8b] },
+  { compression: "bzip2", magic: [0x42, 0x5a, 0x68] },
+  { compression: "xz", magic: [0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00] },
+  { compression: "zstd", magic: [0x28, 0xb5, 0x2f, 0xfd] },
+  // The last entry, because LZMA's "magic" is one plausible properties byte
+  // followed by a little-endian dictionary size — a weak signature that would
+  // shadow a stronger one if it were tested first.
+  { compression: "lzma", magic: [0x5d, 0x00, 0x00] },
+];
+
+/** Longest compression magic this package recognizes. */
+const MAGIC_BYTES = 8;
+
+/**
+ * The first {@linkcode MAGIC_BYTES} of a file, for compression sniffing.
+ *
+ * A short file yields a short array, which `detectCompression` treats as
+ * "none" — the same answer reading the whole thing would give.
+ */
+async function readMagic(path: string): Promise<Uint8Array> {
+  const file = await Deno.open(path, { read: true });
+  try {
+    const buffer = new Uint8Array(MAGIC_BYTES);
+    const read = await file.read(buffer) ?? 0;
+    return buffer.subarray(0, read);
+  } finally {
+    file.close();
+  }
+}
+
+/**
+ * Name a file's compression from its first bytes.
+ *
+ * Exported because it is the whole basis for the `unpack` refusals, and a
+ * refusal whose evidence cannot be unit-tested on its own is a refusal nobody
+ * can check. `"none"` means "no compression signature" — for an `unpack` step
+ * that is a plain `.tar`, which busybox reads directly.
+ */
+export function detectCompression(bytes: Uint8Array): ArchiveCompression {
+  for (const { compression, magic } of COMPRESSION_MAGIC) {
+    if (bytes.byteLength < magic.length) continue;
+    if (magic.every((byte, index) => bytes[index] === byte)) return compression;
+  }
+  return "none";
+}
+
 /** Resolves inputs against the real filesystem. */
 export class LocalInputResolver implements InputResolver {
   /** Hash a file, or walk and hash a directory tree. */
@@ -136,6 +189,11 @@ export class LocalInputResolver implements InputResolver {
         input,
         sha256: await sha256HexFile(input.path),
         sizeBytes: (await Deno.stat(input.path)).size,
+        // Sniffed from the leading bytes, never from the filename: the guest
+        // sees a block device with no name at all. Only the magic is read —
+        // the digest above streams, and slurping the file to classify it
+        // would put the whole thing back in memory for the sake of 6 bytes.
+        compression: detectCompression(await readMagic(input.path)),
       };
     }
     const entries = await walkTree(input.path);
@@ -198,6 +256,8 @@ function stepInputSites(step: Step, index: number): InputSite[] {
           : []
       );
     case "copyIn":
+      return [{ input: step.from, stepId: step.id, field: `${at}.from` }];
+    case "unpack":
       return [{ input: step.from, stepId: step.id, field: `${at}.from` }];
     case "run":
       return [];
@@ -264,6 +324,18 @@ export async function resolveRecipe(
 export function resolvedDir(
   resolved: ResolvedRecipe,
   input: DirInput,
+): ResolvedInput {
+  const found = resolved.inputs[input.path];
+  if (found === undefined) {
+    throw new Error(`input ${input.path} was never resolved`);
+  }
+  return found;
+}
+
+/** Look up a resolved file input, or throw if the resolver missed it. */
+export function resolvedFile(
+  resolved: ResolvedRecipe,
+  input: FileInput,
 ): ResolvedInput {
   const found = resolved.inputs[input.path];
   if (found === undefined) {

@@ -46,6 +46,33 @@
  * console.log(planned.requiresAppliance, planned.explain());
  * ```
  *
+ * @example A distro rootfs, installed by its own package manager
+ * ```ts
+ * import { defineRecipe, file } from "@nullstyle/qemu-img/recipe";
+ *
+ * const recipe = defineRecipe({
+ *   name: "web-appliance",
+ *   platform: { arch: "aarch64", machine: "virt-11.0" },
+ *   base: { kind: "blank", sizeBytes: 4 * 1024 ** 3 },
+ *   boot: { kind: "uefi-removable" },
+ *   determinism: { sourceDateEpoch: 1700000000, guidSeed: "v1", fsSeed: "v1" },
+ *   steps: [
+ *     // …a `partition` step declaring an ESP and one ext4 root…
+ *     // Digest-pinned, and its compression is sniffed rather than named.
+ *     { kind: "unpack", id: "rootfs", from: file("./alpine-minirootfs.tar.gz"), to: "/" },
+ *     // Inside the target, not beside it: /proc, /sys and a bind of /dev go
+ *     // under the root first, and `network` lends it the resolver for the step.
+ *     {
+ *       kind: "run",
+ *       id: "pkgs",
+ *       script: "apk add --no-cache nginx",
+ *       chroot: true,
+ *       network: true,
+ *     },
+ *   ],
+ * });
+ * ```
+ *
  * @module
  */
 
@@ -73,6 +100,7 @@ export {
 export { contentDigest, type ContentDigestOptions } from "./content.ts";
 
 export {
+  type ArchiveCompression,
   type BaseSpec,
   type BootSpec,
   defineRecipe,
@@ -95,10 +123,13 @@ export {
 } from "./types.ts";
 
 export {
+  detectCompression,
   type InputResolver,
   inputsOf,
   LocalInputResolver,
   recipeInputs,
+  resolvedDir,
+  resolvedFile,
   resolveRecipe,
   traitsOf,
 } from "./resolve.ts";

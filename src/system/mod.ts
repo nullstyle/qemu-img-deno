@@ -81,11 +81,17 @@ export {
 export {
   copyInScript,
   type CopyInScriptArgs,
+  GUEST_TAR_FLAG,
+  type GuestScriptArch,
   type MkfsPartition,
   mkfsScript,
   type MkfsScriptArgs,
   runScript,
   type RunScriptArgs,
+  type TarCompression,
+  TARGET_LOADERS,
+  unpackScript,
+  type UnpackScriptArgs,
 } from "./script.ts";
 
 export {

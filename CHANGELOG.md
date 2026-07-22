@@ -195,6 +195,62 @@ an ESP gets built on a machine with no `mkfs.fat`.
   gained `parentRealizationKey` to make that walk possible without opening every
   image.
 
+- **A `unpack` step and `run({ chroot: true })`** — a distro rootfs installed by
+  its own package manager, which is the use case the recipe tier existed for and
+  could not do. `unpack` is a step rather than a base because layer 0 is the
+  DISK: a rootfs goes into a partition that does not exist until the table and
+  the mkfs layer have run. The archive is handed to the guest as the data disk
+  exactly as `copyIn`'s generated ustar is, and the host never decompresses.
+  Measured end to end on aarch64: GPT + FAT ESP + ext4 + the 3.8 MiB Alpine
+  3.21.7 minirootfs + `apk add --no-cache nginx` over the network is **five
+  layers in 2.3 s**, two guest boots included.
+
+  The compression is **sniffed from the archive's leading bytes**, never read
+  off its name — the resolver reads only the first 8, and a filename is the one
+  thing about an archive that is free to lie. `plan()` then refuses what the
+  guest cannot unpack, for two different measured reasons: zstd has no applet in
+  the appliance at all, and **xz** extracts every member correctly and then
+  exits `1` with `tar: corrupted data`, because busybox's xz reader does not
+  stop at the end of the stream and runs into the zero padding qemu adds
+  rounding a data disk up to 512 bytes. Plain tar, gzip, bzip2 and lzma were
+  each measured extracting at exit `0` over that same transport.
+
+  The extraction passes **`--numeric-owner`**. Without it busybox `tar` resolves
+  each member's `uname`/`gname` against the **appliance's** `/etc/passwd` and
+  `/etc/group` — the target's cannot be consulted, it is a mounted directory and
+  not the running system — so a rootfs lands owned by whatever those names mean
+  inside the build appliance, and the image builds, mounts and boots that way.
+  Measured in the appliance rather than read off `tar --help`, which in this
+  applet advertises options it does not implement: extracting an archive whose
+  members carry uid/gid **123/456** under `uname=root`/`gname=root`, as uid 0,
+  gave `0:0` for both the file and the directory without the flag and `123:456`
+  with it. Argv position was measured not to matter.
+
+  `run({ chroot: true })` mounts `/proc`, `/sys` and a **bind of `/dev`** under
+  the target before entering it. The `/dev` bind is not hygiene: without it
+  `apk add nginx` exits `0`, reports `OK: 9 MiB in 17 packages`, and leaves a
+  0-byte **regular file** at `/dev/null` that a post-install script's
+  `> /dev/null` created — after which every redirect in the shipped image
+  appends to a file. With `network`, the resolver is lent to the target for the
+  step and taken back afterwards, so the build host's `/etc/resolv.conf` does
+  not ship inside the image.
+
+  The chroot's failure path is the part worth stating plainly. A chroot into a
+  root without its dynamic loader fails with
+  `chroot: can't execute '/bin/sh': No such file or directory` — naming a file
+  that is right there, because `execve()` reports `ENOENT` for the missing
+  INTERPRETER. Measured by hiding `/lib/ld-musl-aarch64.so.1` in an otherwise
+  complete Alpine rootfs: rc 127, and the identical message for `/bin/busybox`,
+  `/bin/sh` and `/sbin/apk` alike. The generated script therefore **probes**
+  with `sh -c :` first and only on failure diagnoses, exiting 70 (no `/bin/sh`),
+  71 (no loader, naming the paths it looked for) or 72 (neither explains it).
+  Probing rather than pre-checking is deliberate: a statically linked shell
+  needs no loader, and refusing that rootfs would be a guess.
+
+  `chroot` is in the cache key — the same script beside the target and inside it
+  are different programs against different roots — and a networked step and its
+  descendants stay uncacheable, unchanged.
+
 ### Fixed
 
 - **A guest layer's container bytes are not reproducible, and every descendant's
@@ -224,6 +280,31 @@ an ESP gets built on a machine with no `mkfs.fat`.
   observations rather than asserted: `--strict` compares allocation status,
   which is the same class of container property (`smoke:recipe` now demonstrates
   it calling a content-identical image different).
+- **Two different exported classes were named `GuestStepFailedError`**, and the
+  one `build()` actually threw was declared in `build.ts` and exported from
+  nowhere. The only importable spelling was `./system`'s, which `instanceof`
+  never matched, so there was no way to catch a failed guest layer by type. The
+  duplicate is gone and `./recipe` re-exports the one that is thrown.
+- **A networked `chroot` step silently had no resolver in every Debian and
+  Ubuntu cloud image.** The save guard tested `[ -e "$1/etc/resolv.conf" ]`,
+  which is **false for a dangling symlink** — and that is exactly the shape
+  those images ship (`/etc/resolv.conf -> ../run/systemd/resolve/stub-…`, whose
+  target does not exist until `systemd-resolved` runs). So nothing was saved,
+  and the restore then deleted the image's own symlink: the step ran against a
+  resolver that was not there, and the artifact shipped with its resolver
+  configuration removed. The test is now `-e` **or** `-L`, and both copies are
+  `cp -P` — measured, plain `cp` of a dangling symlink fails
+  `cp: can't stat …: No such file or directory` at rc 1, which `/init`'s
+  `set -e` turns into a dead step, so widening the test alone would have traded
+  a wrong artifact for a broken build. The delete is now unconditional and runs
+  before the restore, since what the install left behind is the build host's
+  resolver either way.
+- **`qi_mount_root` was called with one argument from three of its four call
+  sites**, so its diagnostics printed `partition` with nothing after it. The
+  helper takes the device _and_ the recipe's declared 1-based partition number,
+  and the number is the whole point of messages like
+  `$1 never appeared, so partition $2 is not in this image` — which exist to
+  send a reader to `base.rootPartition`.
 - **`LayerStore.publish()` could never re-publish a key.** `rename` onto a
   non-empty directory is `ENOTEMPTY`, and an uncacheable layer skips the cache
   lookup and so reaches `publish()` on _every_ run — meaning any recipe with a

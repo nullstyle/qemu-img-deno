@@ -54,6 +54,27 @@ export interface DirInput {
 /** Anything a step can read. */
 export type Input = FileInput | DirInput;
 
+/**
+ * How an archive handed to an `unpack` step is compressed.
+ *
+ * DETECTED from the file's leading magic bytes by the resolver, never inferred
+ * from its name: a `.tar.gz` that is really zstd is a real thing, and the guest
+ * would fail on it with `gzip: invalid magic` after the disk was attached and
+ * the VM booted. Sniffing costs four bytes of a file the resolver already reads
+ * in full to hash.
+ *
+ * `zstd` and `xz` are listed so the refusals can NAME them, for two different
+ * measured reasons — see {@link ../system/script.ts}'s `GUEST_TAR_FLAG`. Both
+ * are refused at plan time rather than after a boot.
+ */
+export type ArchiveCompression =
+  | "none"
+  | "gzip"
+  | "bzip2"
+  | "xz"
+  | "lzma"
+  | "zstd";
+
 /** Declare a host file input. */
 export function file(path: string): FileInput {
   return { kind: "file", path };
@@ -197,6 +218,25 @@ export type Step =
      * uncacheable, and so is everything downstream of it.
      */
     readonly network?: boolean;
+    /**
+     * Run the script INSIDE the target root rather than beside it.
+     *
+     * Off: the target is mounted at `$QI_ROOT` and the script runs on the
+     * appliance's own busybox. On: `/proc`, `/sys` and a bind of `/dev` are
+     * mounted under the root and the script runs under `chroot`, so a package
+     * manager installed in the target manages the target.
+     *
+     * The `/dev` bind is not a nicety. **Measured**: `apk add nginx` in a
+     * chroot with no `/dev` exits `0` and leaves a *regular file* at
+     * `/dev/null` — a post-install script's `> /dev/null` created it — which
+     * every later redirect in the shipped image then appends to.
+     *
+     * With `network`, the resolver `/init` configured is copied to
+     * `$QI_ROOT/etc/resolv.conf` for the duration of the step and removed (or
+     * restored) afterwards, so the build host's resolver does not ship inside
+     * the image.
+     */
+    readonly chroot?: boolean;
   }
   | {
     /** Copy a host tree into the image, in the guest. */
@@ -205,6 +245,32 @@ export type Step =
     readonly from: DirInput;
     /** Absolute destination path inside the image's root filesystem. */
     readonly to: string;
+  }
+  | {
+    /**
+     * Extract a host archive into the image, in the guest.
+     *
+     * This is how a distro rootfs gets in. It is a STEP and not a `base`,
+     * because layer 0 is the disk: a rootfs goes into a partition that does
+     * not exist until the table has been written and the mkfs layer has run.
+     *
+     * The host never decompresses. The archive is attached to the guest as
+     * the data disk exactly as `copyIn`'s generated ustar is, and busybox
+     * `tar` reads the raw block device — measured at 0.05 s for the 3.8 MiB
+     * Alpine minirootfs, with the tar's own two-zero-block trailer ending the
+     * read before the padding.
+     */
+    readonly kind: "unpack";
+    readonly id: string;
+    /** The archive. Digest-pinned by the resolver, which also sniffs it. */
+    readonly from: FileInput;
+    /** Absolute destination path inside the image's root filesystem. */
+    readonly to: string;
+    /**
+     * Leading path components to drop, as busybox `tar --strip-components`.
+     * @default 0
+     */
+    readonly stripComponents?: number;
   };
 
 /** Where layer 0 comes from. */
@@ -324,6 +390,15 @@ export interface ResolvedInput {
   readonly entries?: readonly ResolvedEntry[];
   /** Traits the data requires, derived from the walk rather than declared. */
   readonly traits?: readonly CapabilityTrait[];
+  /**
+   * Compression sniffed from a FILE input's leading magic bytes.
+   *
+   * Absent for directory inputs, and absent from any resolver that does not
+   * sniff — `plan()` refuses an `unpack` step whose archive has no detected
+   * compression rather than falling back to the filename, because the filename
+   * is the one thing about an archive that is free to lie.
+   */
+  readonly compression?: ArchiveCompression;
 }
 
 /** A recipe whose every declared input has been replaced by its digest. */

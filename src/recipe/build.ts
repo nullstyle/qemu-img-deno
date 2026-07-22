@@ -26,6 +26,8 @@ import {
   mkfsScript,
   runScript,
   stepNonce,
+  type TarCompression,
+  unpackScript,
 } from "../system/mod.ts";
 import { sha256Hex } from "../digest.ts";
 import { contentDigest } from "./content.ts";
@@ -41,7 +43,7 @@ import {
   BaseImageSizeMismatchError,
   GuestExecutorUnavailableError,
 } from "./errors.ts";
-import { resolvedDir } from "./resolve.ts";
+import { resolvedDir, resolvedFile } from "./resolve.ts";
 import type { DirInput, ResolvedInput, ResolvedRecipe, Step } from "./types.ts";
 
 /** vvfat's own MBR occupies the first 32256 bytes; a window past it is the
@@ -529,6 +531,10 @@ async function guestWork(
       script: runScript({
         rootPartitionNumber: rootPartition,
         script: declared.script,
+        ...(declared.chroot === true
+          ? { chroot: true, arch: recipe.platform.arch }
+          : {}),
+        ...(declared.network === true ? { network: true } : {}),
       }),
     };
   }
@@ -541,7 +547,59 @@ async function guestWork(
       data: await tarOf(declared, resolved),
     };
   }
+  if (declared.kind === "unpack") {
+    const input = resolvedFile(resolved, declared.from);
+    // plan() refuses both an absent and an unsupported compression, so this is
+    // unreachable through the planner. It says so rather than substituting a
+    // default: a guessed decompressor is how you get a step that extracts
+    // nothing and reports success.
+    if (input.compression === undefined) {
+      throw new Error(
+        `${step.id}: the resolver reported no compression for ` +
+          `${declared.from.path}, and build() will not guess one. plan() ` +
+          "refuses this — reaching here means a caller bypassed the planner.",
+      );
+    }
+    return {
+      script: unpackScript({
+        rootPartitionNumber: rootPartition,
+        to: declared.to,
+        compression: input.compression as TarCompression,
+        ...(declared.stripComponents === undefined
+          ? {}
+          : { stripComponents: declared.stripComponents }),
+      }),
+      data: await archiveOf(declared, input.sha256),
+    };
+  }
   throw new Error(`step ${step.id} has no guest work to do`);
+}
+
+/**
+ * Read the archive an `unpack` step delivers, re-hashing it against the digest
+ * the resolver recorded.
+ *
+ * Same argument as {@linkcode tarOf}: an archive swapped between `resolve()`
+ * and `build()` would otherwise be attached as-is under a key naming what it
+ * used to hold. Note the whole file is read into memory, exactly as `copyIn`'s
+ * generated ustar is — a multi-gigabyte rootfs tarball would need a streaming
+ * route this seam does not have yet.
+ */
+async function archiveOf(
+  step: Extract<Step, { kind: "unpack" }>,
+  recordedSha256: string,
+): Promise<Uint8Array> {
+  const bytes = await Deno.readFile(step.from.path);
+  const actual = await sha256Hex(bytes);
+  if (actual !== recordedSha256) {
+    throw new Error(
+      `${step.id}: ${step.from.path} changed between resolving this recipe ` +
+        `and building it (recorded ${recordedSha256.slice(0, 12)}, now ` +
+        `${actual.slice(0, 12)}). The layer's key names the recorded ` +
+        "content, so publishing this would cache the wrong bytes under it.",
+    );
+  }
+  return bytes;
 }
 
 /**
