@@ -43,6 +43,29 @@ an ESP gets built on a machine with no `mkfs.fat`.
   FAT filesystem via `vvfat` — validated against `/sbin/fsck_msdos`, an
   implementation with no shared code with qemu.
 
+- **`./recipe`** — the recipe vocabulary and a deterministic `plan()`.
+  `resolveRecipe` replaces every declared input with its digest (the only I/O
+  before planning); `plan()` then computes every cache key, partition LBA and
+  refusal with no binary, no VM and no clock, so the highest-value tests need no
+  fake at all.
+
+  Two keys, never conflated. `RecipeKey` is pure and chains parent _intentions_.
+  `RealizationKey` names a layer's directory and folds in the parent's
+  **actual** content digest — which is what makes a changed parent a cache miss
+  by construction. Without it, changing an early step rebuilds it while
+  descendants stay hits, and since a qcow2 overlay is a block-level delta the
+  image becomes `merge(parent_now, child_written_against_parent_then)` at
+  cluster granularity: it mounts, and `qemu-img check` passes, because qcow2
+  records no size, digest or generation counter for a backing file.
+
+  Plan-time refusals, each naming its fix: a FAT partition below vvfat's fixed
+  geometry (528450048 bytes at FAT16, regardless of content), an over-long FAT
+  label, `uefi-removable` with no `BOOTAA64.EFI`/`BOOTX64.EFI` in the ESP tree,
+  an unversioned machine alias, a partition running into the GPT's backup
+  header, and staging content a chosen filesystem would silently drop.
+  Capability traits are DERIVED from the walked tree, so a symlink nobody
+  noticed still refuses a FAT partition.
+
 ### Fixed
 
 - `timeoutMs` was not a wall-clock deadline. The abort raced the child's
