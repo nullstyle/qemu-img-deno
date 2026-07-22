@@ -52,7 +52,14 @@ export class StaleApplianceError extends Error {
   }
 }
 
-/** The guest ran the step and it returned nonzero, or its checks failed. */
+/**
+ * The guest ran the step and it returned nonzero, or its checks failed.
+ *
+ * Thrown by `build()`, and re-exported from `@nullstyle/qemu-img/recipe`
+ * alongside it. `instanceof` is the only honest way to tell this apart from a
+ * generic failure — `.name` is a string anyone can set — so there is exactly
+ * one class, reachable from both subpaths.
+ */
 export class GuestStepFailedError extends Error {
   /** The planned step's id. */
   readonly stepId: string;
@@ -61,20 +68,41 @@ export class GuestStepFailedError extends Error {
   /** Everything the guest wrote to the serial console. */
   readonly console: string;
 
-  /** Build the error from the guest's own report. */
+  /** Build the error from the guest's own report, naming every failed signal. */
   constructor(stepId: string, outcome: StepOutcome, consoleText: string) {
-    // `code: 0` with a nonzero umount/fsck/dmesg count is the dangerous shape:
-    // the script succeeded and the filesystem it produced is not sound, which
-    // without this check publishes as a cache hit every descendant trusts.
+    // All four signals are independent, so all four are reported. A step that
+    // exits nonzero AND leaves a filesystem e2fsck rejects has two separate
+    // things wrong with it, and naming only the first reads as the smaller
+    // problem — the exit code looks like the whole story, and the corruption
+    // gets rediscovered later against an image nobody suspects.
+    const checks = [
+      outcome.umountRc !== 0
+        ? "an unmount under /mnt failed, so its writeback did not complete"
+        : "",
+      (outcome.fsckRc ?? 0) !== 0
+        ? `e2fsck -fn returned ${outcome.fsckRc}`
+        : "",
+      outcome.dmesgErrors !== 0
+        ? `the guest logged ${outcome.dmesgErrors} ext4/I/O error lines`
+        : "",
+    ].filter((check) => check !== "");
+    // Semicolons, not commas: these clauses contain commas of their own.
+    //
+    // `code: 0` with any of the other three is the dangerous shape, and stays
+    // spelled out as such: the script succeeded and the filesystem it produced
+    // is not sound, which without this check publishes as a cache hit every
+    // descendant trusts.
     const why = outcome.code !== 0
-      ? `the step script exited ${outcome.code} at stage ${outcome.stage}`
-      : outcome.umountRc !== 0
-      ? "the step script succeeded but an unmount under /mnt failed, so its " +
-        "writeback did not complete"
-      : (outcome.fsckRc ?? 0) !== 0
-      ? `the step script succeeded but e2fsck -fn returned ${outcome.fsckRc}`
-      : `the step script succeeded but the guest logged ` +
-        `${outcome.dmesgErrors} ext4/I/O error lines`;
+      ? [
+        `the step script exited ${outcome.code} at stage ${outcome.stage}`,
+        ...checks,
+      ].join("; ")
+      : checks.length > 0
+      ? `the step script succeeded but ${checks.join("; ")}`
+      // Unreachable from `build()`, which constructs this only after one of the
+      // four fired. Reachable by hand, though, and a dangling "succeeded but"
+      // would be worse than saying plainly that nothing explains the failure.
+      : "the outcome records no failing signal";
     super(
       `guest step ${stepId} failed: ${why}. ${outcome.detail}\n` +
         "The layer was not published; the console below is the whole record " +
