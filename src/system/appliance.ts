@@ -25,7 +25,13 @@ import {
 import { APPLIANCE_ABI } from "./abi.ts";
 import { DISK_SERIALS, diskArgs, type DiskAttachment } from "./devices.ts";
 import type { ApplianceIdentity } from "./identity.ts";
-import { GuestNetworkUnavailableError } from "./errors.ts";
+import {
+  GuestBootError,
+  GuestNetworkUnavailableError,
+  GuestStatusError,
+  GuestTimeoutError,
+  InvalidGuestDnsError,
+} from "./errors.ts";
 
 /** What a guest layer needs run. */
 export interface GuestStepRequest {
@@ -45,6 +51,16 @@ export interface GuestStepRequest {
   readonly network?: boolean;
   /** Logical sector size of the target. @default 512 */
   readonly sectorSize?: 512 | 4096;
+  /**
+   * Deadline for THIS step, overriding the runner's.
+   *
+   * Steps are not the same size. A 200 MiB mkfs finishes in ~250ms on a
+   * native guest while an `apk add` over slirp is bounded by a download, and
+   * one number cannot be right for both: set it for the slow step and a hung
+   * fast one burns the whole deadline before anyone hears about it.
+   * @default the runner's `timeoutMs`
+   */
+  readonly timeoutMs?: number;
 }
 
 /** What one guest step produced. */
@@ -77,8 +93,25 @@ export interface ApplianceOptions {
   readonly root?: string;
   /** Subprocess seam. @default a real `DenoCommandRunner` */
   readonly runner?: CommandRunner;
-  /** Boot deadline. @default 120_000 native, 600_000 cross-arch */
+  /**
+   * Default boot deadline, overridable per step.
+   *
+   * @default 120_000 native, 600_000 cross-arch
+   */
   readonly timeoutMs?: number;
+  /**
+   * Where a failed boot's console log is copied so it outlives the build.
+   *
+   * The console is written into the step's `scratchDir`, which is the layer's
+   * `.partial` — and `build()` calls `store.abandon()` on failure, which
+   * removes that directory. Without a copy every error naming the console
+   * names a file that has already been deleted by the time anyone reads it.
+   *
+   * Written to only when a step fails, and never cleaned up — surviving the
+   * build is the entire point, so the caller owns its lifetime.
+   * @default a fresh `Deno.makeTempDir({ prefix: "qemu-img-console-" })`
+   */
+  readonly consoleDir?: string;
   /**
    * Enable `run({ network: true })`. Slirp's own resolver at 10.0.2.3 never
    * answers on qemu 11.0.2/macOS, and DHCP is impossible (no af_packet
@@ -104,6 +137,24 @@ const CONSOLE: Readonly<Record<string, string>> = {
   x86_64: "ttyS0",
 };
 
+/**
+ * Dotted-quad IPv4, and nothing else.
+ *
+ * Deliberately not a general address parser. This value is interpolated into
+ * the kernel cmdline, so the only shapes that can survive are ones with no
+ * whitespace — and the only ones the guest can *reach* are IPv4, since it is
+ * configured `10.0.2.15/24` with an IPv4 default route and no IPv6 address at
+ * all. A leading zero is refused because `010` is octal to some resolvers and
+ * decimal to others, and a resolver at the wrong address just never answers.
+ */
+const IPV4 = /^(?:(?:0|[1-9]\d{0,2})\.){3}(?:0|[1-9]\d{0,2})$/;
+
+/** Whether `value` is a dotted-quad IPv4 address with every octet in range. */
+function isIpv4(value: string): boolean {
+  if (!IPV4.test(value)) return false;
+  return value.split(".").every((octet) => Number(octet) <= 255);
+}
+
 /** Boots the real appliance under `qemu-system-<arch>`. */
 export class ApplianceGuestRunner implements GuestRunner {
   readonly #identity: ApplianceIdentity;
@@ -112,12 +163,22 @@ export class ApplianceGuestRunner implements GuestRunner {
   readonly #timeoutMs: number;
   readonly #network: GuestNetworkOptions | undefined;
   readonly #abi: number;
+  readonly #consoleDir: string | undefined;
+  /** Created on first use, so a run that never fails never makes a directory. */
+  #consoleDirPromise: Promise<string> | undefined;
 
   /** Create a runner over an already-verified appliance identity. */
   constructor(options: ApplianceOptions) {
     this.#identity = options.identity;
     this.#root = options.root ?? ".appliance";
     this.#runner = options.runner ?? new DenoCommandRunner();
+    // Validated HERE, not at run time: the value rides the kernel cmdline
+    // beside the nonce, which has always been validated, and a `dns` carrying
+    // a space does not fail — it silently changes the arguments the guest
+    // parses. Failing at construction means it cannot reach a boot at all.
+    if (options.network !== undefined && !isIpv4(options.network.dns)) {
+      throw new InvalidGuestDnsError(options.network.dns);
+    }
     // A same-arch guest accelerates; a cross-arch guest is emulated end to end
     // and is roughly an order of magnitude slower, so it gets a longer
     // deadline rather than a shared one that is wrong for both.
@@ -125,6 +186,45 @@ export class ApplianceGuestRunner implements GuestRunner {
     this.#timeoutMs = options.timeoutMs ?? (native ? 120_000 : 600_000);
     this.#network = options.network;
     this.#abi = options.abi ?? APPLIANCE_ABI;
+    this.#consoleDir = options.consoleDir;
+  }
+
+  /**
+   * Copy the console somewhere `store.abandon()` cannot reach, and read it.
+   *
+   * Best effort by construction: this runs only on paths that are already
+   * failing, and a retention error must never replace the failure that caused
+   * it. A `undefined` path means the copy did not happen — the text is still
+   * returned, and it is still embedded in the error.
+   */
+  async #retainConsole(
+    stepId: string,
+    consolePath: string,
+  ): Promise<{ text: string; retained: string | undefined }> {
+    const text = await Deno.readTextFile(consolePath).catch(() => "");
+    try {
+      if (this.#consoleDirPromise === undefined) {
+        const configured = this.#consoleDir;
+        const pending = configured === undefined
+          ? Deno.makeTempDir({ prefix: "qemu-img-console-" })
+          : Deno.mkdir(configured, { recursive: true }).then(() => configured);
+        // Forget a rejection rather than caching it: one full disk must not
+        // stop every later step from retaining its console.
+        pending.catch(() => {
+          this.#consoleDirPromise = undefined;
+        });
+        this.#consoleDirPromise = pending;
+      }
+      const dir = await this.#consoleDirPromise;
+      // The step id reaches a filename, so anything that is not obviously
+      // safe in one is replaced: ids carry `:` (`table:mkfs`) by design.
+      const stem = stepId.replaceAll(/[^A-Za-z0-9._-]/g, "_") || "step";
+      const retained = `${dir}/${stem}-console.log`;
+      await Deno.writeTextFile(retained, text);
+      return { text, retained };
+    } catch {
+      return { text, retained: undefined };
+    }
   }
 
   /** Boot the appliance, run one step, and return its status record. */
@@ -214,9 +314,10 @@ export class ApplianceGuestRunner implements GuestRunner {
     ];
 
     const started = Date.now();
+    const timeoutMs = request.timeoutMs ?? this.#timeoutMs;
     try {
       const result = await this.#runner.run(`qemu-system-${arch}`, argv, {
-        timeoutMs: this.#timeoutMs,
+        timeoutMs,
         stdout: "null",
       });
       // A runner never throws on a nonzero exit, so without this the failure
@@ -225,7 +326,10 @@ export class ApplianceGuestRunner implements GuestRunner {
       // and the one place that says why — qemu's own stderr — would be thrown
       // away. This is the one case where qemu's exit code IS the answer.
       if (result.code !== 0) {
-        throw new Error(
+        throw new GuestBootError(
+          request.stepId,
+          result.code,
+          result.stderr,
           `qemu exited ${result.code} without booting the guest for step ` +
             `${request.stepId}. This is not a step failure — the VM never ` +
             `started:\n${result.stderr.trim() || "(no stderr)"}`,
@@ -233,12 +337,16 @@ export class ApplianceGuestRunner implements GuestRunner {
       }
     } catch (error) {
       if (error instanceof CommandAbortedError) {
-        throw new Error(
-          `guest step ${request.stepId} did not power off within ` +
-            `${this.#timeoutMs}ms — it hung. qemu's exit code could not have ` +
-            "told you that either: it exits 0 for a panic under -no-reboot " +
-            `just as it does for a clean poweroff. Console: ${consolePath}`,
-          { cause: error },
+        const { text, retained } = await this.#retainConsole(
+          request.stepId,
+          consolePath,
+        );
+        throw new GuestTimeoutError(
+          request.stepId,
+          timeoutMs,
+          text,
+          retained,
+          error,
         );
       }
       throw error;
@@ -246,9 +354,30 @@ export class ApplianceGuestRunner implements GuestRunner {
     const elapsedMs = Date.now() - started;
 
     const consoleText = await Deno.readTextFile(consolePath).catch(() => "");
-    const outcome = parseStatus(await Deno.readFile(statusPath), {
-      nonce: request.nonce,
-    });
+    const statusBytes = await Deno.readFile(statusPath).catch(
+      () => new Uint8Array(STATUS_BYTES),
+    );
+    let outcome: StepOutcome;
+    try {
+      outcome = parseStatus(statusBytes, { nonce: request.nonce });
+    } catch (error) {
+      if (!(error instanceof GuestStatusError)) throw error;
+      // Until this existed the console was read one line above and dropped on
+      // the floor right here — in the exact case where the record says
+      // nothing, so the console is the only account of the boot. One of these
+      // faults cannot produce a record at all: an `/init` that resolves its
+      // status role to zero disks has nowhere to write one, and explains
+      // itself on the console and nowhere else.
+      const { text, retained } = await this.#retainConsole(
+        request.stepId,
+        consolePath,
+      );
+      throw new GuestStatusError(error.fault, error.reason, {
+        ...(error.field === undefined ? {} : { field: error.field }),
+        console: text,
+        ...(retained === undefined ? {} : { consolePath: retained }),
+      });
+    }
     return { outcome, console: consoleText, elapsedMs };
   }
 }

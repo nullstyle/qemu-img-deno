@@ -12,11 +12,17 @@
  * README's guest-tier hazard table.
  *
  * Exit codes raised by generated scripts, chosen not to collide with `/init`'s
- * own `90`–`101`: `64` a declared partition node never appeared, `65`/`66` its
+ * own `91`–`101`: `64` a declared partition node never appeared, `65`/`66` its
  * start/size disagree with the plan, `67` a `copyIn` with no data disk, `68`
  * the ROOT partition node never appeared, `69` the root partition holds no
  * filesystem `blkid` recognizes, `70` it holds one that is not ext2/3/4, `71`
- * the `copyIn` payload failed to extract.
+ * the `copyIn` payload failed to extract, `73` the `copyIn` destination
+ * resolves outside the image root through a symlink the base image shipped.
+ *
+ * These all arrive at stage `"step"`, because they are raised by the script
+ * `/init` runs — so they are indistinguishable from a code the recipe author
+ * chose. Keep new ones in this band and away from anything an author is
+ * likely to pick.
  *
  * @module
  */

@@ -46,6 +46,8 @@ export {
   FRAME_MAGIC,
   framePayload,
   type FramePayloadOptions,
+  type FsckVerdict,
+  fsckVerdict,
   type GuestStage,
   parseStatus,
   type ParseStatusExpectation,
@@ -95,8 +97,16 @@ export {
 } from "./appliance.ts";
 
 export {
+  GuestBootError,
   GuestNetworkUnavailableError,
+  GuestStatusError,
+  type GuestStatusErrorOptions,
+  type GuestStatusFault,
   GuestStepFailedError,
+  GuestTimeoutError,
+  InvalidGuestDnsError,
+  PayloadFrameError,
+  type PayloadFrameFault,
   StaleApplianceError,
   type StaleApplianceField,
 } from "./errors.ts";
