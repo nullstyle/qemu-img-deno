@@ -14,6 +14,8 @@
  * @module
  */
 
+import { createHash } from "node:crypto";
+
 /**
  * Serialize a value with object keys sorted at every depth, so two values that
  * differ only in key order hash identically.
@@ -80,4 +82,59 @@ export async function sha256Hex(input: string | Uint8Array): Promise<string> {
   return Array.from(new Uint8Array(digest))
     .map((byte) => byte.toString(16).padStart(2, "0"))
     .join("");
+}
+
+/**
+ * The window {@linkcode sha256HexFile} holds while folding a file.
+ *
+ * 1 MiB, the same block `contentDigest()` reads in `src/recipe/content.ts`, so
+ * a build that digests one layer both ways has a single buffer size to reason
+ * about.
+ */
+const FILE_BLOCK_BYTES = 1024 * 1024;
+
+/**
+ * Lowercase-hex sha256 of a file's bytes, read one block at a time.
+ *
+ * Byte-identical to `sha256Hex(await Deno.readFile(path))` — that is the whole
+ * contract, because this digest names cached layers and a changed value
+ * silently invalidates every one of them. Verified against both that
+ * expression and `shasum -a 256` on a 2 GiB file.
+ *
+ * It exists for the memory. `Deno.readFile` holds the entire file, and
+ * `crypto.subtle.digest` then copies it again to hash it, so the peak is twice
+ * the file — and the files here are disk images, which makes that the common
+ * case rather than the pathological one. Measured on one 2 GiB file:
+ *
+ * | how                                  | peak RSS | wall    |
+ * | ------------------------------------ | -------- | ------- |
+ * | `Deno.readFile` + `crypto.subtle`    | 4.05 GiB | 894 ms  |
+ * | `node:crypto` `createHash`, 1 MiB    | 55 MB    | 756 ms  |
+ * | `@std/crypto` (wasm) over a stream   | 84 MB    | 4396 ms |
+ * | `node:crypto` over `file.readable`   | 109 MB   | 1109 ms |
+ *
+ * Streaming needs an INCREMENTAL hash, and `crypto.subtle` has none: on Deno
+ * 2.9.3 its `digest` rejects a `ReadableStream`, an async iterable and an array
+ * of chunks alike ("Argument 1 can not be converted to a BufferSource"). Of the
+ * two incremental sha256s available, `node:crypto` wins on both axes and adds
+ * no dependency — Deno implements the `node:` builtins natively. The
+ * portability a `node:` specifier costs was never on offer: this package only
+ * runs where `Deno.Command` does.
+ */
+export async function sha256HexFile(path: string): Promise<string> {
+  const hash = createHash("sha256");
+  const file = await Deno.open(path, { read: true });
+  try {
+    const block = new Uint8Array(FILE_BLOCK_BYTES);
+    for (;;) {
+      const read = await file.read(block);
+      if (read === null) break;
+      // `update` consumes the bytes before it returns, so one block can be
+      // refilled for the whole file.
+      hash.update(block.subarray(0, read));
+    }
+  } finally {
+    file.close();
+  }
+  return hash.digest("hex");
 }

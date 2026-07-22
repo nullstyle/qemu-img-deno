@@ -46,7 +46,9 @@ export interface ContentDigestOptions {
    * Directory for the transient raw materialization.
    *
    * The file is sparse — only the image's data extents ever get written — and
-   * it is removed before this returns, including on failure.
+   * it is removed before this returns, including on failure. A process KILLED
+   * mid-digest is the one case that leaves one behind; `LayerStore.gc()`
+   * reclaims what is left in the store's own `scratch/`.
    */
   readonly scratch: string;
   /** The image's format (`-f`), so qemu does not probe it. */
@@ -105,6 +107,27 @@ async function digestRawFile(qemu: QemuImg, raw: string): Promise<string> {
   const extents = (await qemu.map(raw, { format: "raw" }))
     .filter((extent) => extent.zero !== true && extent.length > 0)
     .sort((a, b) => a.start - b.start);
+
+  // Every offset below is derived from `sizeBytes`, and an extent reaching
+  // past it turns the block length into a negative number that `subarray`
+  // silently reinterprets as "all but the last n bytes" — a digest over a
+  // block nothing else would ever produce. Measured on qemu-img 11.0.2, a
+  // `convert -O raw` output is always its full virtual length even when the
+  // tail is one hole (512 MiB virtual, 16 KiB allocated, `stat().size` =
+  // 536870912), so this fires only if the materialization was truncated.
+  for (const extent of extents) {
+    const end = extent.start + extent.length;
+    if (end > sizeBytes) {
+      throw new Error(
+        `content digest: qemu-img map reports data out to ${end} in a ` +
+          `${sizeBytes}-byte materialization of this image. Folding in what ` +
+          "is actually there would name the content with a digest no " +
+          "complete image can reproduce, so it is refused instead. Check " +
+          `whether ${raw} was truncated — a full scratch filesystem is the ` +
+          "likeliest cause.",
+      );
+    }
+  }
 
   const file = await Deno.open(raw, { read: true });
   try {
