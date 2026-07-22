@@ -1,0 +1,60 @@
+{
+  "lockfileVersion": 1,
+  "_comment": [
+    "Pinned inputs for the build appliance (tools/build_appliance.ts).",
+    "Nothing is trusted by URL: every artifact is verified against the sha256",
+    "recorded here, so a fetch is a pure function of its pins and the cache is",
+    "safely shareable. Alpine publishes .sha256, .sha512 and a GPG .asc for",
+    "both of these artifacts; the digests below are the published ones.",
+    "",
+    "To move to a new Alpine release, update `version`, refresh all four",
+    "digests from the published .sha256 sidecars, and rebuild both targets.",
+    "Alpine garbage-collects superseded packages, so a stale pin eventually",
+    "stops resolving -- that is a loud 404, never a silent substitution."
+  ],
+  "alpine": {
+    "release": "v3.21",
+    "version": "3.21.7",
+    "mirror": "https://dl-cdn.alpinelinux.org/alpine"
+  },
+  "packages": [
+    "e2fsprogs",
+    "e2fsprogs-libs",
+    "e2fsprogs-extra",
+    "libcom_err",
+    "libblkid",
+    "libuuid"
+  ],
+  "targets": {
+    "aarch64": {
+      "console": "ttyAMA0",
+      "machine": "virt",
+      "qemu": "qemu-system-aarch64",
+      "artifacts": {
+        "iso": {
+          "file": "alpine-virt-3.21.7-aarch64.iso",
+          "sha256": "1b1da158030879a9f8af3309e839ce38bc3e99f3e658292ac46d596bf6c08ad7"
+        },
+        "minirootfs": {
+          "file": "alpine-minirootfs-3.21.7-aarch64.tar.gz",
+          "sha256": "d1d1a3fae5f4d6146e9742790a47fcb116199622cfb8439f218a4d5fbe5000da"
+        }
+      }
+    },
+    "x86_64": {
+      "console": "ttyS0",
+      "machine": "q35",
+      "qemu": "qemu-system-x86_64",
+      "artifacts": {
+        "iso": {
+          "file": "alpine-virt-3.21.7-x86_64.iso",
+          "sha256": "004568b74408e6110b253b46781edb4aa3aed35e247d96b2f290b2171bd0e4d1"
+        },
+        "minirootfs": {
+          "file": "alpine-minirootfs-3.21.7-x86_64.tar.gz",
+          "sha256": "8cba1ea3e8b500ea986a313d8eecf3d5952a2a0d23a69117bb81c023d9ceac05"
+        }
+      }
+    }
+  }
+}

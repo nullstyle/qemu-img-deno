@@ -7,6 +7,94 @@ and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Pre-1.0, breaking
 changes ride a minor bump.
 
+## [0.3.0] — Unreleased
+
+Groundwork for building disk images from scratch. The mechanism that makes it
+possible on a host with no Linux image tooling: qemu's own block drivers. A
+`raw` node with `offset`/`size` is a **window** onto a larger image, so bytes
+can be written into one partition without touching its neighbours, and the
+`vvfat` driver synthesizes a FAT filesystem from a host directory — which is how
+an ESP gets built on a machine with no `mkfs.fat`.
+
+### Added
+
+- `BlockNodeSpec` / `ImageRef` / `renderBlockNode` — block-driver option graphs,
+  accepted by `convert`, `info`, `infoChain`, `map`, `measure` and `compare` in
+  place of a path, and rendered to qemu's `key=value,child.key=value` form with
+  keys sorted for stable argv. A plain string still emits identical argv. Guards
+  refuse, with a `TypeError` naming the fix, the combinations qemu rejects
+  later: an option graph alongside a format flag, a `--target-image-opts`
+  destination without `noCreate`, one graph operand and one path on `compare`,
+  and mixing graphs with multi-source `convert`.
+- `ConvertOptions.parallel` (`-m`). Pin to `1` when the output will be hashed;
+  `-W` is never emitted.
+- `CommandAbortedError.stdout`/`.stderr` — the output the child had already
+  produced when the abort fired. A timed-out command is exactly where its last
+  line matters most.
+- `RunOptions.stdout`/`.stderr` disposition (`"piped"`/`"inherit"`/`"null"`),
+  and `DenoCommandRunnerOptions.killGraceMs`.
+- `FakeQemuImg.refuseContentOracles` — makes `compare`/`check`/`map` throw
+  instead of answering. The fake models no image content, so those three verbs
+  are fiction; code whose correctness depends on them should say so rather than
+  pass for the wrong reason.
+- Smoke coverage for `convert` **with a backing file** (every convert in the
+  smoke was previously backing-less, leaving the argv path a backing chain
+  depends on unexercised), for option-graph window writes, and for building a
+  FAT filesystem via `vvfat` — validated against `/sbin/fsck_msdos`, an
+  implementation with no shared code with qemu.
+
+### Fixed
+
+- `timeoutMs` was not a wall-clock deadline. The abort raced the child's
+  _captured output_, and a pipe stays readable while any grandchild holds its
+  write end — so `sh -c 'echo x; sleep 5'` with a 500 ms timeout blocked for the
+  full 5 s (measured: 5010 ms). It now races the exit status and escalates
+  `SIGTERM` → grace → `SIGKILL`, guaranteeing the child is reaped. The existing
+  test used bare `sleep 5`, which has no children, so the suite never saw it.
+- `CommandAbortedError` discarded output the runner already held.
+- **A `timeoutMs` deadline kept the process alive after the command finished.**
+  `AbortSignal.timeout()` uses a _referenced_ timer, so a run with
+  `timeoutMs: 120_000` that completed in 300 ms still held the event loop open
+  for the remaining two minutes. The deadline is now an owned timer cleared on
+  every exit path. The existing tests could not see it: they use short timeouts
+  that simply fire.
+- **`FakeQemuImg` silently mis-parsed long flags.** `positionalsOf` skipped any
+  unrecognized `--flag` and treated its value as a positional, so
+  `create -f qcow2 --backing base.qcow2 --backing-format qcow2 /out.qcow2`
+  registered an image at path `base.qcow2`, clobbered the real base's state,
+  never created `/out.qcow2`, and returned exit 0 — every assertion downstream
+  passing against an image that was never built. Unrecognized flags now throw,
+  and each subcommand's flag table covers both the short spellings and the long
+  ones, including the backing flags qemu-img 11.0 renamed in opposite directions
+  (`create`'s backing _format_ `-F` → `-B`; `convert`'s backing _file_ `-B` →
+  `-b`). Both spellings still parse on 11.0.2, so the client's emission is
+  unchanged.
+
+### Tooling (not published)
+
+- `deno task appliance [--arch=aarch64|x86_64]` builds the guest-tier build
+  appliance — a kernel plus an initramfs that runs one step script against
+  attached disks and reports a framed status record. Inputs are pinned in
+  `appliance.lock.json` and verified by sha256; Alpine publishes `.sha256`,
+  `.sha512` and a GPG `.asc` for both. Three things it has to get right: the
+  kernel builds virtio as **modules** (`CONFIG_VIRTIO_BLK=m` on both arches), so
+  the appliance layers over Alpine's module-carrying initramfs and relies on
+  concatenated cpio members resolving later-wins; block devices reject unaligned
+  reads, so the payload is sector-framed with an explicit length; and
+  `kernel_power_off()` does not sync, so the status record is fsynced.
+- `deno task appliance:run [--arch=…] [--target=…] <step.sh>` runs a step inside
+  it. Measured: **0.3 s** on aarch64 under `hvf`, **5.6 s** for x86_64 under TCG
+  emulation on Apple Silicon. Guests run with `-nic none`.
+
+### Changed
+
+- **Breaking (`./testing`):** `FakeQemuImg` now throws on an argv flag the
+  subcommand does not declare, rather than skipping it. A downstream test
+  driving an undeclared flag through `raw()` will start failing — which is the
+  point.
+- `ConvertOptions.format` is now optional, required only for a path destination.
+  An option-graph destination carries its own `driver`.
+
 ## [0.2.1] — Unreleased
 
 An adversarial re-review of 0.2.0 found a crash reachable from the typed API and
