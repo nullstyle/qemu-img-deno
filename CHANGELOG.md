@@ -93,6 +93,11 @@ an ESP gets built on a machine with no `mkfs.fat`.
   bumping Alpine cannot leave a stale layer looking like a hit. Disks are
   addressed by **identity**, not position: roles ride the kernel cmdline as
   serial tokens and the guest resolves them from `/sys/block/vd*/serial`.
+  `GuestStepFailedError` — what `build()` throws when a guest step's exit code,
+  unmount, `e2fsck` or dmesg scan says the layer must not be published — is
+  exported from **both** `./system` and `./recipe`, since `build()` lives on the
+  latter. One class, so `instanceof` matches whichever subpath a caller reached
+  for; `.name` alone cannot distinguish it from a generic failure.
 - **`buildTar` in `./fs`** — a ustar writer, because both host tars lose data
   while exiting `0` (see the guest-tier hazard table). It throws where they
   drop, and emits a GNU `'L'` record for names with no prefix/name split.
