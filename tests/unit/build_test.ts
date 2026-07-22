@@ -8,7 +8,11 @@ import {
 import { QemuImg } from "../../src/qemu_img.ts";
 import { FakeQemuImg } from "../../testing/mod.ts";
 import { build } from "../../src/recipe/build.ts";
-import { plan } from "../../src/recipe/plan.ts";
+import {
+  plan,
+  type PlanAppliance,
+  VVFAT_USABLE_BYTES,
+} from "../../src/recipe/plan.ts";
 import { LayerStore } from "../../src/recipe/store.ts";
 import { LocalInputResolver } from "../../src/recipe/resolve.ts";
 import {
@@ -45,14 +49,27 @@ async function scratchDir(): Promise<string> {
 /** Big enough for vvfat's fixed FAT12 geometry plus a root partition. */
 const DISK_BYTES = 64 * 1024 ** 2;
 /** vvfat's FAT12 usable size — fixed, content-independent, checked by plan(). */
-const FAT12_BYTES = 33_005_568;
+/**
+ * vvfat's fixed FAT12 geometry, from the package's own constant.
+ *
+ * It used to be a literal 33_005_568 here, which was wrong by 7680 bytes and
+ * which nothing caught because no smoke builds FAT12. Measured against the
+ * real binary: `qemu-img info driver=vvfat,fat-type=12` reports 33030144, and
+ * the filesystem starts 32256 bytes in past vvfat's own MBR.
+ */
+const FAT12_BYTES = VVFAT_USABLE_BYTES[12];
 const DETERMINISM = {
   sourceDateEpoch: 1_700_000_000,
   guidSeed: "guid-seed",
   fsSeed: "fs-seed",
 } as const;
 /** Stand-in appliance identity; plan() only ever folds its digest. */
-const APPLIANCE = { digest: "ap".repeat(32) };
+const APPLIANCE: PlanAppliance = {
+  digest: "ap".repeat(32),
+  // plan() refuses an appliance whose arch disagrees with the recipe's, so
+  // the stub has to name one rather than being a bare digest.
+  arch: "aarch64",
+};
 /**
  * A REAL staging tree, resolved by the real resolver.
  *
