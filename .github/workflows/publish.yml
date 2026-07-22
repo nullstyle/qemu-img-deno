@@ -9,8 +9,11 @@ permissions:
   id-token: write # OIDC → JSR provenance (Sigstore)
 
 jobs:
-  publish:
+  # Cheap, and first: a tag that disagrees with deno.json should not spend the
+  # whole suite finding that out.
+  version-gate:
     runs-on: ubuntu-24.04
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
       - uses: denoland/setup-deno@v2
@@ -24,8 +27,22 @@ jobs:
             echo "::error::tag v$tag does not match deno.json version $version"
             exit 1
           fi
-      - run: deno task check
-      - run: deno task doc:lint
-      - run: deno task publish:check
-      - run: deno task test
+
+  # The entire PR gate, re-run on the tagged commit, real-binary smoke and all.
+  # This job used to be a hand-copied subset ending at `deno task test` --
+  # which is FakeQemuImg from end to end, so every argv this package emits
+  # could have been wrong and the release would still have gone out.
+  ci:
+    needs: version-gate
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    needs: [version-gate, ci]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
       - run: deno publish
