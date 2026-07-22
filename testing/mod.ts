@@ -23,6 +23,8 @@
 export {
   failed,
   type FakeConvert,
+  type FakeCreate,
+  type FakeExtent,
   type FakeImageState,
   FakeQemuImg,
   ok,

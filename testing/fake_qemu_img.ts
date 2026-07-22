@@ -5,9 +5,15 @@
  * It models a coherent in-memory image store (formats, virtual sizes,
  * backing references, snapshots, bitmaps) and dispatches on the exact argv
  * the client emits, so tests assert both behavior AND the precise command
- * sequence — with no `qemu-img` binary. Image *contents* are not modeled:
- * `convert`/`dd` track metadata only; use {@linkcode FakeQemuImg.onConvert}
- * to produce real bytes when a test needs them.
+ * sequence — with no `qemu-img` binary.
+ *
+ * Image content is **declared, never invented**. A test states what an image
+ * holds with {@linkcode FakeQemuImg.setImage}'s `content`, and the fake then
+ * keeps `create`, `convert` and `map` consistent with that declaration —
+ * flattening the backing chain, and, under
+ * {@linkcode FakeQemuImg.materialize}, writing the bytes out as real files.
+ * What it will not do is answer a question about content nobody declared;
+ * that is what {@linkcode FakeQemuImg.refuseContentOracles} is for.
  *
  * The seam is structurally identical to `@nullstyle/lima`'s, so this fake
  * also serves as that library's runner in cross-package tests.
@@ -31,6 +37,24 @@ export interface RecordedCall {
   readonly stdin?: string;
 }
 
+/** One extent, shaped like a `qemu-img map --output=json` entry. */
+export interface FakeExtent {
+  /** Guest offset in bytes. */
+  readonly start: number;
+  /** Extent length in bytes. */
+  readonly length: number;
+  /** Backing-chain depth that allocated it. @default 0 */
+  readonly depth?: number;
+  /** Whether the extent is allocated in the chain. @default true */
+  readonly present?: boolean;
+  /** Whether it reads as zeros. @default false */
+  readonly zero?: boolean;
+  /** Whether it carries stored data. @default the negation of `zero` */
+  readonly data?: boolean;
+  /** Host file offset, when the mapping is direct. */
+  readonly offset?: number;
+}
+
 /** Mutable per-image fake state. */
 export interface FakeImageState {
   /** Image format (`"qcow2"`, `"raw"`, …). */
@@ -39,12 +63,58 @@ export interface FakeImageState {
   virtualSizeBytes?: number;
   /** Backing file reference, when the image is an overlay. */
   backingFilename?: string;
+  /**
+   * The backing reference resolved against this image's own directory —
+   * qcow2 records a path relative to the OVERLAY, and qemu-img resolves it
+   * that way before opening it. Lookups follow this; `backingFilename` stays
+   * the string as written, which is what `info` reports.
+   */
+  backingPath?: string;
   /** Backing file format. */
   backingFormat?: string;
+  /**
+   * The bytes this layer declares, from guest offset 0.
+   *
+   * The fake never invents this and never derives it from an image on disk:
+   * a test states it, and everything downstream — the chain flattening in
+   * {@linkcode FakeQemuImg.contentOf}, what `convert` propagates, what `map`
+   * reports, what {@linkcode FakeQemuImg.materialize} writes — follows from
+   * the declaration. Absent means "nobody said", which is a different answer
+   * from "empty" and is why `map` can refuse.
+   */
+  content?: Uint8Array;
+  /**
+   * The exact extents `map` should report for this image.
+   *
+   * Declare these when a test is *about* allocation — that a digest ignores
+   * how the same bytes were stored, say. Otherwise leave it out and the
+   * extents follow from `content`.
+   */
+  extents?: readonly FakeExtent[];
   /** Internal snapshots, in creation order. */
   snapshots: { id: string; tag: string }[];
   /** Persistent dirty bitmaps. */
   bitmaps: Set<string>;
+}
+
+/** One recorded `create`, decoded. */
+export interface FakeCreate {
+  /** The image path being created. */
+  readonly path: string;
+  /** Output format (`-f`). */
+  readonly format: string;
+  /** The requested virtual size, parsed; absent when the size came from a backing file. */
+  readonly sizeBytes?: number;
+  /** The backing reference as written on the command line (`-b`). */
+  readonly backing?: string;
+  /** That reference resolved against the new image's own directory. */
+  readonly backingPath?: string;
+  /** The backing format (`-F`). */
+  readonly backingFormat?: string;
+  /** The raw `-o` option string, when given. */
+  readonly options?: string;
+  /** The raw recorded call. */
+  readonly raw: RecordedCall;
 }
 
 /** One recorded `convert`, decoded. */
@@ -92,6 +162,8 @@ export class FakeQemuImg implements CommandRunner {
   readonly images: Map<string, FakeImageState> = new Map();
   /** Every decoded `convert`, in order. */
   readonly converts: FakeConvert[] = [];
+  /** Every decoded `create`, in order. */
+  readonly creates: FakeCreate[] = [];
   /**
    * When `false`, {@linkcode FakeQemuImg.run} rejects with
    * `Deno.errors.NotFound` — the missing-binary simulation.
@@ -109,19 +181,50 @@ export class FakeQemuImg implements CommandRunner {
    */
   onConvert?: (convert: FakeConvert) => CommandResult | undefined | void;
   /**
-   * Make `compare`, `check` and `map` throw instead of answering.
+   * Hook: observe a `create` before the image is registered, and/or override
+   * its result. Return `undefined` for the default behavior.
    *
-   * Those three verbs are the fake's content oracles, and the fake models no
-   * content: `compare` reports "Images are identical" whenever both paths
-   * exist, `check` hardcodes zero errors, and `map` always returns one
-   * full-length data extent. Code whose correctness *depends* on what they
-   * report — anything verifying that an image holds the bytes it should —
-   * passes against this fake for the wrong reason. Set this to refuse the
-   * question rather than answer it falsely. @default false
+   * Fires before registration, like {@linkcode FakeQemuImg.onConvert}, so
+   * returning a result leaves nothing behind. A hook that declares content
+   * with `setImage(create.path, { content })` survives: registration merges
+   * over whatever is already there.
+   */
+  onCreate?: (create: FakeCreate) => CommandResult | undefined | void;
+  /**
+   * Treat the host filesystem as the image store.
+   *
+   * With this on, every image `create` or `convert` produces is written out as
+   * a real file holding exactly the content its chain declares (nothing, when
+   * none is declared — never a guess), a `raw` image is extended sparsely to
+   * its virtual size so its unwritten tail reads as the zeros it would on a
+   * real one, and a path that already exists on disk is openable even though
+   * no test declared it.
+   *
+   * Off by default: the fake is an in-memory model and reaching the host
+   * filesystem from a unit test should be a decision. Turn it on to drive code
+   * that opens the images it asks about — a store hashing a container file, a
+   * digest reading extents — or code that RENAMES a layer into place, which an
+   * in-memory map has no way to observe. @default false
+   */
+  materialize = false;
+  /**
+   * Make `compare`, `check` and unanswerable `map`s throw instead of lying.
+   *
+   * Those three verbs are the fake's content oracles. `compare` reports
+   * "Images are identical" whenever both paths exist and `check` hardcodes
+   * zero errors — neither has anything to consult, so both are refused
+   * outright. `map` is refused only when the image declares neither `extents`
+   * nor `content`, because then all it can do is claim one full-length data
+   * extent whether or not anything was ever written there. Code whose
+   * correctness *depends* on those answers — anything verifying that an image
+   * holds the bytes it should — otherwise passes against this fake for the
+   * wrong reason. @default false
    */
   refuseContentOracles = false;
 
   readonly #stubs: Stub[] = [];
+  /** Materialized images by `dev:ino`, so a RENAMED file is still itself. */
+  readonly #byInode = new Map<string, FakeImageState>();
   #nextSnapshotId = 1;
 
   /** Add (or update) an image; format defaults to `"qcow2"`. */
@@ -190,17 +293,18 @@ export class FakeQemuImg implements CommandRunner {
     if (subcommand !== undefined && subcommand in FLAGS) {
       positionalsOf(args.slice(1), FLAGS[subcommand]);
     }
-    if (
-      this.refuseContentOracles &&
-      (subcommand === "compare" || subcommand === "check" ||
-        subcommand === "map")
-    ) {
-      throw new Error(
-        `fake qemu-img: refusing to answer '${subcommand}' — this fake models ` +
-          "no image content, so its answer would be fiction. Assert on the " +
-          "recorded argv, or exercise this path against a real qemu-img in a " +
-          "smoke test.",
-      );
+    if (this.refuseContentOracles) {
+      const undeclared = subcommand === "map" &&
+        this.#declaredMap(lastPositional(args)) === undefined;
+      if (subcommand === "compare" || subcommand === "check" || undeclared) {
+        throw new Error(
+          `fake qemu-img: refusing to answer '${subcommand}' — this fake ` +
+            "models no image content beyond what a test declared, so its " +
+            "answer would be fiction. Declare it with `setImage(path, { " +
+            "content })` or `{ extents }`, assert on the recorded argv, or " +
+            "exercise this path against a real qemu-img in a smoke test.",
+        );
+      }
     }
     switch (subcommand) {
       case "--version":
@@ -223,7 +327,7 @@ export class FakeQemuImg implements CommandRunner {
       case "convert":
         return this.#convert(call);
       case "create":
-        return this.#create(args);
+        return this.#create(call);
       case "dd":
         return this.#dd(args);
       case "info":
@@ -246,11 +350,99 @@ export class FakeQemuImg implements CommandRunner {
     }
   }
 
+  /**
+   * The bytes a guest reads through `path`, flattening the backing chain.
+   *
+   * Each layer's declared content is written over its parent's from offset 0,
+   * base first — a qcow2 overlay is a delta in guest address space, so that
+   * is the only composition rule that means anything here. `undefined` when
+   * no layer in the chain declared any: the fake has nothing to say, rather
+   * than an empty image to claim.
+   */
+  contentOf(path: string): Uint8Array | undefined {
+    const chain: FakeImageState[] = [];
+    const seen = new Set<string>();
+    let current: string | undefined = path;
+    while (current !== undefined && !seen.has(current)) {
+      seen.add(current);
+      const state = this.images.get(current);
+      if (state === undefined) break;
+      chain.push(state);
+      current = state.backingPath ?? state.backingFilename;
+    }
+    let flat: Uint8Array | undefined;
+    for (const state of chain.reverse()) {
+      if (state.content === undefined) continue;
+      if (flat === undefined || state.content.length >= flat.length) {
+        flat = state.content.slice();
+        continue;
+      }
+      flat.set(state.content, 0);
+    }
+    return flat;
+  }
+
+  /**
+   * The state for a path the fake is being asked to open.
+   *
+   * Under {@linkcode FakeQemuImg.materialize} a file on disk is openable even
+   * though nothing declared it at that path — which is what a layer looks like
+   * after code under test RENAMED it into place. It is matched by inode first,
+   * so a moved image is still the same image with the same declared size and
+   * content; a file the fake never wrote is adopted with neither, because it
+   * has no idea what is in it.
+   */
+  #openable(path: string): FakeImageState | undefined {
+    const known = this.images.get(path);
+    if (known !== undefined) return known;
+    if (!this.materialize) return undefined;
+    const identity = inodeOf(path);
+    if (identity === undefined) return undefined;
+    const moved = this.#byInode.get(identity);
+    if (moved !== undefined) {
+      // The same object under both names: it is one file, and a `rebase` or
+      // `resize` through either path is a change to the same image.
+      this.images.set(path, moved);
+      return moved;
+    }
+    this.setImage(path, {});
+    return this.images.get(path);
+  }
+
+  /** Write an image out as a real file holding what its chain declares. */
+  #materialize(path: string): CommandResult | undefined {
+    if (!this.materialize) return undefined;
+    const state = this.images.get(path);
+    if (state === undefined) return undefined;
+    const content = this.contentOf(path) ?? new Uint8Array();
+    try {
+      Deno.writeFileSync(path, content);
+      // A raw image IS its guest address space, so its unwritten tail has to
+      // read as zeros out to the virtual size. Sparse, so a 64 GiB declaration
+      // still costs nothing.
+      const size = state.virtualSizeBytes ?? 0;
+      if (state.format === "raw" && size > content.length) {
+        Deno.truncateSync(path, size);
+      }
+    } catch (error) {
+      this.images.delete(path);
+      return failed(
+        1,
+        `qemu-img: Could not open '${path}': ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+    const identity = inodeOf(path);
+    if (identity !== undefined) this.#byInode.set(identity, state);
+    return undefined;
+  }
+
   #requireImage(
     path: string,
     then: (state: FakeImageState) => CommandResult,
   ): CommandResult {
-    const state = this.images.get(path);
+    const state = this.#openable(path);
     if (state === undefined) {
       return failed(1, `qemu-img: Could not open '${path}'`);
     }
@@ -371,7 +563,7 @@ export class FakeQemuImg implements CommandRunner {
     this.converts.push(convert);
     if (!sourceIsGraph) {
       for (const source of sources) {
-        if (!this.images.has(source)) {
+        if (this.#openable(source) === undefined) {
           return failed(1, `qemu-img: Could not open '${source}'`);
         }
       }
@@ -389,18 +581,32 @@ export class FakeQemuImg implements CommandRunner {
       if (size === undefined) known = false;
       else virtualSizeBytes += size;
     }
+    // A conversion reads the source through its whole backing chain, so the
+    // destination holds the FLATTENED content. Only for a single source: how
+    // qemu pads each operand of a concatenation out to its virtual size is not
+    // modeled, and guessing it would put bytes at offsets nobody declared.
+    const content = sources.length === 1 && !sourceIsGraph
+      ? this.contentOf(sources[0])
+      : undefined;
     const backing = valueOf(args, "-B", "-b", "--backing");
     this.setImage(dest, {
       format,
       snapshots: [],
       bitmaps: new Set(),
       ...(known ? { virtualSizeBytes } : {}),
-      ...(backing === undefined ? {} : { backingFilename: backing }),
+      ...(content === undefined
+        ? (this.materialize ? { content: new Uint8Array() } : {})
+        : { content }),
+      ...(backing === undefined ? {} : {
+        backingFilename: backing,
+        backingPath: resolveAgainst(dirnameOf(dest), backing),
+      }),
     });
-    return ok();
+    return this.#materialize(dest) ?? ok();
   }
 
-  #create(args: readonly string[]): CommandResult {
+  #create(call: RecordedCall): CommandResult {
+    const args = call.args;
     const format = valueOf(args, "-f", "--format");
     if (format === undefined) {
       return failed(1, "fake qemu-img: create needs -f");
@@ -412,11 +618,47 @@ export class FakeQemuImg implements CommandRunner {
     }
     const backing = valueOf(args, "-b", "--backing");
     const backingFormat = valueOf(args, "-F", "-B", "--backing-format");
-    const virtualSizeBytes = size !== undefined
-      ? parseSizeBytes(size)
-      : backing !== undefined
-      ? this.images.get(backing)?.virtualSizeBytes
-      : undefined;
+    const options = valueOf(args, "-o", "--options");
+    const sizeBytes = size === undefined ? undefined : parseSizeBytes(size);
+    // qcow2 stores a backing reference relative to the OVERLAY, and qemu-img
+    // resolves it that way before opening it. Keeping the string as written
+    // AND its resolution is what lets a test assert the reference is relative
+    // while the fake still finds the parent it names.
+    const backingPath = backing === undefined || backing === ""
+      ? undefined
+      : resolveAgainst(dirnameOf(path), backing);
+    const create: FakeCreate = {
+      path,
+      format,
+      ...(sizeBytes === undefined ? {} : { sizeBytes }),
+      ...(backing === undefined ? {} : { backing }),
+      ...(backingPath === undefined ? {} : { backingPath }),
+      ...(backingFormat === undefined ? {} : { backingFormat }),
+      ...(options === undefined ? {} : { options }),
+      raw: call,
+    };
+    this.creates.push(create);
+    const hooked = this.onCreate?.(create);
+    if (hooked !== undefined) return hooked;
+
+    // `-u` is the documented escape from this check, and the only one: without
+    // it qemu-img OPENS the backing file, so a chain built on a reference that
+    // resolves nowhere fails here rather than producing an overlay that reads
+    // as zeros. Accepting it silently is how a test proves a relative backing
+    // path is correct when it is not.
+    const unsafe = args.includes("-u") || args.includes("--backing-unsafe");
+    let parent: FakeImageState | undefined;
+    if (backingPath !== undefined && !unsafe) {
+      parent = this.#openable(backingPath);
+      if (parent === undefined) {
+        return failed(
+          1,
+          `qemu-img: Could not open backing file: Could not open ` +
+            `'${backingPath}': No such file or directory`,
+        );
+      }
+    }
+    const virtualSizeBytes = sizeBytes ?? parent?.virtualSizeBytes;
     if (size === undefined && backing === undefined) {
       return failed(1, "qemu-img: Image creation needs a size");
     }
@@ -426,9 +668,16 @@ export class FakeQemuImg implements CommandRunner {
       bitmaps: new Set(),
       ...(virtualSizeBytes === undefined ? {} : { virtualSizeBytes }),
       ...(backing === undefined ? {} : { backingFilename: backing }),
+      ...(backingPath === undefined ? {} : { backingPath }),
       ...(backingFormat === undefined ? {} : { backingFormat }),
+      // A fresh image holds nothing until something writes to it, and under
+      // `materialize` that has to be said out loud — otherwise `map` falls
+      // back to claiming a full-length data extent over a file that is empty.
+      ...(this.materialize && this.images.get(path)?.content === undefined
+        ? { content: new Uint8Array() }
+        : {}),
     });
-    return ok();
+    return this.#materialize(path) ?? ok();
   }
 
   #dd(args: readonly string[]): CommandResult {
@@ -475,9 +724,12 @@ export class FakeQemuImg implements CommandRunner {
         ? {}
         : { "virtual-size": state.virtualSizeBytes }),
       "actual-size": 0,
+      // qemu-img reports both: the reference as qcow2 records it, and the one
+      // it actually opened after resolving that against this image's own
+      // directory. A relative backing makes them different strings.
       ...(state.backingFilename === undefined ? {} : {
         "backing-filename": state.backingFilename,
-        "full-backing-filename": state.backingFilename,
+        "full-backing-filename": state.backingPath ?? state.backingFilename,
       }),
       ...(state.backingFormat === undefined
         ? {}
@@ -494,20 +746,74 @@ export class FakeQemuImg implements CommandRunner {
     };
   }
 
+  /**
+   * The extents a test DECLARED for `path`, or `undefined` when it declared
+   * none — which is the question {@linkcode FakeQemuImg.refuseContentOracles}
+   * turns into a refusal.
+   */
+  #declaredMap(path: string): FakeExtent[] | undefined {
+    const state = this.#openable(path);
+    if (state === undefined) return undefined;
+    if (state.extents !== undefined) return [...state.extents];
+    const content = this.contentOf(path);
+    if (content === undefined) return undefined;
+    const extents: FakeExtent[] = [];
+    if (content.length > 0) {
+      extents.push({
+        start: 0,
+        length: content.length,
+        depth: 0,
+        present: true,
+        zero: false,
+        data: true,
+        offset: 0,
+      });
+    }
+    // Everything past the declared content reads as zeros. Reporting it —
+    // rather than omitting it — is the shape a caller that folds allocation
+    // away has to survive, and the two spellings must digest the same.
+    const size = state.virtualSizeBytes ?? content.length;
+    if (size > content.length) {
+      extents.push({
+        start: content.length,
+        length: size - content.length,
+        depth: 0,
+        present: true,
+        zero: true,
+        data: false,
+      });
+    }
+    return extents;
+  }
+
   #map(args: readonly string[]): CommandResult {
     const path = lastPositional(args);
-    return this.#requireImage(path, (state) =>
-      ok(
-        JSON.stringify([{
-          "start": 0,
-          "length": state.virtualSizeBytes ?? 0,
-          "depth": 0,
-          "present": true,
-          "zero": false,
-          "data": true,
-          "offset": 0,
-        }]) + "\n",
-      ));
+    return this.#requireImage(path, (state) => {
+      const declared = this.#declaredMap(path);
+      const extents = declared ??
+        // Nothing declared: the legacy answer, one full-length data extent.
+        // It is a guess, which is why `refuseContentOracles` suppresses it.
+        [{
+          start: 0,
+          length: state.virtualSizeBytes ?? 0,
+          depth: 0,
+          present: true,
+          zero: false,
+          data: true,
+          offset: 0,
+        }];
+      return ok(
+        JSON.stringify(extents.map((extent) => ({
+          "start": extent.start,
+          "length": extent.length,
+          "depth": extent.depth ?? 0,
+          "present": extent.present ?? true,
+          "zero": extent.zero ?? false,
+          "data": extent.data ?? extent.zero !== true,
+          ...(extent.offset === undefined ? {} : { "offset": extent.offset }),
+        }))) + "\n",
+      );
+    });
   }
 
   #measure(args: readonly string[]): CommandResult {
@@ -532,9 +838,15 @@ export class FakeQemuImg implements CommandRunner {
     if (backing === undefined) {
       return failed(1, "fake qemu-img: rebase needs -b");
     }
-    return this.#requireImage(lastPositional(args), (state) => {
-      if (backing === "") delete state.backingFilename;
-      else state.backingFilename = backing;
+    const path = lastPositional(args);
+    return this.#requireImage(path, (state) => {
+      if (backing === "") {
+        delete state.backingFilename;
+        delete state.backingPath;
+      } else {
+        state.backingFilename = backing;
+        state.backingPath = resolveAgainst(dirnameOf(path), backing);
+      }
       const backingFormat = valueOf(args, "-F", "-B", "--backing-format");
       if (backingFormat !== undefined) state.backingFormat = backingFormat;
       return ok();
@@ -750,6 +1062,57 @@ const FLAGS: Readonly<Record<string, FlagSpec>> = {
   ]),
   snapshot: spec(["-c", "-a", "-d", "--object"], ["-l", "-q", "-U"]),
 };
+
+/** The directory part of a path, POSIX-style. */
+function dirnameOf(path: string): string {
+  const cut = path.lastIndexOf("/");
+  if (cut < 0) return ".";
+  return cut === 0 ? "/" : path.slice(0, cut);
+}
+
+/**
+ * Resolve `ref` against `dir`, collapsing `.` and `..`.
+ *
+ * Purely lexical, and deliberately so: this stands in for how qemu-img joins
+ * a backing reference to the overlay's own directory, which is a string
+ * operation there too — no symlink is followed and no file needs to exist.
+ */
+function resolveAgainst(dir: string, ref: string): string {
+  const joined = ref.startsWith("/") ? ref : `${dir}/${ref}`;
+  const absolute = joined.startsWith("/");
+  const out: string[] = [];
+  for (const segment of joined.split("/")) {
+    if (segment === "" || segment === ".") continue;
+    if (segment !== "..") {
+      out.push(segment);
+      continue;
+    }
+    const last = out[out.length - 1];
+    if (last !== undefined && last !== "..") out.pop();
+    else if (!absolute) out.push("..");
+  }
+  return (absolute ? "/" : "") + out.join("/");
+}
+
+/**
+ * `dev:ino` for a real file, or `undefined` when there is none to look at.
+ *
+ * A missing file and a read permission this test was not granted answer the
+ * same way on purpose: either way the fake has no file to open, and reporting
+ * that beats throwing out of a `dispatch` the caller expected an exit code
+ * from.
+ */
+function inodeOf(path: string): string | undefined {
+  try {
+    const stat = Deno.statSync(path);
+    if (!stat.isFile || stat.dev === null || stat.ino === null) {
+      return undefined;
+    }
+    return `${stat.dev}:${stat.ino}`;
+  } catch {
+    return undefined;
+  }
+}
 
 /** Split `--flag=value` into its name; a bare flag is its own name. */
 function flagName(arg: string): string {
