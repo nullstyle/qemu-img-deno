@@ -6,7 +6,7 @@ import {
   assertStringIncludes,
 } from "@std/assert";
 import { QemuImg } from "../../src/qemu_img.ts";
-import { FakeQemuImg } from "../../testing/mod.ts";
+import { FakeQemuImg, ok } from "../../testing/mod.ts";
 import { build } from "../../src/recipe/build.ts";
 import {
   plan,
@@ -165,6 +165,52 @@ interface Rig {
 }
 
 /**
+ * A minimal but VALID FAT12 image: 512-byte sectors, 1 sector per cluster,
+ * 1 reserved sector, 2 FATs of 1 sector, a 16-entry root directory, 100 data
+ * clusters — and one 8.3 entry carrying a deliberately stale creation stamp.
+ *
+ * The fake models no image content, so a `vvfat -> raw` convert would leave a
+ * zero-byte file and `normalizeFatTimestamps` would correctly refuse it. This
+ * gives the normalizer a real filesystem to rewrite, which is what lets a unit
+ * test prove `build()` calls it at all.
+ */
+function minimalFat(): Uint8Array {
+  const SECTOR = 512, ROOT_ENTRIES = 16, DATA_CLUSTERS = 100;
+  const totalSectors = 1 + 2 + 1 + DATA_CLUSTERS;
+  const image = new Uint8Array(totalSectors * SECTOR);
+  const view = new DataView(image.buffer);
+  const ascii = (at: number, text: string) => {
+    for (let i = 0; i < text.length; i++) image[at + i] = text.charCodeAt(i);
+  };
+  image[0] = 0xeb, image[1] = 0x3c, image[2] = 0x90;
+  ascii(3, "MSWIN4.1");
+  view.setUint16(11, SECTOR, true); // BytsPerSec
+  image[13] = 1; //                    SecPerClus
+  view.setUint16(14, 1, true); //      RsvdSecCnt
+  image[16] = 2; //                    NumFATs
+  view.setUint16(17, ROOT_ENTRIES, true);
+  view.setUint16(19, totalSectors, true);
+  image[21] = 0xf8; //                 Media
+  view.setUint16(22, 1, true); //      FATSz16
+  image[38] = 0x29; //                 BootSig
+  ascii(43, "NO NAME    ");
+  ascii(54, "FAT12   ");
+  image[510] = 0x55, image[511] = 0xaa;
+  // Both FATs: media byte + end-of-chain for the reserved entries.
+  for (const fat of [1, 2]) {
+    const at = fat * SECTOR;
+    image[at] = 0xf8, image[at + 1] = 0xff, image[at + 2] = 0xff;
+  }
+  // One root entry, with a creation stamp that is NOT the pinned epoch.
+  const root = 3 * SECTOR;
+  ascii(root, "BOOTAA64EFI");
+  image[root + 11] = 0x20; //          attr: archive
+  view.setUint16(root + 14, 0x1234, true); // CrtTime, stale on purpose
+  view.setUint16(root + 16, 0x5cf6, true); // CrtDate, stale on purpose
+  return image;
+}
+
+/**
  * A fake wired the way `build()` needs: it writes the images it creates,
  * because the store hashes a container file and `contentDigest()` opens a raw
  * one — and it refuses to invent what any of them hold.
@@ -173,6 +219,19 @@ function rigOn(root: string, store = `${root}/store`): Rig {
   const fake = new FakeQemuImg();
   fake.materialize = true;
   fake.refuseContentOracles = true;
+  // build() now reads vvfat into a raw scratch file, normalizes its FAT
+  // creation timestamps, then splices THAT into the window. Returning ok() is
+  // load-bearing: falling through lets the fake register the graph convert's
+  // content as empty and truncate the file back to zero bytes.
+  fake.onConvert = (convert) => {
+    if (
+      convert.sourceIsGraph === true && convert.destIsGraph !== true &&
+      convert.format === "raw"
+    ) {
+      Deno.writeFileSync(convert.dest, minimalFat());
+      return ok();
+    }
+  };
   return {
     fake,
     qemu: new QemuImg({ runner: fake }),
@@ -320,8 +379,20 @@ Deno.test("the GPT and each FAT window are spliced without touching their neighb
     );
     // vvfat's own MBR is stripped by a window at 32256, so the partition type
     // byte is the GPT's rather than vvfat's 0x06.
-    assertStringIncludes(windows[2].raw.args.join(" "), "offset=32256");
-    assertStringIncludes(windows[2].raw.args.join(" "), "driver=vvfat");
+    // The vvfat MBR strip moved OFF the window write: build() now reads vvfat
+    // into a raw scratch file (so the FAT creation timestamps can be pinned
+    // before publication), then splices that file into the window.
+    const fatRead = rig.fake.converts.find((c) =>
+      c.sourceIsGraph === true && c.destIsGraph !== true
+    );
+    assert(fatRead !== undefined, "vvfat is read into a raw scratch file");
+    assertStringIncludes(fatRead.raw.args.join(" "), "offset=32256");
+    assertStringIncludes(fatRead.raw.args.join(" "), "driver=vvfat");
+    assertEquals(
+      windows[2].sources,
+      [fatRead.dest],
+      "the FAT window is spliced from the normalized raw, not from vvfat",
+    );
   } finally {
     await Deno.remove(root, { recursive: true });
   }
@@ -1067,6 +1138,44 @@ Deno.test("copyIn refuses a tree edited between resolving and building", async (
     assertStringIncludes(error.message, "hello.txt");
     assertEquals(guest.requests.length, 1, "only the mkfs step ever ran");
     assertEquals((await rig.store.list()).length, 3);
+  } finally {
+    await Deno.remove(root, { recursive: true });
+  }
+});
+
+Deno.test("the FAT spliced into the window has pinned creation timestamps", async () => {
+  const root = await scratchDir();
+  try {
+    const rig = rigOn(root);
+    // Snapshot the raw at the moment build() splices it into the window —
+    // after normalizeFatTimestamps has run, before the scratch file is
+    // removed. Nothing else proves build() calls the normalizer at all.
+    let spliced: Uint8Array | undefined;
+    const inner = rig.fake.onConvert!;
+    rig.fake.onConvert = (convert) => {
+      if (convert.destIsGraph === true && convert.sourceIsGraph !== true) {
+        spliced = Deno.readFileSync(convert.sources[0]);
+      }
+      return inner(convert);
+    };
+    const resolved = resolveOf(blankRecipe([partitionStep(false)]));
+    await build(await plan(resolved, { appliance: APPLIANCE }), resolved, {
+      store: rig.store,
+      output: rig.output,
+      qemu: rig.qemu,
+      scratch: rig.scratch,
+    });
+
+    assert(spliced !== undefined, "the FAT window was spliced from a file");
+    const entry = 3 * 512; // the single root-directory entry
+    const view = new DataView(spliced.buffer, spliced.byteOffset);
+    // sourceDateEpoch 1700000000 in FAT's packed form. These are the same
+    // values vvfat writes for DIR_WrtTime/DIR_WrtDate from a pinned mtime, so
+    // created and written times agree rather than merely both being stable.
+    assertEquals(view.getUint16(entry + 14, true), 0xb1aa, "DIR_CrtTime");
+    assertEquals(view.getUint16(entry + 16, true), 0x576e, "DIR_CrtDate");
+    assertEquals(view.getUint16(entry + 18, true), 0x576e, "DIR_LstAccDate");
+    assertEquals(spliced[entry + 13], 0, "DIR_CrtTimeTenth");
   } finally {
     await Deno.remove(root, { recursive: true });
   }

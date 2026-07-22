@@ -15,6 +15,7 @@
  */
 
 import { QemuImg } from "../qemu_img.ts";
+import { normalizeFatTimestamps } from "../fs/fat.ts";
 import { buildGpt, deriveGuid, PARTITION_TYPE_GUIDS } from "../fs/gpt.ts";
 import { buildTar, type TarEntry } from "../fs/tar.ts";
 import {
@@ -401,10 +402,24 @@ async function runBytesLayer(
       resolvedDir(resolved, contents.from),
       recipe.determinism.sourceDateEpoch,
     );
+    // A unique name, like the staging copy above: `scratch` defaults to one
+    // directory per STORE, not per build, so a fixed name would collide
+    // between two concurrent builds whose recipes share a step id.
+    const fatRaw = await Deno.makeTempFile({
+      dir: scratch,
+      prefix: "fat-",
+      suffix: ".raw",
+    });
     try {
       // vvfat synthesizes the filesystem from the host directory; the `raw`
       // window at 32256 strips vvfat's own MBR, so the partition type byte is
       // ours rather than vvfat's 0x06.
+      //
+      // Landed in a raw file rather than straight into the image window,
+      // because the creation timestamps below have to be rewritten before the
+      // layer is published and a qcow2 is not seekable from here. The file is
+      // sparse: measured at 304 KiB written for a 504 MiB FAT16 ESP, so the
+      // detour costs the directory bytes rather than the partition size.
       await qemu.convert(
         {
           imageOpts: {
@@ -419,13 +434,28 @@ async function runBytesLayer(
             },
           },
         },
+        fatRaw,
+        { format: "raw", parallel: 1 },
+      );
+      // stageFatTree() pinned mtime and atime, which settles DIR_WrtTime and
+      // DIR_LstAccDate. No userspace call sets a BIRTH time, so DIR_CrtTime
+      // still held the wall clock of the staging copy: measured over the
+      // system smoke's recipe, two cold builds seconds apart published 8
+      // differing bytes under ONE realization key, every one at offset 14 of a
+      // 32-byte directory entry. That is cache poisoning, and this closes it.
+      await normalizeFatTimestamps(fatRaw, {
+        epochSeconds: recipe.determinism.sourceDateEpoch,
+      });
+      await qemu.convert(
+        fatRaw,
         window(imagePath, partition.offsetBytes, partition.lengthBytes),
-        { noCreate: true, parallel: 1 },
+        { sourceFormat: "raw", noCreate: true, parallel: 1 },
       );
     } finally {
       // A snapshot is a full copy of the ESP tree, so leaving it behind would
       // grow the store's scratch by one ESP per built layer.
       await Deno.remove(staged, { recursive: true }).catch(() => {});
+      await Deno.remove(fatRaw).catch(() => {});
     }
   }
 }

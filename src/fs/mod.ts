@@ -9,6 +9,14 @@
  */
 
 export {
+  DIR_ENTRY_BYTES,
+  FatLayoutError,
+  type FatTimestampOptions,
+  type FatTimestampReport,
+  normalizeFatTimestamps,
+} from "./fat.ts";
+
+export {
   buildGpt,
   bytesToGuid,
   crc32,
